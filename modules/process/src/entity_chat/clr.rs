@@ -274,12 +274,18 @@ impl RuntimeSurface for ClrGameplay {
         generation: u64,
         envelope_json: &str,
     ) -> ChatOperation {
+        let text = serde_json::from_str::<super::envelope::InputCommand>(envelope_json)
+            .ok()
+            .and_then(|input| input.try_decode_chat_text().ok());
+        let Some(text) = text else {
+            return ChatOperation::rejected("bad_envelope");
+        };
         match self.call(json!({
             "op": "admit_input",
             "roomId": room_id,
             "connection": connection,
             "connectionGeneration": generation,
-            "envelope": envelope_json,
+            "text": text,
         })) {
             Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
                 ChatOperation::admitted()

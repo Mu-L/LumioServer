@@ -1,6 +1,7 @@
 //! Frozen `lumio.gameplay-envelope.v1` InputCommand (chat.input tenant).
 
 use sha2::{Digest, Sha256};
+use serde::Deserialize;
 
 use super::crypto::{hex_lower, BinWriter};
 
@@ -11,16 +12,18 @@ pub const CHAT_INPUT_MAPPING: &str = "chat.input";
 const MAX_COMMANDS: usize = 16;
 
 /// One CommandBlock.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct CommandBlock {
     pub mapping_id: String,
     pub payload: String,
+    #[serde(rename = "payloadSha256")]
     pub payload_sha256: String,
 }
 
 /// Frozen InputCommand envelope.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct InputCommand {
+    #[serde(rename = "messageType")]
     pub message_type: String,
     pub commands: Vec<CommandBlock>,
 }
