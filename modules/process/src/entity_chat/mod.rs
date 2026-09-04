@@ -45,6 +45,9 @@ pub use envelope::{
 pub use host::{
     AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
     RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,
+    MAX_DEFERRED_FRAMES_PER_CONNECTION, MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION,
+    MAX_DEFERRED_FRAME_CONNECTIONS, MAX_PENDING_EGRESS_CONNECTIONS,
+    MAX_PENDING_EGRESS_PER_CONNECTION,
 };
 pub use runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,

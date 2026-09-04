@@ -113,6 +113,7 @@ public static class HostEntry
         Manager = ManagerType.GetMethod("Create", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { registry, instanceId });
         ManagerType.GetMethod("Start", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
+        AttachBindingAdapter();
         Chat = ChatType.GetMethod("Create", new[] { BindingType, typeof(bool) })!.Invoke(null, new object?[] { Bindings, false });
         return Manager is null || Bindings is null || Chat is null ? (EntrySuccess, Fail("boot_failed")) : (EntrySuccess, Ok());
     }
@@ -289,6 +290,7 @@ public static class HostEntry
         Manager = restored;
         ManagerType.GetMethod("Start")!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
+        AttachBindingAdapter();
         Chat = ChatType!.GetMethod("Create", new[] { BindingType, typeof(bool) })!.Invoke(null, new object?[] { Bindings, false });
         return (EntrySuccess, Ok());
     }
@@ -302,6 +304,22 @@ public static class HostEntry
     }
 
     private static object NewMessage(string typeName, params string?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;
+    private static void AttachBindingAdapter()
+    {
+        MethodInfo attach = ManagerType!.GetMethod("AttachControlAdapter", BindingFlags.Public | BindingFlags.Instance)
+            ?? throw new MissingMethodException(ManagerType.FullName, "AttachControlAdapter");
+        try
+        {
+            attach.Invoke(Manager, new[] { Bindings });
+        }
+        catch (TargetInvocationException error)
+            when (error.InnerException is InvalidOperationException duplicate &&
+                duplicate.Message.Contains("already has a control adapter", StringComparison.Ordinal))
+        {
+            // EntityBindingQuery attaches itself on newer Runtime builds; keep the explicit
+            // HostEntry attachment for older builds while retaining that adapter instance.
+        }
+    }
     private static void Enqueue(object message) => ManagerType!.GetMethod("Enqueue")!.Invoke(Manager, new[] { message });
     private static List<object>? TickManager() { ManagerType!.GetMethod("Tick")!.Invoke(Manager, null); return DrainManager(); }
     private static List<object>? DrainManager() => ManagerType!.GetMethod("DrainOutbox")!.Invoke(Manager, null) is IEnumerable rows ? ToObjectList(rows) : null;

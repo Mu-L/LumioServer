@@ -10,7 +10,7 @@ use lumio_host_runtime::{
 };
 
 use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
-use super::envelope::{normalize_net_entity_id, InputCommand};
+use super::envelope::InputCommand;
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
@@ -18,6 +18,17 @@ use super::runtime::{
 };
 use super::wire::{RoomListener, WireEvent, WireSender};
 use super::MAX_CHAT_INPUTS_PER_TICK;
+
+/// Maximum number of sockets waiting for admission before new sockets are closed.
+pub const MAX_PENDING_EGRESS_CONNECTIONS: usize = 1_024;
+/// Maximum observers retained for one connection while admission is pending/active.
+pub const MAX_PENDING_EGRESS_PER_CONNECTION: usize = 8;
+/// Maximum number of connection queues retaining frames without an attached socket.
+pub const MAX_DEFERRED_FRAME_CONNECTIONS: usize = 1_024;
+/// Maximum deferred Runtime frames retained for one connection.
+pub const MAX_DEFERRED_FRAMES_PER_CONNECTION: usize = 64;
+/// Maximum bytes retained by one deferred Runtime frame queue.
+pub const MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION: usize = 1_048_576;
 
 /// WallClock expire dispatch id (NativeCore slot).
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -359,7 +370,6 @@ impl EntityChatHost {
         room_id: String,
         net_entity_id: String,
     ) -> Option<EntityResolution> {
-        let net_entity_id = normalize_net_entity_id(&net_entity_id);
         self.on_owner(move |inner| inner.try_resolve_by_net_entity_id(&room_id, &net_entity_id))
     }
 
@@ -466,7 +476,9 @@ impl Inner {
         if admitted.accepted {
             return self.commit_session(connection_id, payload, admitted, false, false);
         }
-        self.route_frames(room_id, &admitted.frames);
+        if !self.route_frames(room_id, &admitted.frames) {
+            return RoomAdmitResult::reject("runtime_failure");
+        }
         if admitted.code.as_deref() == Some("cross_room_reference") {
             return RoomAdmitResult::reject("invalid_request");
         }
@@ -485,7 +497,9 @@ impl Inner {
             );
             return self.commit_session(connection_id, payload, rebound, true, false);
         }
-        self.route_frames(room_id, &rebound.frames);
+        if !self.route_frames(room_id, &rebound.frames) {
+            return RoomAdmitResult::reject("runtime_failure");
+        }
         RoomAdmitResult::reject(admitted.code.as_deref().unwrap_or("invalid_request"))
     }
 
@@ -509,7 +523,9 @@ impl Inner {
             RebindMode::Takeover,
         );
         let Some(_binding) = rebound.binding.clone() else {
-            self.route_frames(room_id, &rebound.frames);
+            if !self.route_frames(room_id, &rebound.frames) {
+                return RoomAdmitResult::reject("runtime_failure");
+            }
             return RoomAdmitResult::reject(rebound.code.as_deref().unwrap_or("invalid_request"));
         };
         let result = self.commit_session(connection_id, payload, rebound, false, true);
@@ -562,7 +578,10 @@ impl Inner {
         self.account_sessions
             .insert(payload.account_id.clone(), connection_id.to_owned());
         self.sessions.insert(connection_id.to_owned(), session);
-        self.route_frames(&binding.room_id, &frames);
+        if !self.route_frames(&binding.room_id, &frames) {
+            self.fail_connection(connection_id);
+            return RoomAdmitResult::reject("runtime_failure");
+        }
         RoomAdmitResult::ok(binding, reconnected, takeover)
     }
 
@@ -577,11 +596,13 @@ impl Inner {
             return false;
         };
         self.account_sessions.remove(&account_id);
-        if let Ok(result) = runtime_result {
-            self.route_frames(&room_id, &result.frames);
-        }
         for egress in &session.egresses {
             let _ = egress.close();
+        }
+        if let Ok(result) = runtime_result {
+            if !self.route_frames(&room_id, &result.frames) {
+                return false;
+            }
         }
         let due = self.clock.now_ms().saturating_add(self.reconnect_window_ms);
         if let Ok(handle) =
@@ -647,23 +668,25 @@ impl Inner {
             return RuntimeTick::failed("runtime_failure");
         }
         let tick = self.runtime.run_tick(room_id, self.tick_id);
-        self.route_frames(room_id, &tick.frames);
+        let routed = self.route_frames(room_id, &tick.frames);
         if !tick.ok {
             return tick;
+        }
+        if !routed {
+            return RuntimeTick::failed("runtime_failure");
         }
         self.wire_chat_pending = 0;
         tick
     }
 
-    fn route_frames(&mut self, room_id: &str, frames: &[RuntimeFrame]) {
+    fn route_frames(&mut self, room_id: &str, frames: &[RuntimeFrame]) -> bool {
+        let mut routed = true;
         for frame in frames {
             if let Some(connection) = frame.connection.as_deref() {
                 let delivered = self.deliver_to_connection(connection, &frame.bytes);
-                if !delivered {
-                    self.deferred_frames
-                        .entry(connection.to_owned())
-                        .or_default()
-                        .push(frame.bytes.clone());
+                if !delivered && !self.defer_frame(connection, &frame.bytes) {
+                    self.fail_connection(connection);
+                    routed = false;
                 }
                 continue;
             }
@@ -674,14 +697,15 @@ impl Inner {
                 .map(|(connection, _)| connection.clone())
                 .collect();
             for connection in targets {
-                if !self.deliver_to_connection(&connection, &frame.bytes) {
-                    self.deferred_frames
-                        .entry(connection)
-                        .or_default()
-                        .push(frame.bytes.clone());
+                if !self.deliver_to_connection(&connection, &frame.bytes)
+                    && !self.defer_frame(&connection, &frame.bytes)
+                {
+                    self.fail_connection(&connection);
+                    routed = false;
                 }
             }
         }
+        routed
     }
 
     fn deliver_to_connection(&mut self, connection: &str, bytes: &[u8]) -> bool {
@@ -706,11 +730,48 @@ impl Inner {
             return;
         };
         for bytes in frames {
-            if !self.deliver_to_connection(connection, &bytes) {
-                self.deferred_frames
-                    .entry(connection.to_owned())
-                    .or_default()
-                    .push(bytes);
+            if !self.deliver_to_connection(connection, &bytes)
+                && !self.defer_frame(connection, &bytes)
+            {
+                self.fail_connection(connection);
+                break;
+            }
+        }
+    }
+
+    fn defer_frame(&mut self, connection: &str, bytes: &[u8]) -> bool {
+        if bytes.len() > MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION {
+            return false;
+        }
+        if let Some(frames) = self.deferred_frames.get_mut(connection) {
+            let queued_bytes: usize = frames.iter().map(Vec::len).sum();
+            if frames.len() >= MAX_DEFERRED_FRAMES_PER_CONNECTION
+                || queued_bytes.saturating_add(bytes.len())
+                    > MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION
+            {
+                return false;
+            }
+            frames.push(bytes.to_vec());
+            return true;
+        }
+        if self.deferred_frames.len() >= MAX_DEFERRED_FRAME_CONNECTIONS {
+            return false;
+        }
+        self.deferred_frames
+            .insert(connection.to_owned(), vec![bytes.to_vec()]);
+        true
+    }
+
+    fn fail_connection(&mut self, connection: &str) {
+        if let Some(session) = self.sessions.get_mut(connection) {
+            for egress in &session.egresses {
+                let _ = egress.close();
+            }
+            session.egresses.clear();
+        }
+        if let Some(egresses) = self.pending_egress.remove(connection) {
+            for egress in egresses {
+                let _ = egress.close();
             }
         }
     }
@@ -723,14 +784,24 @@ impl Inner {
             } => {
                 if self.sessions.contains_key(&connection_id) {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
+                        if session.egresses.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
+                            let _ = egress.close();
+                            return;
+                        }
                         session.egresses.push(egress.clone());
                     }
                     self.flush_deferred(&connection_id);
                 } else {
-                    self.pending_egress
-                        .entry(connection_id)
-                        .or_default()
-                        .push(egress);
+                    if self.pending_egress.len() >= MAX_PENDING_EGRESS_CONNECTIONS {
+                        let _ = egress.close();
+                        return;
+                    }
+                    let queue = self.pending_egress.entry(connection_id).or_default();
+                    if queue.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
+                        let _ = egress.close();
+                    } else {
+                        queue.push(egress);
+                    }
                 }
             }
             WireEvent::Input {
@@ -743,7 +814,9 @@ impl Inner {
                 }
             }
             WireEvent::Closed { connection_id } => {
-                let _ = self.disconnect(&connection_id);
+                if !self.disconnect(&connection_id) {
+                    self.fail_connection(&connection_id);
+                }
             }
         }
     }
@@ -762,16 +835,9 @@ impl Inner {
         room_id: &str,
         net_entity_id: &str,
     ) -> Option<EntityResolution> {
-        let id = normalize_net_entity_id(net_entity_id);
         let runtime = self
             .runtime
-            .resolve_by_net_entity_id(room_id, &id)
-            .or_else(|| {
-                self.runtime
-                    .list_bindings(room_id)
-                    .into_iter()
-                    .find(|row| normalize_net_entity_id(&row.net_entity_id) == id)
-            })?;
+            .resolve_by_net_entity_id(room_id, net_entity_id)?;
         Some(EntityResolution {
             net_entity_id: runtime.net_entity_id,
             room_id: runtime.room_id,
@@ -784,7 +850,7 @@ impl Inner {
         self.runtime.query_attribute(&RuntimeQuery {
             caller_scope: request.caller_scope,
             room_id: request.room_id.clone(),
-            net_entity_id: normalize_net_entity_id(&request.net_entity_id),
+            net_entity_id: request.net_entity_id.clone(),
             attribute_id: request.attribute_id.clone(),
             connection_generation: request.connection_generation,
         })

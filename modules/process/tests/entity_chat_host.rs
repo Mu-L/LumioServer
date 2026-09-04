@@ -425,7 +425,7 @@ fn claimed_mark_client_replica_is_contract_unauthorized() {
 }
 
 #[test]
-fn resolve_accepts_runtime_32_hex_and_c1_u64() {
+fn resolve_requires_canonical_runtime_id() {
     let (host, keys) = host_with(SharedRuntime::new());
     let bot = host.admit(
         "room-main".to_owned(),
@@ -440,8 +440,7 @@ fn resolve_accepts_runtime_32_hex_and_c1_u64() {
     let as_u64 = u64::from_str_radix(&hex, 16).expect("runtime 32-hex is a u64");
     let resolved = host.try_resolve_by_net_entity_id("room-main".to_owned(), as_u64.to_string());
     assert!(
-        resolved.is_some(),
-        "C-1 u64 decimal {as_u64} must resolve the Runtime 32-hex {hex}"
+        resolved.is_none(),
+        "non-canonical Runtime ID {as_u64} must not be normalized by the Server host"
     );
-    assert_eq!(resolved.expect("row").net_entity_id, hex);
 }

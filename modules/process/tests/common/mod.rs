@@ -371,8 +371,7 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         net_entity_id: &str,
     ) -> Option<RuntimeBinding> {
-        let net_entity_id = normalize_net_entity_id(net_entity_id);
-        let occupancy = self.entities.get(&net_entity_id)?;
+        let occupancy = self.entities.get(net_entity_id)?;
         if occupancy.binding.room_id != room_id {
             return None;
         }

@@ -256,12 +256,88 @@ fn host_entry_uses_runtime_world_manager_passthrough_and_codec() {
             "HostEntry must pass through Runtime {required}"
         );
     }
+    assert!(
+        text.contains("[\"connection\"] = message.GetType().GetProperty(\"Connection\")"),
+        "HostEntry frame encoding must preserve Runtime connection metadata"
+    );
     for removed in ["build_full_snapshot", "build_delta", "TryReadU64"] {
         assert!(
             !text.contains(removed),
             "HostEntry must not own legacy {removed} path"
         );
     }
+}
+
+#[test]
+fn host_entry_attaches_binding_adapter_after_boot_and_restore_bindings() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(&path).expect("HostEntry.cs");
+    assert!(
+        text.contains("AttachControlAdapter"),
+        "HostEntry must attach EntityBindingQuery to WorldManager lifecycle controls"
+    );
+    assert!(
+        text.contains("attach.Invoke(Manager, new[] { Bindings })"),
+        "HostEntry must invoke the Runtime WorldManager adapter API"
+    );
+    for marker in [
+        "Bindings = BindingType!.GetMethod(\"Create\"",
+        "AttachControlAdapter",
+    ] {
+        assert!(text.contains(marker), "HostEntry must contain {marker}");
+    }
+    let boot_bindings = text
+        .find("Bindings = BindingType!.GetMethod(\"Create\"")
+        .expect("boot bindings");
+    let boot_adapter = text[boot_bindings..]
+        .find("AttachBindingAdapter();")
+        .expect("boot adapter")
+        + boot_bindings;
+    let restore_start = text
+        .find("private static (int, byte[]) Restore")
+        .expect("restore");
+    let restore_bindings = text[restore_start..]
+        .find("Bindings = BindingType!.GetMethod(\"Create\"")
+        .expect("restore bindings")
+        + restore_start;
+    let restore_adapter = text[restore_bindings..]
+        .find("AttachBindingAdapter();")
+        .expect("restore adapter")
+        + restore_bindings;
+    assert!(
+        boot_bindings < boot_adapter,
+        "Boot must attach immediately after creating Bindings"
+    );
+    assert!(
+        restore_bindings < restore_adapter,
+        "Restore must attach immediately after creating Bindings"
+    );
+}
+
+#[test]
+fn host_pending_wire_storage_has_explicit_bounds_and_overflow_close() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    for required in [
+        "MAX_PENDING_EGRESS_PER_CONNECTION",
+        "MAX_PENDING_EGRESS_CONNECTIONS",
+        "MAX_DEFERRED_FRAMES_PER_CONNECTION",
+        "MAX_DEFERRED_FRAME_CONNECTIONS",
+        "close()",
+    ] {
+        assert!(
+            host.contains(required),
+            "host queue bound/close contract missing {required}"
+        );
+    }
+    assert!(
+        host.contains("runtime_failure") || host.contains("overflow"),
+        "queue overflow must be an explicit failure, not a silent drop"
+    );
 }
 
 #[test]
