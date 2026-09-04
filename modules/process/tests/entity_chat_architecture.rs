@@ -311,6 +311,16 @@ fn host_entry_dispatch_is_exact_runtime_five_op_allowlist() {
 }
 
 #[test]
+fn host_session_occupancy_has_no_account_index() {
+    let path = process_root().join("src/entity_chat/host.rs");
+    let text = fs::read_to_string(&path).expect("host.rs");
+    assert!(
+        !text.contains("account_sessions"),
+        "R5 host must derive account occupancy from the connection session table"
+    );
+}
+
+#[test]
 fn clr_runtime_input_stays_opaque_until_runtime_wire_codec() {
     let path = process_root().join("src/entity_chat/clr.rs");
     let text = fs::read_to_string(&path).expect("clr.rs");
@@ -322,6 +332,30 @@ fn clr_runtime_input_stays_opaque_until_runtime_wire_codec() {
             && !text.contains("from_slice::<Value>(envelope_bytes)"),
         "Rust CLR bridge must not parse C-1 command payloads"
     );
+}
+
+#[test]
+fn clr_runtime_state_is_only_connection_route_state() {
+    let path = process_root().join("src/entity_chat/clr.rs");
+    let text = fs::read_to_string(&path).expect("clr.rs");
+    assert!(
+        !text.contains("retained"),
+        "CLR bridge must not retain disconnected binding authority"
+    );
+    assert!(
+        !text.contains("bindings: HashMap"),
+        "CLR bridge must not maintain a binding map alongside Runtime authority"
+    );
+    for forbidden in [
+        "self.bindings.values().find",
+        "self.bindings\n            .values()",
+        "self.bindings\n            .get(connection)",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "CLR bridge must not answer Runtime queries from the route cache: {forbidden}"
+        );
+    }
 }
 
 #[test]

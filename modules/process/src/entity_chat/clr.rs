@@ -1,6 +1,5 @@
 //! CoreCLR consume host for Runtime WorldManager and opaque C-1 persistence.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::{json, Value};
@@ -13,6 +12,8 @@ use super::runtime::{
     ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
     RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
+
+const RUNTIME_AUTHORITY_API_UNAVAILABLE: &str = "runtime_authority_api_unavailable";
 
 /// Files needed to create the CoreCLR Runtime consume host.
 #[derive(Debug, Clone)]
@@ -33,8 +34,6 @@ pub struct ClrGameplay {
     replication_assembly: String,
     ecs_assembly: String,
     booted: bool,
-    bindings: HashMap<String, RuntimeBinding>,
-    retained: HashMap<String, RuntimeBinding>,
 }
 
 impl ClrGameplay {
@@ -58,8 +57,6 @@ impl ClrGameplay {
             replication_assembly: config.replication_assembly.to_string_lossy().into_owned(),
             ecs_assembly: config.ecs_assembly.to_string_lossy().into_owned(),
             booted: false,
-            bindings: HashMap::new(),
-            retained: HashMap::new(),
         })
     }
 
@@ -108,7 +105,7 @@ impl ClrGameplay {
     fn tick_and_drain(&mut self) -> Result<(Value, Vec<RuntimeFrame>), String> {
         let tick = self.call(json!({ "op": "tick" }))?;
         let drain = self.call(json!({ "op": "drain" }))?;
-        Ok((tick, frames_from_runtime(&drain)))
+        Ok((tick, frames_from_runtime(&drain)?))
     }
 }
 
@@ -119,36 +116,68 @@ fn bridge_err(error: BridgeError) -> String {
     }
 }
 
-fn frames_from_runtime(value: &Value) -> Vec<RuntimeFrame> {
-    value
-        .get("frames")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|row| {
-            let bytes = row
+fn frames_from_runtime(value: &Value) -> Result<Vec<RuntimeFrame>, String> {
+    let Some(raw_frames) = value.get("frames") else {
+        return Ok(Vec::new());
+    };
+    let rows = raw_frames
+        .as_array()
+        .ok_or_else(|| "runtime frames must be an array".to_owned())?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let object = row
+                .as_object()
+                .ok_or_else(|| format!("runtime frame {index} is not an object"))?;
+            let encoded = object
                 .get("bytesBase64")
                 .and_then(Value::as_str)
-                .and_then(decode_base64)?;
-            Some(RuntimeFrame {
-                connection: row
-                    .get("connection")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                .ok_or_else(|| format!("runtime frame {index} is missing bytesBase64"))?;
+            let bytes = decode_base64(encoded)
+                .ok_or_else(|| "runtime frame bytesBase64 is malformed".to_owned())?;
+            Ok(RuntimeFrame {
+                connection: optional_frame_string(object, "connection")?,
                 bytes,
-                observer_net_entity_id: row
-                    .get("observerNetEntityId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                connection_generation: row.get("connectionGeneration").and_then(Value::as_u64),
-                message_type: row
-                    .get("messageType")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                code: row.get("code").and_then(Value::as_str).map(str::to_owned),
+                observer_net_entity_id: optional_frame_string(object, "observerNetEntityId")?,
+                connection_generation: optional_frame_u64(object, "connectionGeneration")?,
+                message_type: optional_frame_string(object, "messageType")?,
+                code: optional_frame_string(object, "code")?,
             })
         })
         .collect()
+}
+
+fn optional_frame_string(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let Some(value) = object.get(name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_str()
+        .map(str::to_owned)
+        .map(Some)
+        .ok_or_else(|| format!("runtime frame {name} must be a string"))
+}
+
+fn optional_frame_u64(
+    object: &serde_json::Map<String, Value>,
+    name: &str,
+) -> Result<Option<u64>, String> {
+    let Some(value) = object.get(name) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| format!("runtime frame {name} must be an unsigned integer"))
 }
 
 fn error_from_frames(frames: &[RuntimeFrame]) -> Option<String> {
@@ -222,19 +251,16 @@ impl RuntimeSurface for ClrGameplay {
             entity_type,
             connection_generation: generation,
         };
-        self.bindings.insert(connection.to_owned(), binding.clone());
-        self.retained.remove(account_id);
         let mut result = RuntimeAdmit::ok(binding);
         result.frames = frames;
         result
     }
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String> {
-        let binding = self
-            .bindings
-            .get(connection)
-            .cloned()
-            .ok_or_else(|| "binding_not_found".to_owned())?;
+    fn disconnect(
+        &mut self,
+        connection: &str,
+        binding: &RuntimeBinding,
+    ) -> Result<RuntimeDisconnect, String> {
         self.enqueue(json!({
             "op": "enqueue",
             "messageType": "DisconnectConnectionMessage",
@@ -250,10 +276,10 @@ impl RuntimeSurface for ClrGameplay {
                 .unwrap_or_else(|| "runtime_failure".to_owned());
             return Err(code);
         }
-        self.bindings.remove(connection);
-        self.retained
-            .insert(binding.account_id.clone(), binding.clone());
-        Ok(RuntimeDisconnect { binding, frames })
+        Ok(RuntimeDisconnect {
+            binding: binding.clone(),
+            frames,
+        })
     }
 
     fn rebind(
@@ -262,25 +288,12 @@ impl RuntimeSurface for ClrGameplay {
         account_id: &str,
         room_id: &str,
         mode: RebindMode,
+        entity_type: BoundEntityKind,
     ) -> RuntimeAdmit {
         let mode_text = match mode {
             RebindMode::Reconnect => "reconnect",
             RebindMode::Takeover => "takeover",
         };
-        let previous = self
-            .bindings
-            .iter()
-            .find(|(_, binding)| binding.account_id == account_id)
-            .map(|(connection, binding)| (connection.clone(), binding.clone()))
-            .or_else(|| {
-                self.retained
-                    .get(account_id)
-                    .map(|binding| (String::new(), binding.clone()))
-            });
-        let entity_type = previous
-            .as_ref()
-            .map(|(_, binding)| binding.entity_type)
-            .unwrap_or(BoundEntityKind::Player);
         if let Err(code) = self.enqueue(json!({
             "op": "enqueue",
             "messageType": "RebindConnectionMessage",
@@ -318,13 +331,6 @@ impl RuntimeSurface for ClrGameplay {
             entity_type,
             connection_generation: generation,
         };
-        if let Some((old_connection, _)) = previous {
-            if !old_connection.is_empty() && old_connection != connection {
-                self.bindings.remove(&old_connection);
-            }
-        }
-        self.retained.remove(account_id);
-        self.bindings.insert(connection.to_owned(), binding.clone());
         let mut result = RuntimeAdmit::ok(binding);
         result.frames = frames;
         result
@@ -332,47 +338,20 @@ impl RuntimeSurface for ClrGameplay {
 
     fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
         let _ = net_entity_id;
-        Err("unsupported_runtime_op".to_owned())
-    }
-
-    fn self_lookup(&mut self, connection: &str) -> Option<RuntimeBinding> {
-        self.bindings.get(connection).cloned()
+        Err(RUNTIME_AUTHORITY_API_UNAVAILABLE.to_owned())
     }
 
     fn resolve_by_net_entity_id(
         &mut self,
-        room_id: &str,
-        net_entity_id: &str,
+        _room_id: &str,
+        _net_entity_id: &str,
     ) -> Option<RuntimeBinding> {
-        self.bindings
-            .values()
-            .find(|binding| binding.room_id == room_id && binding.net_entity_id == net_entity_id)
-            .cloned()
+        None
     }
 
     fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
-        let Some(binding) = self.bindings.values().find(|binding| {
-            binding.room_id == request.room_id && binding.net_entity_id == request.net_entity_id
-        }) else {
-            return QueryResult::fail(super::runtime::AttributeQueryOutcome::NonExistent);
-        };
-        if request.attribute_id == "EntityIdentity.entityType" {
-            return QueryResult::ok(binding.entity_type.as_str().to_owned(), 0, 0);
-        }
-        if request.caller_scope == super::runtime::AttributeQueryScope::ClientReplica
-            && request.attribute_id == "EntityIdentity.claimedMark"
-        {
-            return QueryResult::fail(super::runtime::AttributeQueryOutcome::Unauthorized);
-        }
-        QueryResult::fail(super::runtime::AttributeQueryOutcome::Invisible)
-    }
-
-    fn list_bindings(&mut self, room_id: &str) -> Vec<RuntimeBinding> {
-        self.bindings
-            .values()
-            .filter(|binding| binding.room_id == room_id)
-            .cloned()
-            .collect()
+        let _ = request;
+        QueryResult::request_error(RUNTIME_AUTHORITY_API_UNAVAILABLE)
     }
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {
@@ -382,21 +361,16 @@ impl RuntimeSurface for ClrGameplay {
 
     fn admit_input_command(
         &mut self,
-        room_id: &str,
+        _room_id: &str,
         connection: &str,
-        generation: u64,
+        _generation: u64,
+        net_entity_id: &str,
         envelope_bytes: &[u8],
     ) -> ChatOperation {
-        let Some(binding) = self.bindings.get(connection).cloned() else {
-            return ChatOperation::rejected("disconnected");
-        };
-        if binding.room_id != room_id || binding.connection_generation != generation {
-            return ChatOperation::rejected("stale_generation");
-        }
         if let Err(code) = self.enqueue(json!({
             "op": "enqueue",
             "messageType": "InputCommandMessage",
-            "senderNetEntityId": binding.net_entity_id,
+            "senderNetEntityId": net_entity_id,
             "connection": connection,
             "envelopeBase64": base64_encode(envelope_bytes),
         })) {
@@ -411,7 +385,10 @@ impl RuntimeSurface for ClrGameplay {
             Ok(result) => result,
             Err(_) => return RuntimeTick::failed("runtime_failure"),
         };
-        let mut tick = tick_from_hostentry_json(value);
+        let mut tick = match tick_from_hostentry_json(value) {
+            Ok(tick) => tick,
+            Err(_) => return RuntimeTick::failed("runtime_failure"),
+        };
         tick.frames = frames;
         if let Some(code) = error_from_frames(&tick.frames) {
             tick.ok = false;
@@ -464,7 +441,14 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
             _ => None,
         }
     };
-    for chunk in bytes.chunks_exact(4) {
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let last = index + 1 == bytes.len() / 4;
+        if !last && (chunk[2] == b'=' || chunk[3] == b'=') {
+            return None;
+        }
+        if chunk[2] == b'=' && chunk[3] != b'=' {
+            return None;
+        }
         let a = sextet(chunk[0])?;
         let b = sextet(chunk[1])?;
         let c = if chunk[2] == b'=' {
@@ -477,6 +461,12 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
         } else {
             sextet(chunk[3])?
         };
+        if chunk[2] == b'=' && (b & 0x0f) != 0 {
+            return None;
+        }
+        if chunk[3] == b'=' && chunk[2] != b'=' && (c & 0x03) != 0 {
+            return None;
+        }
         out.push((a << 2) | (b >> 4));
         if chunk[2] != b'=' {
             out.push((b << 4) | (c >> 2));
@@ -512,7 +502,8 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// HostEntry `tick` JSON: `ok:false` is a failed tick even if appliedTick >= 1.
-pub(crate) fn tick_from_hostentry_json(value: Value) -> RuntimeTick {
+pub(crate) fn tick_from_hostentry_json(value: Value) -> Result<RuntimeTick, String> {
+    let frames = frames_from_runtime(&value)?;
     let event_count = value.get("eventCount").and_then(Value::as_u64).unwrap_or(0);
     let code = value
         .get("code")
@@ -520,14 +511,14 @@ pub(crate) fn tick_from_hostentry_json(value: Value) -> RuntimeTick {
         .filter(|code| !code.is_empty())
         .map(str::to_owned);
     if value.get("ok").and_then(Value::as_bool) != Some(true) {
-        return RuntimeTick {
+        return Ok(RuntimeTick {
             applied_tick: 0,
             revision: value.get("revision").and_then(Value::as_u64).unwrap_or(0),
             ok: false,
             event_count: 0,
             code: code.or_else(|| Some("runtime_failure".to_owned())),
-            frames: frames_from_runtime(&value),
-        };
+            frames,
+        });
     }
     let mut tick = RuntimeTick::committed(
         value
@@ -537,8 +528,8 @@ pub(crate) fn tick_from_hostentry_json(value: Value) -> RuntimeTick {
         value.get("revision").and_then(Value::as_u64).unwrap_or(0),
         event_count,
     );
-    tick.frames = frames_from_runtime(&value);
-    tick
+    tick.frames = frames;
+    Ok(tick)
 }
 
 #[cfg(test)]
@@ -554,7 +545,8 @@ mod tests {
             "revision": 1,
             "eventCount": 0,
             "code": "runtime_failure"
-        }));
+        }))
+        .expect("well-formed tick response");
         assert!(!tick.ok);
         assert_eq!(tick.applied_tick, 0);
         assert_eq!(tick.event_count, 0);
@@ -583,7 +575,7 @@ mod tests {
             }],
             "ok": true
         });
-        let frame = &frames_from_runtime(&value)[0];
+        let frame = &frames_from_runtime(&value).expect("well-formed frame")[0];
         assert_eq!(frame.connection.as_deref(), Some("c1"));
         assert_eq!(frame.bytes, b"wire");
         assert_eq!(
@@ -592,6 +584,24 @@ mod tests {
         );
         assert_eq!(frame.connection_generation, Some(2));
         assert_eq!(frame.message_type.as_deref(), Some("Welcome"));
-        assert!(frames_from_runtime(&json!({ "frames": [{ "bytesBase64": "bad" }] })).is_empty());
+        assert_eq!(
+            frames_from_runtime(&json!({ "frames": [{ "bytesBase64": "bad" }] }))
+                .expect_err("malformed Runtime frame must fail the bridge"),
+            "runtime frame bytesBase64 is malformed"
+        );
+    }
+
+    #[test]
+    fn malformed_runtime_frame_metadata_fails_instead_of_being_dropped() {
+        let value = json!({
+            "frames": [{
+                "bytesBase64": base64_encode(b"wire"),
+                "connectionGeneration": "not-a-number"
+            }]
+        });
+        assert_eq!(
+            frames_from_runtime(&value).expect_err("malformed metadata must fail the bridge"),
+            "runtime frame connectionGeneration must be an unsigned integer"
+        );
     }
 }

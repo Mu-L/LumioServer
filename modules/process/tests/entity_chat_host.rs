@@ -127,7 +127,7 @@ fn wall_clock_kernel_expire_tombstones_a_and_creates_b() {
     let account = host.must_self("c-bot01").account_id;
     assert!(host.disconnect("c-bot01".to_owned()));
     clock.advance_ms(RECONNECT_WINDOW_MS + 1);
-    host.drive_kernel();
+    assert!(host.drive_kernel());
     assert!(runtime
         .lock()
         .expire_calls()
@@ -399,6 +399,15 @@ fn deferred_overflow_retires_session_and_disconnects_runtime_binding() {
             .iter()
             .any(|connection| connection == "c-overflow"),
         "overflow must ask Runtime to disconnect the retired binding"
+    );
+    let reconnected = host.admit(
+        "room-main".to_owned(),
+        "c-overflow-reconnected".to_owned(),
+        credential(&keys, "OverflowBot", true),
+    );
+    assert!(
+        reconnected.reconnected,
+        "retired overflow session must not block account reconnect"
     );
 }
 

@@ -234,6 +234,13 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         entity_type: BoundEntityKind,
     ) -> RuntimeAdmit {
+        if self
+            .by_connection
+            .values()
+            .any(|row| row.account_id == account_id)
+        {
+            return RuntimeAdmit::reject("account_already_online");
+        }
         if let Some(live) = self.retained.get(account_id) {
             if live.live_connection.is_some() {
                 return RuntimeAdmit::reject("invalid_binding_shape");
@@ -280,7 +287,11 @@ impl RuntimeSurface for ScriptedRuntime {
         result
     }
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String> {
+    fn disconnect(
+        &mut self,
+        connection: &str,
+        _binding: &RuntimeBinding,
+    ) -> Result<RuntimeDisconnect, String> {
         self.disconnect_calls.push(connection.to_owned());
         let binding = self
             .by_connection
@@ -309,6 +320,7 @@ impl RuntimeSurface for ScriptedRuntime {
         account_id: &str,
         room_id: &str,
         mode: RebindMode,
+        _entity_type: BoundEntityKind,
     ) -> RuntimeAdmit {
         if mode == RebindMode::Takeover {
             let Some(old_conn) = self
@@ -386,10 +398,6 @@ impl RuntimeSurface for ScriptedRuntime {
         Ok(())
     }
 
-    fn self_lookup(&mut self, connection: &str) -> Option<RuntimeBinding> {
-        self.by_connection.get(connection).cloned()
-    }
-
     fn resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
@@ -436,14 +444,6 @@ impl RuntimeSurface for ScriptedRuntime {
         QueryResult::ok(occupancy.binding.entity_type.as_str().to_owned(), 0, 0)
     }
 
-    fn list_bindings(&mut self, room_id: &str) -> Vec<RuntimeBinding> {
-        self.by_connection
-            .values()
-            .filter(|row| row.room_id == room_id)
-            .cloned()
-            .collect()
-    }
-
     fn attach_member(&mut self, _room_id: &str, _connection: &str) -> Result<(), String> {
         Ok(())
     }
@@ -453,6 +453,7 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         connection: &str,
         _generation: u64,
+        _net_entity_id: &str,
         _envelope_bytes: &[u8],
     ) -> ChatOperation {
         if self.by_connection.contains_key(connection) {
@@ -547,8 +548,12 @@ impl RuntimeSurface for SharedRuntime {
             .admit(connection, account_id, room_id, entity_type)
     }
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String> {
-        self.lock().disconnect(connection)
+    fn disconnect(
+        &mut self,
+        connection: &str,
+        binding: &RuntimeBinding,
+    ) -> Result<RuntimeDisconnect, String> {
+        self.lock().disconnect(connection, binding)
     }
 
     fn rebind(
@@ -557,16 +562,14 @@ impl RuntimeSurface for SharedRuntime {
         account_id: &str,
         room_id: &str,
         mode: RebindMode,
+        entity_type: BoundEntityKind,
     ) -> RuntimeAdmit {
-        self.lock().rebind(connection, account_id, room_id, mode)
+        self.lock()
+            .rebind(connection, account_id, room_id, mode, entity_type)
     }
 
     fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
         self.lock().expire(net_entity_id)
-    }
-
-    fn self_lookup(&mut self, connection: &str) -> Option<RuntimeBinding> {
-        self.lock().self_lookup(connection)
     }
 
     fn resolve_by_net_entity_id(
@@ -581,10 +584,6 @@ impl RuntimeSurface for SharedRuntime {
         self.lock().query_attribute(request)
     }
 
-    fn list_bindings(&mut self, room_id: &str) -> Vec<RuntimeBinding> {
-        self.lock().list_bindings(room_id)
-    }
-
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {
         self.lock().attach_member(room_id, connection)
     }
@@ -594,10 +593,16 @@ impl RuntimeSurface for SharedRuntime {
         room_id: &str,
         connection: &str,
         generation: u64,
+        net_entity_id: &str,
         envelope_bytes: &[u8],
     ) -> ChatOperation {
-        self.lock()
-            .admit_input_command(room_id, connection, generation, envelope_bytes)
+        self.lock().admit_input_command(
+            room_id,
+            connection,
+            generation,
+            net_entity_id,
+            envelope_bytes,
+        )
     }
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {

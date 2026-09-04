@@ -160,7 +160,6 @@ struct Inner {
     runtime: Box<dyn RuntimeSurface>,
     kernel: Box<dyn KernelTimer>,
     sessions: HashMap<String, Session>,
-    account_sessions: HashMap<String, String>,
     expire_watch: HashMap<KernelHandle, String>,
     pending_egress: HashMap<String, Vec<WireSender>>,
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
@@ -221,7 +220,6 @@ impl EntityChatHost {
                 runtime,
                 kernel,
                 sessions: HashMap::new(),
-                account_sessions: HashMap::new(),
                 expire_watch: HashMap::new(),
                 pending_egress: HashMap::new(),
                 deferred_frames: HashMap::new(),
@@ -316,8 +314,8 @@ impl EntityChatHost {
     }
 
     /// Pumps NativeCore wallClock at the host monotonic reading.
-    pub fn drive_kernel(&self) {
-        self.on_owner(Inner::drive_wall);
+    pub fn drive_kernel(&self) -> bool {
+        self.on_owner(Inner::drive_wall)
     }
 
     /// Test/suite clock handle. Expiry still fires only via kernel pump.
@@ -435,6 +433,16 @@ impl EntityChatHost {
 }
 
 impl Inner {
+    fn session_binding(session: &Session) -> RuntimeBinding {
+        RuntimeBinding {
+            account_id: session.account_id.clone(),
+            room_id: session.room_id.clone(),
+            net_entity_id: session.net_entity_id.clone(),
+            entity_type: session.entity_type,
+            connection_generation: session.generation,
+        }
+    }
+
     fn admit(&mut self, room_id: &str, connection_id: &str, credential: &str) -> RoomAdmitResult {
         match verify_admission(
             credential,
@@ -467,9 +475,6 @@ impl Inner {
             return RoomAdmitResult::reject("invalid_request");
         }
         let kind = super::runtime::entity_type_of(&payload.login_name, payload.bot_tool_context);
-        if let Some(old_id) = self.account_sessions.get(&payload.account_id).cloned() {
-            return self.takeover(room_id, connection_id, payload, kind, &old_id);
-        }
         let admitted = self
             .runtime
             .admit(connection_id, &payload.account_id, room_id, kind);
@@ -482,11 +487,25 @@ impl Inner {
         if admitted.code.as_deref() == Some("cross_room_reference") {
             return RoomAdmitResult::reject("invalid_request");
         }
+        if admitted.code.as_deref() == Some("account_already_online") {
+            let old_id = self
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.account_id == payload.account_id)
+                .map(|(connection, _)| connection)
+                .min()
+                .cloned();
+            let Some(old_id) = old_id else {
+                return RoomAdmitResult::reject("runtime_failure");
+            };
+            return self.takeover(room_id, connection_id, payload, kind, &old_id);
+        }
         let rebound = self.runtime.rebind(
             connection_id,
             &payload.account_id,
             room_id,
             RebindMode::Reconnect,
+            kind,
         );
         if rebound.accepted {
             self.cancel_expire_for(
@@ -508,7 +527,7 @@ impl Inner {
         room_id: &str,
         connection_id: &str,
         payload: &AdmissionPayload,
-        _kind: BoundEntityKind,
+        kind: BoundEntityKind,
         old_id: &str,
     ) -> RoomAdmitResult {
         if let Some(old) = self.sessions.get(old_id) {
@@ -521,6 +540,7 @@ impl Inner {
             &payload.account_id,
             room_id,
             RebindMode::Takeover,
+            kind,
         );
         let Some(_binding) = rebound.binding.clone() else {
             if !self.route_frames(room_id, &rebound.frames) {
@@ -575,8 +595,6 @@ impl Inner {
             egresses,
         };
         let binding = ConnectionBinding::from_runtime(runtime_binding, session_id);
-        self.account_sessions
-            .insert(payload.account_id.clone(), connection_id.to_owned());
         self.sessions.insert(connection_id.to_owned(), session);
         if !self.route_frames(&binding.room_id, &frames) {
             self.fail_connection(connection_id);
@@ -590,12 +608,11 @@ impl Inner {
             return false;
         };
         let room_id = session.room_id.clone();
-        let account_id = session.account_id.clone();
-        let runtime_result = self.runtime.disconnect(connection_id);
+        let runtime_binding = Self::session_binding(session);
+        let runtime_result = self.runtime.disconnect(connection_id, &runtime_binding);
         let Some(session) = self.sessions.remove(connection_id) else {
             return false;
         };
-        self.account_sessions.remove(&account_id);
         self.deferred_frames.remove(connection_id);
         for egress in &session.egresses {
             let _ = egress.close();
@@ -635,19 +652,23 @@ impl Inner {
         }
     }
 
-    fn drive_wall(&mut self) {
+    fn drive_wall(&mut self) -> bool {
         let now = self.clock.now_ms();
         let Ok(fired) = self.kernel.pump_wall_clock(now) else {
-            return;
+            return false;
         };
+        let mut succeeded = true;
         for event in fired {
             if event.dispatch_id != DISPATCH_EXPIRE {
                 continue;
             }
             if let Some(net_entity_id) = self.expire_watch.remove(&event.handle) {
-                let _ = self.runtime.expire(&net_entity_id);
+                if self.runtime.expire(&net_entity_id).is_err() {
+                    succeeded = false;
+                }
             }
         }
+        succeeded
     }
 
     fn admit_chat_input(&mut self, connection_id: &str, envelope_bytes: &[u8]) -> ChatOperation {
@@ -656,8 +677,14 @@ impl Inner {
         };
         let room_id = session.room_id.clone();
         let generation = session.generation;
-        self.runtime
-            .admit_input_command(&room_id, connection_id, generation, envelope_bytes)
+        let net_entity_id = session.net_entity_id.clone();
+        self.runtime.admit_input_command(
+            &room_id,
+            connection_id,
+            generation,
+            &net_entity_id,
+            envelope_bytes,
+        )
     }
 
     fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
@@ -778,13 +805,6 @@ impl Inner {
             self.deferred_frames.remove(connection);
             return;
         };
-        if self
-            .account_sessions
-            .get(&session.account_id)
-            .is_some_and(|owner| owner == connection)
-        {
-            self.account_sessions.remove(&session.account_id);
-        }
         self.deferred_frames.remove(connection);
         for egress in &session.egresses {
             let _ = egress.close();
@@ -797,7 +817,8 @@ impl Inner {
 
         // Overflow is terminal for the logical session. Runtime must observe
         // the disconnect so a subsequent admission can reconnect immediately.
-        if let Ok(result) = self.runtime.disconnect(connection) {
+        let runtime_binding = Self::session_binding(&session);
+        if let Ok(result) = self.runtime.disconnect(connection, &runtime_binding) {
             for frame in result.frames {
                 if frame.connection.as_deref() == Some(connection) {
                     continue;
@@ -855,12 +876,15 @@ impl Inner {
     }
 
     fn try_self_lookup(&mut self, connection_id: &str) -> Option<ConnectionBinding> {
-        let runtime = self.runtime.self_lookup(connection_id)?;
         let session = self.sessions.get(connection_id)?;
-        Some(ConnectionBinding::from_runtime(
-            runtime,
-            session.session_id.clone(),
-        ))
+        Some(ConnectionBinding {
+            account_id: session.account_id.clone(),
+            room_id: session.room_id.clone(),
+            net_entity_id: session.net_entity_id.clone(),
+            session_id: session.session_id.clone(),
+            entity_type: session.entity_type,
+            connection_generation: session.generation,
+        })
     }
 
     fn try_resolve_by_net_entity_id(
@@ -890,7 +914,19 @@ impl Inner {
     }
 
     fn census(&mut self, room_id: &str) -> RoomCensus {
-        let mut rows = self.runtime.list_bindings(room_id);
+        let mut rows: Vec<ConnectionBinding> = self
+            .sessions
+            .values()
+            .filter(|session| session.room_id == room_id)
+            .map(|session| ConnectionBinding {
+                account_id: session.account_id.clone(),
+                room_id: session.room_id.clone(),
+                net_entity_id: session.net_entity_id.clone(),
+                entity_type: session.entity_type,
+                connection_generation: session.generation,
+                session_id: session.session_id.clone(),
+            })
+            .collect();
         rows.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
         let mut bots = 0;
         let mut players = 0;

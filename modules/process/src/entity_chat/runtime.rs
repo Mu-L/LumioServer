@@ -271,7 +271,11 @@ pub trait RuntimeSurface: Send {
         entity_type: BoundEntityKind,
     ) -> RuntimeAdmit;
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String>;
+    fn disconnect(
+        &mut self,
+        connection: &str,
+        binding: &RuntimeBinding,
+    ) -> Result<RuntimeDisconnect, String>;
 
     fn rebind(
         &mut self,
@@ -279,11 +283,10 @@ pub trait RuntimeSurface: Send {
         account_id: &str,
         room_id: &str,
         mode: RebindMode,
+        entity_type: BoundEntityKind,
     ) -> RuntimeAdmit;
 
     fn expire(&mut self, net_entity_id: &str) -> Result<(), String>;
-
-    fn self_lookup(&mut self, connection: &str) -> Option<RuntimeBinding>;
 
     fn resolve_by_net_entity_id(
         &mut self,
@@ -293,8 +296,6 @@ pub trait RuntimeSurface: Send {
 
     fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult;
 
-    fn list_bindings(&mut self, room_id: &str) -> Vec<RuntimeBinding>;
-
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String>;
 
     fn admit_input_command(
@@ -302,6 +303,7 @@ pub trait RuntimeSurface: Send {
         room_id: &str,
         connection: &str,
         generation: u64,
+        net_entity_id: &str,
         envelope_bytes: &[u8],
     ) -> ChatOperation;
 
