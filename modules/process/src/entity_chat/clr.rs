@@ -443,45 +443,10 @@ pub(crate) fn tick_from_hostentry_json(value: Value) -> RuntimeTick {
     )
 }
 
-/// Maps a Runtime `build_full_snapshot` JSON envelope to wire bytes.
-/// Missing/failed Runtime responses must not become a host-minted FullSnapshot.
-pub(crate) fn full_snapshot_bytes_from_runtime(response: Option<Value>) -> Vec<u8> {
-    response
-        .and_then(|value| {
-            value
-                .get("json")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(|text| text.as_bytes().to_vec())
-        })
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-
-    const HOST_MINTED_EMPTY: &[u8] =
-        br#"{"messageType":"FullSnapshot","tickId":0,"revision":0,"stateBlocks":[]}"#;
-
-    #[test]
-    fn runtime_failure_does_not_mint_empty_full_snapshot() {
-        assert_eq!(full_snapshot_bytes_from_runtime(None), Vec::<u8>::new());
-        assert_ne!(full_snapshot_bytes_from_runtime(None), HOST_MINTED_EMPTY);
-        assert_eq!(
-            full_snapshot_bytes_from_runtime(Some(json!({"ok": false, "code": "runtime_failure"}))),
-            Vec::<u8>::new()
-        );
-        assert_ne!(
-            full_snapshot_bytes_from_runtime(Some(json!({"ok": false, "code": "runtime_failure"}))),
-            HOST_MINTED_EMPTY
-        );
-        assert_eq!(
-            full_snapshot_bytes_from_runtime(Some(json!({"ok": true}))),
-            Vec::<u8>::new()
-        );
-    }
 
     #[test]
     fn budget_fault_tick_is_not_success_even_when_applied_tick_is_one() {
@@ -496,14 +461,6 @@ mod tests {
         assert_eq!(tick.applied_tick, 0);
         assert_eq!(tick.event_count, 0);
         assert_eq!(tick.code.as_deref(), Some("runtime_failure"));
-    }
-
-    #[test]
-    fn runtime_json_is_forwarded_unchanged() {
-        let runtime = r#"{"messageType":"FullSnapshot","tickId":1,"revision":1,"stateBlocks":[{"mappingId":"entity.identity","payload":"aa","payloadSha256":"bb"}]}"#;
-        let bytes = full_snapshot_bytes_from_runtime(Some(json!({ "ok": true, "json": runtime })));
-        assert_eq!(bytes, runtime.as_bytes());
-        assert!(String::from_utf8_lossy(&bytes).contains("\"mappingId\":\"entity.identity\""));
     }
 
     #[test]
