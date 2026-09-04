@@ -223,12 +223,12 @@ fn host_entry_resolve_forwards_ok_entity_as_binding() {
         .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
     let text = fs::read_to_string(&path).expect("HostEntry.cs");
     assert!(
-        text.contains("ListBindings") && text.contains("ResolveByNetEntityId"),
-        "Resolve OkEntity has no Binding; HostEntry must attach the listed ConnectionBinding"
+        text.contains("ResolveByNetEntityId"),
+        "Resolve must delegate to the authoritative Runtime query"
     );
     assert!(
-        text.contains("x32") || text.contains("NormalizeNetEntityId"),
-        "Resolve must accept C-1 u64 and Runtime 32-hex NetEntityId"
+        !text.contains("ListBindings") && !text.contains("NormalizeNetEntityId"),
+        "Resolve must not add a host-side census or NetEntityId normalization fallback; Runtime owns identity parsing and binding truth"
     );
 }
 

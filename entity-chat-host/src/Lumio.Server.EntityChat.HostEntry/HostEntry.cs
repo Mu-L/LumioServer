@@ -26,7 +26,6 @@ public static class HostEntry
     private static Type? ManagerType;
     private static Type? WireCodecType;
     private static Type? EcsRegistryType;
-    private const string ResolveSurfaceNames = "ListBindings NormalizeNetEntityId";
     private static object? Bindings;
     private static object? Chat;
     private static object? Manager;
