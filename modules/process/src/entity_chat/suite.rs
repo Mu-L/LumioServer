@@ -933,13 +933,25 @@ fn wait_for_wire_observers(
 }
 
 fn is_chat_event_delta(frame: &str) -> bool {
-    frame.contains("\"messageType\":\"Delta\"") && frame.contains("\"mappingId\":\"chat.event\"")
+    let Ok(value) = serde_json::from_str::<Value>(frame) else {
+        return false;
+    };
+    value.get("messageType").and_then(Value::as_str) == Some("WorldChange")
+        && value
+            .get("rpcs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|rpc| {
+                rpc.get("componentId").and_then(Value::as_str) == Some("ChatComponent")
+                    && rpc.get("method").and_then(Value::as_str) == Some("OnChatMessage")
+            })
 }
 
 fn delta_tick_id(frame: &str) -> Option<u64> {
     serde_json::from_str::<Value>(frame)
         .ok()?
-        .get("tickId")?
+        .get("tick")?
         .as_u64()
 }
 

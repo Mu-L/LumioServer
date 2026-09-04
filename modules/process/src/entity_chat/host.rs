@@ -596,6 +596,7 @@ impl Inner {
             return false;
         };
         self.account_sessions.remove(&account_id);
+        self.deferred_frames.remove(connection_id);
         for egress in &session.egresses {
             let _ = egress.close();
         }
@@ -604,15 +605,18 @@ impl Inner {
                 return false;
             }
         }
+        self.schedule_expire(&session.net_entity_id);
+        true
+    }
+
+    fn schedule_expire(&mut self, net_entity_id: &str) {
         let due = self.clock.now_ms().saturating_add(self.reconnect_window_ms);
         if let Ok(handle) =
             self.kernel
                 .schedule_one_shot(TimerMode::WallClock, due, DISPATCH_EXPIRE)
         {
-            self.expire_watch
-                .insert(handle, session.net_entity_id.clone());
+            self.expire_watch.insert(handle, net_entity_id.to_owned());
         }
-        true
     }
 
     fn cancel_expire_for(&mut self, net_entity_id: Option<&str>) {
@@ -763,17 +767,45 @@ impl Inner {
     }
 
     fn fail_connection(&mut self, connection: &str) {
-        if let Some(session) = self.sessions.get_mut(connection) {
-            for egress in &session.egresses {
-                let _ = egress.close();
-            }
-            session.egresses.clear();
+        let Some(session) = self.sessions.remove(connection) else {
+            self.pending_egress
+                .remove(connection)
+                .into_iter()
+                .flatten()
+                .for_each(|egress| {
+                    let _ = egress.close();
+                });
+            self.deferred_frames.remove(connection);
+            return;
+        };
+        if self
+            .account_sessions
+            .get(&session.account_id)
+            .is_some_and(|owner| owner == connection)
+        {
+            self.account_sessions.remove(&session.account_id);
+        }
+        self.deferred_frames.remove(connection);
+        for egress in &session.egresses {
+            let _ = egress.close();
         }
         if let Some(egresses) = self.pending_egress.remove(connection) {
             for egress in egresses {
                 let _ = egress.close();
             }
         }
+
+        // Overflow is terminal for the logical session. Runtime must observe
+        // the disconnect so a subsequent admission can reconnect immediately.
+        if let Ok(result) = self.runtime.disconnect(connection) {
+            for frame in result.frames {
+                if frame.connection.as_deref() == Some(connection) {
+                    continue;
+                }
+                let _ = self.route_frames(&session.room_id, &[frame]);
+            }
+        }
+        self.schedule_expire(&session.net_entity_id);
     }
 
     fn on_wire(&mut self, event: WireEvent) {
@@ -786,6 +818,7 @@ impl Inner {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
                         if session.egresses.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
                             let _ = egress.close();
+                            self.fail_connection(&connection_id);
                             return;
                         }
                         session.egresses.push(egress.clone());

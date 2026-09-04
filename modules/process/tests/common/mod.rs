@@ -142,6 +142,7 @@ pub struct ScriptedRuntime {
     tick: u64,
     revision: u64,
     expire_calls: Vec<String>,
+    disconnect_calls: Vec<String>,
     restore_calls: usize,
     pending_chats: Vec<(String, String)>,
     events_by_tick: HashMap<u64, Vec<(String, String)>>,
@@ -165,6 +166,7 @@ impl ScriptedRuntime {
             tick: 0,
             revision: 0,
             expire_calls: Vec::new(),
+            disconnect_calls: Vec::new(),
             restore_calls: 0,
             pending_chats: Vec::new(),
             events_by_tick: HashMap::new(),
@@ -199,6 +201,11 @@ impl ScriptedRuntime {
     #[must_use]
     pub fn expire_calls(&self) -> &[String] {
         &self.expire_calls
+    }
+
+    #[must_use]
+    pub fn disconnect_calls(&self) -> &[String] {
+        &self.disconnect_calls
     }
 
     #[must_use]
@@ -256,7 +263,7 @@ impl RuntimeSurface for ScriptedRuntime {
                 live_connection: Some(connection.to_owned()),
             },
         );
-        let mut result = RuntimeAdmit::ok(binding);
+        let mut result = RuntimeAdmit::ok(binding.clone());
         if !self.snapshot_failed {
             result.frames.push(RuntimeFrame {
                 connection: Some(connection.to_owned()),
@@ -264,12 +271,17 @@ impl RuntimeSurface for ScriptedRuntime {
                     .planted_snapshot
                     .clone()
                     .unwrap_or_else(|| default_snapshot().into_bytes()),
+                observer_net_entity_id: Some(binding.net_entity_id.clone()),
+                connection_generation: Some(binding.connection_generation),
+                message_type: Some("Welcome".to_owned()),
+                code: None,
             });
         }
         result
     }
 
     fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String> {
+        self.disconnect_calls.push(connection.to_owned());
         let binding = self
             .by_connection
             .remove(connection)
@@ -314,14 +326,22 @@ impl RuntimeSurface for ScriptedRuntime {
             binding.connection_generation += 1;
             self.by_connection
                 .insert(connection.to_owned(), binding.clone());
-            let mut result = RuntimeAdmit::ok(binding);
+            let mut result = RuntimeAdmit::ok(binding.clone());
             result.frames.push(RuntimeFrame {
                 connection: Some(old_conn),
                 bytes: superseded_frame(result.binding.as_ref().expect("binding")),
+                observer_net_entity_id: None,
+                connection_generation: Some(binding.connection_generation),
+                message_type: Some("ConnectionSuperseded".to_owned()),
+                code: None,
             });
             result.frames.push(RuntimeFrame {
                 connection: Some(connection.to_owned()),
                 bytes: default_snapshot().into_bytes(),
+                observer_net_entity_id: Some(binding.net_entity_id.clone()),
+                connection_generation: Some(binding.connection_generation),
+                message_type: Some("Welcome".to_owned()),
+                code: None,
             });
             return result;
         }
@@ -342,10 +362,14 @@ impl RuntimeSurface for ScriptedRuntime {
                 live_connection: Some(connection.to_owned()),
             },
         );
-        let mut result = RuntimeAdmit::ok(binding);
+        let mut result = RuntimeAdmit::ok(binding.clone());
         result.frames.push(RuntimeFrame {
             connection: Some(connection.to_owned()),
             bytes: default_snapshot().into_bytes(),
+            observer_net_entity_id: Some(binding.net_entity_id.clone()),
+            connection_generation: Some(binding.connection_generation),
+            message_type: Some("Welcome".to_owned()),
+            code: None,
         });
         result
     }
@@ -466,12 +490,20 @@ impl RuntimeSurface for ScriptedRuntime {
                 .map(|bytes| RuntimeFrame {
                     connection: None,
                     bytes,
+                    observer_net_entity_id: None,
+                    connection_generation: None,
+                    message_type: Some("WorldChange".to_owned()),
+                    code: None,
                 })
                 .collect();
         } else if event_count > 0 {
             result.frames.push(RuntimeFrame {
                 connection: None,
-                bytes: delta_frame(tick_id).into_bytes(),
+                bytes: world_change_frame(tick_id).into_bytes(),
+                observer_net_entity_id: None,
+                connection_generation: None,
+                message_type: Some("WorldChange".to_owned()),
+                code: None,
             });
         }
         result
@@ -581,13 +613,13 @@ impl RuntimeSurface for SharedRuntime {
     }
 }
 
-pub fn snapshot_with_state_blocks() -> String {
-    r#"{"messageType":"FullSnapshot","tickId":1,"revision":1,"stateBlocks":[{"mappingId":"entity.identity","payload":"01000000010000000000000006000000706c6179657200000000","payloadSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#
+pub fn welcome_frame() -> String {
+    r#"{"connectionGeneration":1,"instanceId":0,"messageType":"Welcome","selfNetEntityId":"00000000000000000000000000000001"}"#
         .to_owned()
 }
 
 fn default_snapshot() -> String {
-    snapshot_with_state_blocks()
+    welcome_frame()
 }
 
 fn superseded_frame(binding: &RuntimeBinding) -> Vec<u8> {
@@ -598,8 +630,8 @@ fn superseded_frame(binding: &RuntimeBinding) -> Vec<u8> {
     .into_bytes()
 }
 
-pub fn delta_frame(seq: u64) -> String {
+pub fn world_change_frame(seq: u64) -> String {
     format!(
-        r#"{{"messageType":"Delta","tickId":{seq},"revision":{seq},"changedBlocks":[{{"mappingId":"chat.event","payload":"{seq}","payloadSha256":"bb"}}]}}"#
+        r#"{{"creates":[],"destroys":[],"fields":[],"messageType":"WorldChange","rpcs":[{{"appliedTick":{seq},"args":["{seq}"],"componentId":"ChatComponent","messageId":{seq},"method":"OnChatMessage","roomSequence":{seq},"scope":"room","sender":"00000000000000000000000000000001","target":"00000000000000000000000000000001"}}],"tick":{seq}}}"#
     )
 }

@@ -1,6 +1,6 @@
 # entity-chat-host
 
-Slice-scoped CoreCLR managed entry for R-00408. It loads Runtime `WorldManager`, `EntityBindingQuery`, `ChatCommandRuntime`, and `WireCodec`, then exposes a small JSON op protocol. Lifecycle controls are enqueued and committed by the Runtime owner thread; the Rust host owns admission verification, NativeCore timer drain, and Room WebSocket transport.
+Slice-scoped CoreCLR managed entry for R-00408. It loads Runtime `WorldManager`, `EntityBindingQuery`, and `WireCodec`, then exposes exactly `enqueue`, `tick`, `drain`, `snapshot`, and `restore` (plus `boot`). Lifecycle controls and opaque input envelopes are enqueued and committed by the Runtime owner thread; the Rust host owns admission verification, NativeCore timer drain, and Room WebSocket transport.
 
 ```text
 cd entity-chat-host

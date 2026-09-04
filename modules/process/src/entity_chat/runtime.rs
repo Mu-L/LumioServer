@@ -67,11 +67,16 @@ impl RuntimeAdmit {
     }
 }
 
-/// A Runtime-owned wire frame with its observer/connection address preserved.
+/// A Runtime-owned opaque wire frame with addressed metadata preserved.
+/// The host routes bytes but never decodes the C-1 payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeFrame {
     pub connection: Option<String>,
     pub bytes: Vec<u8>,
+    pub observer_net_entity_id: Option<String>,
+    pub connection_generation: Option<u64>,
+    pub message_type: Option<String>,
+    pub code: Option<String>,
 }
 
 /// Runtime result for a disconnect, including lifecycle frames emitted by the world manager.

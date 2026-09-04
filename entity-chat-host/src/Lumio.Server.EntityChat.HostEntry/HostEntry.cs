@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -21,13 +22,10 @@ public static class HostEntry
     private static Assembly? Replication;
     private static Assembly? Ecs;
     private static Type? BindingType;
-    private static Type? ChatType;
-    private static Type? ChatEnvelopeType;
     private static Type? ManagerType;
     private static Type? WireCodecType;
     private static Type? EcsRegistryType;
     private static object? Bindings;
-    private static object? Chat;
     private static object? Manager;
 
     [UnmanagedCallersOnly(EntryPoint = "lumio_entity_chat_entry")]
@@ -68,21 +66,11 @@ public static class HostEntry
             return op.GetString() switch
             {
                 "boot" => Boot(root),
-                "admit" => Admit(root),
-                "disconnect" => Disconnect(root),
-                "rebind" => Rebind(root),
-                "expire" => Expire(root),
-                "self_lookup" => SelfLookup(root),
-                "resolve" => Resolve(root),
-                "query" => Query(root),
-                "live_ids" => LiveIds(),
-                "attach_member" => AttachMember(root),
-                "admit_input" => AdmitInput(root),
+                "enqueue" => EnqueueWorldMessage(root),
                 "tick" => Tick(root),
                 "drain" => DrainOutbox(),
                 "snapshot" => CaptureSnapshot(),
                 "restore" => Restore(root),
-                "shutdown" => Shutdown(),
                 _ => (EntryInvalidInput, Fail("bad_envelope")),
             };
         }
@@ -101,12 +89,11 @@ public static class HostEntry
         Replication = Assembly.LoadFrom(replicationPath);
         Ecs = Assembly.LoadFrom(ecsPath);
         BindingType = Replication.GetType("Lumio.GameRuntime.Replication.Binding.EntityBindingQuery");
-        ChatType = Replication.GetType("Lumio.GameRuntime.Replication.Chat.ChatCommandRuntime");
-        ChatEnvelopeType = Replication.GetType("Lumio.GameRuntime.Replication.Chat.ChatEnvelope");
         ManagerType = Ecs.GetType("Lumio.GameRuntime.Ecs.WorldManager");
         WireCodecType = Ecs.GetType("Lumio.GameRuntime.Ecs.WireCodec");
         EcsRegistryType = Ecs.GetType("Lumio.GameRuntime.Ecs.EcsRegistry");
-        if (BindingType is null || ChatType is null || ChatEnvelopeType is null || ManagerType is null || WireCodecType is null || EcsRegistryType is null) return (EntrySuccess, Fail("boot_failed"));
+        if (BindingType is null || ManagerType is null || WireCodecType is null || EcsRegistryType is null) return (EntrySuccess, Fail("boot_failed"));
+        if (WireCodecType.GetMethod("DecodeInput", BindingFlags.Public | BindingFlags.Static) is null || WireCodecType.GetMethod("EncodePack", BindingFlags.Public | BindingFlags.Static) is null) return (EntrySuccess, Fail("boot_failed"));
         object? registry = EcsRegistryType.GetProperty("Current", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? FindGeneratedRegistry();
         if (registry is null) return (EntrySuccess, Fail("registry_required"));
         ulong instanceId = root.TryGetProperty("instanceId", out JsonElement id) && id.TryGetUInt64(out ulong supplied) ? supplied : 1UL;
@@ -114,8 +101,7 @@ public static class HostEntry
         ManagerType.GetMethod("Start", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
         AttachBindingAdapter();
-        Chat = ChatType.GetMethod("Create", new[] { BindingType, typeof(bool) })!.Invoke(null, new object?[] { Bindings, false });
-        return Manager is null || Bindings is null || Chat is null ? (EntrySuccess, Fail("boot_failed")) : (EntrySuccess, Ok());
+        return Manager is null || Bindings is null ? (EntrySuccess, Fail("boot_failed")) : (EntrySuccess, Ok());
     }
 
     private static object? FindGeneratedRegistry()
@@ -144,132 +130,96 @@ public static class HostEntry
         foreach (string path in Directory.GetFiles(directory, "Lumio.GameRuntime.*.dll")) try { Assembly.LoadFrom(path); } catch (Exception) { }
     }
 
-    private static (int, byte[]) Admit(JsonElement root)
+    private static (int, byte[]) EnqueueWorldMessage(JsonElement root)
     {
-        if (!TryString(root, "connection", out string? connection) || !TryString(root, "accountId", out string? account) || !TryString(root, "roomId", out string? room) || !TryString(root, "entityType", out string? entityType)) return (EntrySuccess, Fail("invalid_request"));
-        Enqueue(NewMessage("AdmitConnectionMessage", connection, account, room, entityType));
-        List<object>? messages = TickManager();
-        object result = BindingType!.GetMethod("ResolveByConnection")!.Invoke(Bindings, new object[] { room!, connection! })!;
-        return FromBindingResult(result, messages);
-    }
-
-    private static (int, byte[]) Disconnect(JsonElement root)
-    {
-        if (!TryString(root, "connection", out string? connection)) return (EntrySuccess, Fail("invalid_request"));
-        object lookup = BindingType!.GetMethod("SelfLookup")!.Invoke(Bindings, new object?[] { connection, "client-replica" })!;
-        object? binding = lookup.GetType().GetProperty("Binding")?.GetValue(lookup);
-        if (binding is null) return (EntrySuccess, Fail("binding_not_found"));
-        Enqueue(NewMessage("DisconnectConnectionMessage", connection));
-        List<object>? messages = TickManager();
-        return (EntrySuccess, Json(new Dictionary<string, object?>
+        if (!TryString(root, "messageType", out string? messageType)) return (EntryInvalidInput, Fail("bad_envelope"));
+        try
         {
-            ["ok"] = true,
-            ["outcome"] = "accepted",
-            ["binding"] = BindingDict(binding),
-            ["frames"] = EncodeFrames(messages),
-        }));
-    }
-
-    private static (int, byte[]) Rebind(JsonElement root)
-    {
-        if (!TryString(root, "connection", out string? connection) || !TryString(root, "accountId", out string? account) || !TryString(root, "roomId", out string? room) || !TryString(root, "mode", out string? mode)) return (EntrySuccess, Fail("invalid_request"));
-        Enqueue(NewMessage("RebindConnectionMessage", connection, account, room, mode));
-        List<object>? messages = TickManager();
-        object result = BindingType!.GetMethod("ResolveByConnection")!.Invoke(Bindings, new object[] { room!, connection! })!;
-        return FromBindingResult(result, messages);
-    }
-
-    private static (int, byte[]) Expire(JsonElement root)
-    {
-        if (!TryString(root, "netEntityId", out string? id)) return (EntrySuccess, Fail("invalid_request"));
-        object result = BindingType!.GetMethod("Expire", new[] { typeof(string) })!.Invoke(Bindings, new object[] { id! })!;
-        return FromBindingResult(result);
-    }
-
-    private static (int, byte[]) SelfLookup(JsonElement root)
-    {
-        if (!TryString(root, "connection", out string? connection)) return (EntrySuccess, Fail("invalid_request"));
-        object result = BindingType!.GetMethod("SelfLookup")!.Invoke(Bindings, new object?[] { connection, "client-replica" })!;
-        return FromBindingResult(result);
-    }
-
-    private static (int, byte[]) Resolve(JsonElement root)
-    {
-        if (!TryString(root, "roomId", out string? room) || !TryString(root, "netEntityId", out string? id)) return (EntrySuccess, Fail("invalid_request"));
-        object result = BindingType!.GetMethod("ResolveByNetEntityId")!.Invoke(Bindings, new object?[] { room, id, null, "server-authoritative" })!;
-        return FromBindingResult(result);
-    }
-
-    private static (int, byte[]) Query(JsonElement root)
-    {
-        if (Bindings is null || Replication is null) return (EntrySuccess, Fail("invalid_request"));
-        Type requestType = Replication.GetType("Lumio.GameRuntime.Replication.Binding.AttributeQueryRequest")!;
-        object request = Activator.CreateInstance(requestType)!;
-        requestType.GetProperty("CallerScope")!.SetValue(request, Read(root, "callerScope"));
-        requestType.GetProperty("RoomId")!.SetValue(request, Read(root, "roomId"));
-        requestType.GetProperty("NetEntityId")!.SetValue(request, Read(root, "netEntityId"));
-        requestType.GetProperty("AttributeId")!.SetValue(request, Read(root, "attributeId"));
-        if (root.TryGetProperty("connectionGeneration", out JsonElement generation) && generation.TryGetUInt64(out ulong value)) requestType.GetProperty("ConnectionGeneration")!.SetValue(request, value);
-        object result = BindingType!.GetMethod("QueryAttribute")!.Invoke(Bindings, new object?[] { request, null })!;
-        return FromBindingResult(result);
-    }
-
-    private static (int, byte[]) AttachMember(JsonElement root)
-    {
-        if (!TryString(root, "roomId", out string? room) || !TryString(root, "connection", out string? connection)) return (EntrySuccess, Fail("invalid_request"));
-        object result = ChatType!.GetMethod("AttachMember")!.Invoke(Chat, new object[] { room!, connection! })!;
-        bool ok = Convert.ToBoolean(result.GetType().GetProperty("Succeeded")!.GetValue(result), System.Globalization.CultureInfo.InvariantCulture);
-        return (EntrySuccess, ok ? Ok() : Fail("runtime_failure"));
-    }
-
-    private static (int, byte[]) LiveIds()
-    {
-        if (Chat is null) return (EntrySuccess, Fail("runtime_failure"));
-        object? ids = ChatType!.GetProperty("LiveNetEntityIds")!.GetValue(Chat);
-        var rows = new List<string>();
-        if (ids is IEnumerable values) foreach (object value in values) rows.Add(value.ToString() ?? string.Empty);
-        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["ids"] = rows }));
-    }
-
-    private static (int, byte[]) AdmitInput(JsonElement root)
-    {
-        if (!TryString(root, "roomId", out string? room) || !TryString(root, "connection", out string? connection) || !TryString(root, "envelopeBase64", out string? encoded) || !root.TryGetProperty("connectionGeneration", out JsonElement generation) || !generation.TryGetUInt64(out ulong value)) return (EntrySuccess, Fail("invalid_request"));
-        byte[] envelope;
-        try { envelope = Convert.FromBase64String(encoded!); }
-        catch (FormatException) { return (EntrySuccess, Fail("bad_envelope")); }
-        if (WireCodecType!.GetMethod("DecodeInput", BindingFlags.Public | BindingFlags.Static) is null) return (EntrySuccess, Fail("boot_failed"));
-        object[] parse = { Encoding.UTF8.GetString(envelope), null!, null! };
-        bool parsed = Convert.ToBoolean(ChatEnvelopeType!.GetMethod("TryParseInputCommand")!.Invoke(null, parse), System.Globalization.CultureInfo.InvariantCulture);
-        if (!parsed)
-        {
-            object? failure = parse[2];
-            string parseCode = failure?.GetType().GetProperty("Code")?.GetValue(failure) as string ?? "bad_envelope";
-            return (EntrySuccess, Fail(parseCode));
+            Enqueue(CreateWorldMessage(messageType!, root));
+            return (EntrySuccess, Ok());
         }
-        string text = parse[1] as string ?? string.Empty;
-        Type inputType = Replication!.GetType("Lumio.GameRuntime.Replication.Chat.ChatInput")!;
-        object input = inputType.GetConstructor(new[] { typeof(string) })!.Invoke(new object?[] { text });
-        object result = ChatType!.GetMethod("AdmitInput")!.Invoke(Chat, new[] { room, connection, value, input })!;
-        bool ok = Convert.ToBoolean(result.GetType().GetProperty("Succeeded")!.GetValue(result), System.Globalization.CultureInfo.InvariantCulture);
-        string? code = result.GetType().GetProperty("Code")!.GetValue(result) as string;
-        return (EntrySuccess, ok ? Ok() : Fail(code ?? "invalid_request"));
+        catch (FormatException) { return (EntryInvalidInput, Fail("bad_envelope")); }
+        catch (TargetInvocationException error) when (error.InnerException is ArgumentException or InvalidOperationException)
+        {
+            return (EntrySuccess, Fail("invalid_request"));
+        }
     }
+
+    private static object CreateWorldMessage(string messageType, JsonElement root)
+    {
+        string type = messageType.EndsWith("Message", StringComparison.Ordinal) ? messageType : messageType + "Message";
+        if (type == "AdmitConnectionMessage")
+        {
+            return NewMessage(type,
+                RequiredString(root, "connection"),
+                RequiredString(root, "accountId"),
+                RequiredString(root, "roomId"),
+                RequiredString(root, "entityType"));
+        }
+        if (type == "DisconnectConnectionMessage") return NewMessage(type, RequiredString(root, "connection"));
+        if (type == "RebindConnectionMessage")
+        {
+            return NewMessage(type,
+                RequiredString(root, "connection"),
+                RequiredString(root, "accountId"),
+                RequiredString(root, "roomId"),
+                RequiredString(root, "mode"));
+        }
+        if (type == "InputCommandMessage") return CreateInputMessage(root);
+        throw new FormatException("unsupported world message");
+    }
+
+    private static object CreateInputMessage(JsonElement root)
+    {
+        string senderText = RequiredString(root, "senderNetEntityId");
+        string encoded = RequiredString(root, "envelopeBase64");
+        byte[] envelope = Convert.FromBase64String(encoded);
+        Type netEntityIdType = Ecs!.GetType("Lumio.GameRuntime.Ecs.NetEntityId")!;
+        object sender = netEntityIdType.GetMethod("Parse", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { senderText })!;
+        Type messageType = Ecs.GetType("Lumio.GameRuntime.Ecs.InputCommandMessage")!;
+        object message = DecodeInput(envelope, sender, netEntityIdType, messageType);
+        if (Read(root, "connection") is string connection)
+            messageType.GetProperty("Connection")?.SetValue(message, connection);
+        return message;
+    }
+
+    private static object DecodeInput(byte[] envelope, object sender, Type netEntityIdType, Type messageType)
+    {
+        MethodInfo decode = WireCodecType!.GetMethod(
+            "DecodeInput",
+            BindingFlags.Public | BindingFlags.Static,
+            binder: null,
+            types: new[] { typeof(ReadOnlySpan<byte>), netEntityIdType },
+            modifiers: null) ?? throw new MissingMethodException(WireCodecType.FullName, "DecodeInput");
+        Type bridgeType = typeof(InputDecodeBridge);
+        var method = new DynamicMethod(
+            "lumio_decode_input",
+            typeof(object),
+            new[] { typeof(ReadOnlySpan<byte>), typeof(ulong), typeof(ulong) },
+            typeof(HostEntry).Module,
+            skipVisibility: true);
+        ILGenerator il = method.GetILGenerator();
+        il.Emit(OpCodes.Ldarg_0);
+        il.Emit(OpCodes.Ldarg_1);
+        il.Emit(OpCodes.Ldarg_2);
+        il.Emit(OpCodes.Newobj, netEntityIdType.GetConstructor(new[] { typeof(ulong), typeof(ulong) })!);
+        il.Emit(OpCodes.Call, decode);
+        il.Emit(OpCodes.Ret);
+        InputDecodeBridge bridge = (InputDecodeBridge)method.CreateDelegate(bridgeType);
+        ulong instance = Convert.ToUInt64(netEntityIdType.GetProperty("InstanceId")!.GetValue(sender), System.Globalization.CultureInfo.InvariantCulture);
+        ulong counter = Convert.ToUInt64(netEntityIdType.GetProperty("Counter")!.GetValue(sender), System.Globalization.CultureInfo.InvariantCulture);
+        return bridge(envelope, instance, counter);
+    }
+
+    private delegate object InputDecodeBridge(ReadOnlySpan<byte> envelope, ulong instanceId, ulong counter);
 
     private static (int, byte[]) Tick(JsonElement root)
     {
         _ = root;
-        IReadOnlyList<object>? messages = TickManager();
+        TickManager();
         ulong applied = WorldValue("Tick");
         ulong revision = WorldValue("Revision");
-        int events = 0;
-        if (messages is not null)
-            foreach (object message in messages)
-                if (message.GetType().Name == "WorldChangeMessage")
-                {
-                    events = (message.GetType().GetProperty("Rpcs")!.GetValue(message) as ICollection)?.Count ?? 0;
-                    break;
-                }
-        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["appliedTick"] = applied, ["revision"] = revision, ["eventCount"] = events, ["frames"] = EncodeFrames(messages) }));
+        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["appliedTick"] = applied, ["revision"] = revision }));
     }
 
     private static (int, byte[]) DrainOutbox()
@@ -291,19 +241,10 @@ public static class HostEntry
         ManagerType.GetMethod("Start")!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
         AttachBindingAdapter();
-        Chat = ChatType!.GetMethod("Create", new[] { BindingType, typeof(bool) })!.Invoke(null, new object?[] { Bindings, false });
         return (EntrySuccess, Ok());
     }
 
-    private static (int, byte[]) Shutdown()
-    {
-        (Chat as IDisposable)?.Dispose();
-        (Manager as IDisposable)?.Dispose();
-        Chat = null; Bindings = null; Manager = null;
-        return (EntrySuccess, Ok());
-    }
-
-    private static object NewMessage(string typeName, params string?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;
+    private static object NewMessage(string typeName, params object?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;
     private static void AttachBindingAdapter()
     {
         MethodInfo attach = ManagerType!.GetMethod("AttachControlAdapter", BindingFlags.Public | BindingFlags.Instance)
@@ -321,32 +262,12 @@ public static class HostEntry
         }
     }
     private static void Enqueue(object message) => ManagerType!.GetMethod("Enqueue")!.Invoke(Manager, new[] { message });
-    private static List<object>? TickManager() { ManagerType!.GetMethod("Tick")!.Invoke(Manager, null); return DrainManager(); }
+    private static void TickManager() => ManagerType!.GetMethod("Tick")!.Invoke(Manager, null);
     private static List<object>? DrainManager() => ManagerType!.GetMethod("DrainOutbox")!.Invoke(Manager, null) is IEnumerable rows ? ToObjectList(rows) : null;
     private static List<object> ToObjectList(IEnumerable rows) { var result = new List<object>(); foreach (object row in rows) result.Add(row); return result; }
     private static ulong WorldValue(string property) { object world = ManagerType!.GetProperty("World")!.GetValue(Manager)!; return Convert.ToUInt64(world.GetType().GetProperty(property)!.GetValue(world), System.Globalization.CultureInfo.InvariantCulture); }
 
-    private static (int, byte[]) FromBindingResult(object result, IEnumerable<object>? messages = null)
-    {
-        Type type = result.GetType();
-        string outcome = type.GetProperty("Outcome")!.GetValue(result) as string ?? "request_error";
-        var payload = new Dictionary<string, object?> { ["ok"] = outcome is "ok" or "accepted", ["outcome"] = outcome, ["code"] = type.GetProperty("Code")!.GetValue(result) as string };
-        if (messages is not null) payload["frames"] = EncodeFrames(messages);
-        if (type.GetProperty("Binding")!.GetValue(result) is object binding) payload["binding"] = BindingDict(binding);
-        if (type.GetProperty("Value")!.GetValue(result) is object value) payload["value"] = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture);
-        foreach (string name in new[] { "NetEntityId", "RoomId", "EntityType", "AttributeId", "ObservedRevision", "ObservedTick" })
-        {
-            object? field = type.GetProperty(name)?.GetValue(result);
-            if (field is not null) payload[char.ToLowerInvariant(name[0]) + name[1..]] = field;
-        }
-        return (EntrySuccess, Json(payload));
-    }
-
-    private static Dictionary<string, object?> BindingDict(object binding)
-    {
-        Type type = binding.GetType();
-        return new Dictionary<string, object?> { ["accountId"] = type.GetProperty("AccountId")!.GetValue(binding), ["roomId"] = type.GetProperty("RoomId")!.GetValue(binding), ["netEntityId"] = type.GetProperty("NetEntityId")!.GetValue(binding), ["entityType"] = type.GetProperty("EntityType")!.GetValue(binding), ["connectionGeneration"] = type.GetProperty("ConnectionGeneration")!.GetValue(binding) };
-    }
+    private static string RequiredString(JsonElement root, string name) => TryString(root, name, out string? value) ? value! : throw new FormatException("missing field: " + name);
 
     private static bool TryString(JsonElement root, string name, out string? value)
     {
@@ -365,11 +286,27 @@ public static class HostEntry
         foreach (object message in messages)
         {
             byte[] bytes = (byte[])WireCodecType!.GetMethod("EncodePack")!.Invoke(null, new[] { message })!;
-            frames.Add(new Dictionary<string, object?>
+            var frame = new Dictionary<string, object?>
             {
                 ["connection"] = message.GetType().GetProperty("Connection")?.GetValue(message),
                 ["bytesBase64"] = Convert.ToBase64String(bytes),
-            });
+                ["messageType"] = message.GetType().Name.EndsWith("Message", StringComparison.Ordinal)
+                    ? message.GetType().Name[..^"Message".Length]
+                    : message.GetType().Name,
+            };
+            Type type = message.GetType();
+            object? observer = type.GetProperty("Self")?.GetValue(message)
+                ?? type.GetProperty("ObserverId")?.GetValue(message)
+                ?? type.GetProperty("NetEntityId")?.GetValue(message);
+            if (observer is not null && !(type.GetProperty("IsDefault")?.GetValue(observer) as bool? ?? false))
+                frame["observerNetEntityId"] = observer.ToString();
+            object? generation = type.GetProperty("ConnectionGeneration")?.GetValue(message)
+                ?? type.GetProperty("NewConnectionGeneration")?.GetValue(message);
+            if (generation is not null)
+                frame["connectionGeneration"] = generation;
+            if (type.GetProperty("Code")?.GetValue(message) is string code)
+                frame["code"] = code;
+            frames.Add(frame);
         }
         return frames;
     }

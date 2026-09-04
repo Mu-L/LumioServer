@@ -214,7 +214,7 @@ fn suite_unauthorized_query_uses_claimed_mark_not_undeclared_flag() {
 }
 
 #[test]
-fn host_entry_resolve_forwards_ok_entity_as_binding() {
+fn host_entry_has_no_synchronous_binding_resolution_path() {
     let path = process_root()
         .parent()
         .expect("modules")
@@ -223,12 +223,10 @@ fn host_entry_resolve_forwards_ok_entity_as_binding() {
         .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
     let text = fs::read_to_string(&path).expect("HostEntry.cs");
     assert!(
-        text.contains("ResolveByNetEntityId"),
-        "Resolve must delegate to the authoritative Runtime query"
-    );
-    assert!(
-        !text.contains("ListBindings") && !text.contains("NormalizeNetEntityId"),
-        "Resolve must not add a host-side census or NetEntityId normalization fallback; Runtime owns identity parsing and binding truth"
+        !text.contains("ResolveByNetEntityId")
+            && !text.contains("SelfLookup")
+            && !text.contains("BindingDict"),
+        "HostEntry must not expose synchronous binding-resolution helpers"
     );
 }
 
@@ -250,6 +248,9 @@ fn host_entry_uses_runtime_world_manager_passthrough_and_codec() {
         "CreateFromSnapshot",
         "Enqueue",
         "Tick",
+        "observerNetEntityId",
+        "connectionGeneration",
+        "messageType",
     ] {
         assert!(
             text.contains(required),
@@ -266,6 +267,61 @@ fn host_entry_uses_runtime_world_manager_passthrough_and_codec() {
             "HostEntry must not own legacy {removed} path"
         );
     }
+}
+
+#[test]
+fn host_entry_dispatch_is_exact_runtime_five_op_allowlist() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(&path).expect("HostEntry.cs");
+    let dispatch = text
+        .split("private static (int, byte[]) Dispatch")
+        .nth(1)
+        .and_then(|tail| tail.split("private static (int, byte[]) Boot").next())
+        .expect("HostEntry dispatch body");
+    for allowed in ["boot", "enqueue", "tick", "drain", "snapshot", "restore"] {
+        assert_eq!(
+            dispatch.matches(&format!("\"{allowed}\"")).count(),
+            1,
+            "dispatch must contain exactly one {allowed} arm"
+        );
+    }
+    for removed in [
+        "admit",
+        "disconnect",
+        "rebind",
+        "expire",
+        "self_lookup",
+        "resolve",
+        "query",
+        "live_ids",
+        "attach_member",
+        "admit_input",
+        "shutdown",
+    ] {
+        assert!(
+            !dispatch.contains(&format!("\"{removed}\"")),
+            "legacy op {removed} must not be dispatchable"
+        );
+    }
+}
+
+#[test]
+fn clr_runtime_input_stays_opaque_until_runtime_wire_codec() {
+    let path = process_root().join("src/entity_chat/clr.rs");
+    let text = fs::read_to_string(&path).expect("clr.rs");
+    assert!(text.contains("envelopeBase64"));
+    assert!(text.contains("InputCommandMessage"));
+    assert!(
+        !text.contains("payloadHex")
+            && !text.contains("mappingId\"].and_then")
+            && !text.contains("from_slice::<Value>(envelope_bytes)"),
+        "Rust CLR bridge must not parse C-1 command payloads"
+    );
 }
 
 #[test]

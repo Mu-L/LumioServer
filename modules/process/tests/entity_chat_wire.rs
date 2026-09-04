@@ -1,8 +1,8 @@
-//! Room wire: client-received `FullSnapshot` / Delta / `ConnectionSuperseded`.
+//! Room wire: R5 Runtime messages from the consume-only Runtime test double.
 
 mod common;
 
-use common::{delta_frame, snapshot_with_state_blocks, SharedRuntime, TestKernel};
+use common::{welcome_frame, world_change_frame, SharedRuntime, TestKernel};
 use lumio_host_runtime::SharedClock;
 use lumio_server_process::entity_chat::{
     apply_pending_chat_ticks, drain_chat_event_deltas, generate_keys, issue_admission_credential,
@@ -25,10 +25,10 @@ fn host_ready(
     lumio_server_process::entity_chat::Ed25519KeyPair,
 ) {
     let keys = generate_keys();
-    runtime.lock().plant_snapshot(&snapshot_with_state_blocks());
+    runtime.lock().plant_snapshot(&welcome_frame());
     runtime
         .lock()
-        .plant_delta(vec![delta_frame(1), delta_frame(2)]);
+        .plant_delta(vec![world_change_frame(1), world_change_frame(2)]);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::test(),
@@ -42,7 +42,7 @@ fn host_ready(
 }
 
 #[test]
-fn admit_sends_full_snapshot_with_state_blocks_to_the_client() {
+fn runtime_welcome_contains_canonical_self_identity() {
     let (host, keys) = host_ready(SharedRuntime::new());
     let admit = host.admit(
         "room-main".to_owned(),
@@ -52,18 +52,8 @@ fn admit_sends_full_snapshot_with_state_blocks_to_the_client() {
     assert!(admit.accepted);
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let frame = client.recv_text().expect("snapshot");
-    assert!(
-        frame.contains("\"messageType\":\"FullSnapshot\""),
-        "client must receive FullSnapshot, got {frame}"
-    );
-    assert!(
-        frame.contains("\"stateBlocks\""),
-        "FullSnapshot must include stateBlocks, got {frame}"
-    );
-    assert!(
-        frame.contains("\"mappingId\":\"entity.identity\""),
-        "FullSnapshot must carry Runtime entity.identity, got {frame}"
-    );
+    assert!(frame.contains("\"messageType\":\"Welcome\""));
+    assert!(frame.contains("\"selfNetEntityId\""));
 }
 
 #[test]
@@ -94,8 +84,8 @@ fn room_client_chat_input_over_wire_then_tick_sends_chat_event_delta() {
     assert!(tick.ok, "kernel tickFrame must run, got {tick:?}");
     let frame = client.recv_text().expect("delta");
     assert!(
-        frame.contains("\"mappingId\":\"chat.event\""),
-        "Room WS chat.input must become chat.event, got {frame}"
+        frame.contains("\"messageType\":\"WorldChange\""),
+        "Room WS chat.input must become Runtime WorldChange, got {frame}"
     );
 }
 
@@ -168,16 +158,16 @@ fn admit_chat_input_then_tick_sends_chat_event_delta_to_room_client() {
     );
     let frame = client.recv_text().expect("delta");
     assert!(
-        frame.contains("\"messageType\":\"Delta\""),
-        "Room client must receive a C-1 Delta, got {frame}"
+        frame.contains("\"messageType\":\"WorldChange\""),
+        "Room client must receive a C-1 WorldChange, got {frame}"
     );
     assert!(
-        frame.contains("\"mappingId\":\"chat.event\""),
-        "Delta.changedBlocks must contain decodeable mappingId=chat.event, got {frame}"
+        frame.contains("\"method\":\"OnChatMessage\""),
+        "WorldChange.rpcs must contain Runtime ChatComponent.OnChatMessage, got {frame}"
     );
     assert!(
-        !frame.contains("\"changedBlocks\":[]"),
-        "live-equivalent admit_input + tick must not broadcast empty changedBlocks, got {frame}"
+        !frame.contains("\"rpcs\":[]"),
+        "live-equivalent room input + tick must not broadcast empty WorldChange.rpcs, got {frame}"
     );
 }
 
@@ -205,8 +195,8 @@ fn tick_broadcasts_runtime_delta_bytes_in_order() {
     let second_a = a.recv_text().expect("a2");
     let first_b = b.recv_text().expect("b1");
     let second_b = b.recv_text().expect("b2");
-    assert!(first_a.contains("\"messageType\":\"Delta\""));
-    assert!(second_a.contains("\"messageType\":\"Delta\""));
+    assert!(first_a.contains("\"messageType\":\"WorldChange\""));
+    assert!(second_a.contains("\"messageType\":\"WorldChange\""));
     assert_eq!(first_a, first_b);
     assert_eq!(second_a, second_b);
     assert_ne!(first_a, second_a);
@@ -241,12 +231,11 @@ fn takeover_sends_connection_superseded_before_close() {
     );
     let mut new_client = RoomClient::connect(&host.listen_uri(), "c-new").expect("new");
     let snapshot = new_client.recv_text().expect("new snapshot");
-    assert!(snapshot.contains("stateBlocks"));
-    assert!(snapshot.contains("\"mappingId\":\"entity.identity\""));
+    assert!(snapshot.contains("\"messageType\":\"Welcome\""));
+    assert!(snapshot.contains("\"selfNetEntityId\""));
 }
 
-const HOST_MINTED_EMPTY: &str =
-    r#"{"messageType":"FullSnapshot","tickId":0,"revision":0,"stateBlocks":[]}"#;
+const HOST_MINTED_EMPTY: &str = r#"{"connectionGeneration":1,"instanceId":0,"messageType":"Welcome","selfNetEntityId":"00000000000000000000000000000001"}"#;
 
 #[test]
 fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
@@ -272,14 +261,11 @@ fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
     let frame = client.recv_text();
     assert!(
         frame.as_ref().is_err() || frame.as_ref().is_ok_and(|text| text != HOST_MINTED_EMPTY),
-        "client must not receive a host-minted empty FullSnapshot, got {frame:?}"
+        "client must not receive a host-minted empty Welcome, got {frame:?}"
     );
     assert!(
-        client
-            .received
-            .iter()
-            .all(|text| text != HOST_MINTED_EMPTY && !text.contains("\"stateBlocks\":[]")),
-        "no host-invented empty FullSnapshot on the wire, got {:?}",
+        client.received.iter().all(|text| text != HOST_MINTED_EMPTY),
+        "no host-invented empty Welcome on the wire, got {:?}",
         client.received
     );
 }
@@ -415,11 +401,11 @@ fn second_c_browser_attach_still_receives_room_delta() {
     let first_frame = first.recv_text().expect("first delta");
     let second_frame = second.recv_text().expect("second delta");
     assert!(
-        first_frame.contains("\"mappingId\":\"chat.event\""),
-        "first c-browser observer must keep receiving, got {first_frame}"
+        first_frame.contains("\"messageType\":\"WorldChange\""),
+        "first c-browser observer must keep receiving WorldChange, got {first_frame}"
     );
     assert!(
-        second_frame.contains("\"mappingId\":\"chat.event\""),
-        "Playwright-style second c-browser attach must also receive, got {second_frame}"
+        second_frame.contains("\"messageType\":\"WorldChange\""),
+        "Playwright-style second c-browser attach must also receive WorldChange, got {second_frame}"
     );
 }

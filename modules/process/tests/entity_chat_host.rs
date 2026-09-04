@@ -7,7 +7,8 @@ use lumio_host_runtime::{HostClock, SharedClock};
 use lumio_server_process::entity_chat::{
     generate_keys, issue_admission_credential, AttributeQueryOutcome, AttributeQueryRequest,
     AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, InputCommand, QueryResult,
-    ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
+    ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
+    RECONNECT_WINDOW_MS,
 };
 
 fn host_with(
@@ -322,8 +323,9 @@ fn sixty_four_chat_inputs_one_tick_emit_chat_event() {
     assert_eq!(tick.event_count, 64);
     let frame = client.recv_text().expect("delta");
     assert!(
-        frame.contains("\"mappingId\":\"chat.event\""),
-        "N=64 must emit chat.event, got {frame}"
+        frame.contains("\"messageType\":\"WorldChange\"")
+            && frame.contains("\"method\":\"OnChatMessage\""),
+        "N=64 must emit Runtime ChatComponent.OnChatMessage, got {frame}"
     );
 }
 
@@ -368,6 +370,39 @@ fn host_run_tick_must_not_runtick_more_than_max_chat_inputs() {
 }
 
 #[test]
+fn deferred_overflow_retires_session_and_disconnects_runtime_binding() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    let admitted = host.admit(
+        "room-main".to_owned(),
+        "c-overflow".to_owned(),
+        credential(&keys, "OverflowBot", true),
+    );
+    assert!(admitted.accepted);
+
+    // No socket is attached, so each Runtime frame is deferred until the
+    // per-connection bound is reached and the logical session is retired.
+    runtime.lock().plant_delta(vec!["deferred".to_owned()]);
+    for _ in 0..=MAX_DEFERRED_FRAMES_PER_CONNECTION {
+        let _ = host.run_tick("room-main".to_owned());
+    }
+
+    assert!(
+        host.try_self_lookup("c-overflow".to_owned()).is_none(),
+        "overflow must remove the logical session"
+    );
+    assert_eq!(host.wire_observer_count("c-overflow".to_owned()), 0);
+    assert!(
+        runtime
+            .lock()
+            .disconnect_calls()
+            .iter()
+            .any(|connection| connection == "c-overflow"),
+        "overflow must ask Runtime to disconnect the retired binding"
+    );
+}
+
+#[test]
 fn sixty_five_chat_inputs_one_tick_empty_delta_is_not_success() {
     let (host, keys) = host_with(SharedRuntime::new());
     admit_n(&host, &keys, 65);
@@ -385,13 +420,10 @@ fn sixty_five_chat_inputs_one_tick_empty_delta_is_not_success() {
     match client.recv_text() {
         Ok(frame) => {
             assert!(
-                !frame.contains("\"mappingId\":\"chat.event\""),
-                "N=65 must not emit chat.event, got {frame}"
+                !frame.contains("\"method\":\"OnChatMessage\""),
+                "N=65 must not emit Runtime chat RPC, got {frame}"
             );
-            assert!(
-                frame.contains("\"changedBlocks\":[]") || !tick.ok,
-                "N=65 empty Delta is not SUCCESS, got {frame}"
-            );
+            assert!(!tick.ok, "N=65 WorldChange is not SUCCESS, got {frame}");
         }
         Err(_) => assert!(
             !tick.ok,
