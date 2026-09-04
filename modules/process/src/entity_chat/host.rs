@@ -10,13 +10,11 @@ use lumio_host_runtime::{
 };
 
 use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
-use super::envelope::{
-    connection_superseded_json, net_entity_id_to_u64, normalize_net_entity_id, InputCommand,
-};
+use super::envelope::{normalize_net_entity_id, InputCommand};
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
-    RuntimeAdmit, RuntimeBinding, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    RuntimeAdmit, RuntimeBinding, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
 use super::wire::{RoomListener, WireEvent, WireSender};
 use super::MAX_CHAT_INPUTS_PER_TICK;
@@ -154,6 +152,7 @@ struct Inner {
     account_sessions: HashMap<String, String>,
     expire_watch: HashMap<KernelHandle, String>,
     pending_egress: HashMap<String, Vec<WireSender>>,
+    deferred_frames: HashMap<String, Vec<Vec<u8>>>,
     tick_id: u64,
     wire_chat_pending: u64,
 }
@@ -214,6 +213,7 @@ impl EntityChatHost {
                 account_sessions: HashMap::new(),
                 expire_watch: HashMap::new(),
                 pending_egress: HashMap::new(),
+                deferred_frames: HashMap::new(),
                 tick_id: 0,
                 wire_chat_pending: 0,
             };
@@ -318,10 +318,12 @@ impl EntityChatHost {
     /// Decodes a frozen InputCommand (chat.input) envelope, then queues ChatInput.
     #[must_use]
     pub fn admit_chat_input(&self, connection_id: String, envelope: InputCommand) -> ChatOperation {
-        self.on_owner(move |inner| inner.admit_chat_input(&connection_id, &envelope))
+        self.on_owner(move |inner| {
+            inner.admit_chat_input(&connection_id, envelope.to_json().as_bytes())
+        })
     }
 
-    /// Advances kernel tickFrame and broadcasts Runtime BuildDelta bytes.
+    /// Advances kernel tickFrame and routes Runtime-owned outbox frames.
     #[must_use]
     pub fn run_tick(&self, room_id: String) -> RuntimeTick {
         self.on_owner(move |inner| inner.run_tick(&room_id))
@@ -464,6 +466,7 @@ impl Inner {
         if admitted.accepted {
             return self.commit_session(connection_id, payload, admitted, false, false);
         }
+        self.route_frames(room_id, &admitted.frames);
         if admitted.code.as_deref() == Some("cross_room_reference") {
             return RoomAdmitResult::reject("invalid_request");
         }
@@ -482,6 +485,7 @@ impl Inner {
             );
             return self.commit_session(connection_id, payload, rebound, true, false);
         }
+        self.route_frames(room_id, &rebound.frames);
         RoomAdmitResult::reject(admitted.code.as_deref().unwrap_or("invalid_request"))
     }
 
@@ -504,19 +508,19 @@ impl Inner {
             room_id,
             RebindMode::Takeover,
         );
-        let Some(binding) = rebound.binding.clone() else {
+        let Some(_binding) = rebound.binding.clone() else {
+            self.route_frames(room_id, &rebound.frames);
             return RoomAdmitResult::reject(rebound.code.as_deref().unwrap_or("invalid_request"));
         };
-        let new_generation = binding.connection_generation;
-        let net_u64 = net_entity_id_to_u64(&binding.net_entity_id).unwrap_or(0);
-        if let Some(old) = self.sessions.remove(old_id) {
-            for egress in &old.egresses {
-                let _ = egress.send_text(connection_superseded_json(net_u64, new_generation));
-                let _ = egress.close();
+        let result = self.commit_session(connection_id, payload, rebound, false, true);
+        if result.accepted {
+            if let Some(old) = self.sessions.remove(old_id) {
+                for egress in &old.egresses {
+                    let _ = egress.close();
+                }
             }
         }
-        self.account_sessions.remove(&payload.account_id);
-        self.commit_session(connection_id, payload, rebound, false, true)
+        result
     }
 
     fn commit_session(
@@ -527,6 +531,7 @@ impl Inner {
         reconnected: bool,
         takeover: bool,
     ) -> RoomAdmitResult {
+        let frames = admitted.frames.clone();
         let Some(runtime_binding) = admitted.binding else {
             return RoomAdmitResult::reject("invalid_request");
         };
@@ -557,19 +562,27 @@ impl Inner {
         self.account_sessions
             .insert(payload.account_id.clone(), connection_id.to_owned());
         self.sessions.insert(connection_id.to_owned(), session);
-        self.send_full_snapshot(connection_id);
+        self.route_frames(&binding.room_id, &frames);
         RoomAdmitResult::ok(binding, reconnected, takeover)
     }
 
     fn disconnect(&mut self, connection_id: &str) -> bool {
+        let Some(session) = self.sessions.get(connection_id) else {
+            return false;
+        };
+        let room_id = session.room_id.clone();
+        let account_id = session.account_id.clone();
+        let runtime_result = self.runtime.disconnect(connection_id);
         let Some(session) = self.sessions.remove(connection_id) else {
             return false;
         };
-        self.account_sessions.remove(&session.account_id);
+        self.account_sessions.remove(&account_id);
+        if let Ok(result) = runtime_result {
+            self.route_frames(&room_id, &result.frames);
+        }
         for egress in &session.egresses {
             let _ = egress.close();
         }
-        let _ = self.runtime.disconnect(connection_id);
         let due = self.clock.now_ms().saturating_add(self.reconnect_window_ms);
         if let Ok(handle) =
             self.kernel
@@ -612,14 +625,14 @@ impl Inner {
         }
     }
 
-    fn admit_chat_input(&mut self, connection_id: &str, envelope: &InputCommand) -> ChatOperation {
+    fn admit_chat_input(&mut self, connection_id: &str, envelope_bytes: &[u8]) -> ChatOperation {
         let Some(session) = self.sessions.get(connection_id) else {
             return ChatOperation::rejected("disconnected");
         };
         let room_id = session.room_id.clone();
         let generation = session.generation;
         self.runtime
-            .admit_input_command(&room_id, connection_id, generation, &envelope.to_json())
+            .admit_input_command(&room_id, connection_id, generation, envelope_bytes)
     }
 
     fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
@@ -634,59 +647,72 @@ impl Inner {
             return RuntimeTick::failed("runtime_failure");
         }
         let tick = self.runtime.run_tick(room_id, self.tick_id);
+        self.route_frames(room_id, &tick.frames);
         if !tick.ok {
             return tick;
         }
         self.wire_chat_pending = 0;
-        let frames = self
-            .runtime
-            .build_delta(room_id, tick.applied_tick, tick.revision);
-        self.broadcast(room_id, &frames);
         tick
     }
 
-    fn broadcast(&mut self, room_id: &str, frames: &[Vec<u8>]) {
-        for session in self.sessions.values_mut() {
-            if session.room_id != room_id {
+    fn route_frames(&mut self, room_id: &str, frames: &[RuntimeFrame]) {
+        for frame in frames {
+            if let Some(connection) = frame.connection.as_deref() {
+                let delivered = self.deliver_to_connection(connection, &frame.bytes);
+                if !delivered {
+                    self.deferred_frames
+                        .entry(connection.to_owned())
+                        .or_default()
+                        .push(frame.bytes.clone());
+                }
                 continue;
             }
-            session.egresses.retain(|egress| {
-                frames
-                    .iter()
-                    .all(|frame| egress.send_text(String::from_utf8_lossy(frame).into_owned()))
-            });
+            let targets: Vec<String> = self
+                .sessions
+                .iter()
+                .filter(|(_, session)| session.room_id == room_id)
+                .map(|(connection, _)| connection.clone())
+                .collect();
+            for connection in targets {
+                if !self.deliver_to_connection(&connection, &frame.bytes) {
+                    self.deferred_frames
+                        .entry(connection)
+                        .or_default()
+                        .push(frame.bytes.clone());
+                }
+            }
         }
     }
 
-    fn send_full_snapshot(&mut self, connection_id: &str) {
-        let Some(session) = self.sessions.get(connection_id) else {
-            return;
+    fn deliver_to_connection(&mut self, connection: &str, bytes: &[u8]) -> bool {
+        let Some(session) = self.sessions.get_mut(connection) else {
+            return false;
         };
-        let room_id = session.room_id.clone();
-        let egresses = session.egresses.clone();
-        if egresses.is_empty() {
-            return;
+        if session.egresses.is_empty() {
+            return false;
         }
-        let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
-        if bytes.is_empty() {
-            return;
-        }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        for egress in &egresses {
-            let _ = egress.send_text(text.clone());
-        }
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        let mut delivered = false;
+        session.egresses.retain(|egress| {
+            let sent = egress.send_text(text.clone());
+            delivered |= sent;
+            sent
+        });
+        delivered
     }
 
-    fn send_full_snapshot_to(&mut self, connection_id: &str, egress: &WireSender) {
-        let Some(session) = self.sessions.get(connection_id) else {
+    fn flush_deferred(&mut self, connection: &str) {
+        let Some(frames) = self.deferred_frames.remove(connection) else {
             return;
         };
-        let room_id = session.room_id.clone();
-        let bytes = self.runtime.build_full_snapshot(&room_id, self.tick_id, 0);
-        if bytes.is_empty() {
-            return;
+        for bytes in frames {
+            if !self.deliver_to_connection(connection, &bytes) {
+                self.deferred_frames
+                    .entry(connection.to_owned())
+                    .or_default()
+                    .push(bytes);
+            }
         }
-        let _ = egress.send_text(String::from_utf8_lossy(&bytes).into_owned());
     }
 
     fn on_wire(&mut self, event: WireEvent) {
@@ -699,7 +725,7 @@ impl Inner {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
                         session.egresses.push(egress.clone());
                     }
-                    self.send_full_snapshot_to(&connection_id, &egress);
+                    self.flush_deferred(&connection_id);
                 } else {
                     self.pending_egress
                         .entry(connection_id)
@@ -711,15 +737,13 @@ impl Inner {
                 connection_id,
                 text,
             } => {
-                if let Ok(envelope) = parse_input_command_json(&text) {
-                    let admitted = self.admit_chat_input(&connection_id, &envelope);
-                    if admitted.kind == ChatOpKind::Admitted {
-                        self.wire_chat_pending = self.wire_chat_pending.saturating_add(1);
-                    }
+                let admitted = self.admit_chat_input(&connection_id, text.as_bytes());
+                if admitted.kind == ChatOpKind::Admitted {
+                    self.wire_chat_pending = self.wire_chat_pending.saturating_add(1);
                 }
             }
-            WireEvent::Closed { .. } => {
-                // One socket close must not drop other c-browser observers (Playwright + harness).
+            WireEvent::Closed { connection_id } => {
+                let _ = self.disconnect(&connection_id);
             }
         }
     }
@@ -807,39 +831,4 @@ impl Inner {
         rows.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
         rows
     }
-}
-
-fn parse_input_command_json(text: &str) -> Result<InputCommand, ()> {
-    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| ())?;
-    if value.get("messageType").and_then(serde_json::Value::as_str) != Some("InputCommand") {
-        return Err(());
-    }
-    let commands = value
-        .get("commands")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(())?;
-    let mut out = Vec::new();
-    for block in commands {
-        out.push(super::envelope::CommandBlock {
-            mapping_id: block
-                .get("mappingId")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(())?
-                .to_owned(),
-            payload: block
-                .get("payload")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(())?
-                .to_owned(),
-            payload_sha256: block
-                .get("payloadSha256")
-                .and_then(serde_json::Value::as_str)
-                .ok_or(())?
-                .to_owned(),
-        });
-    }
-    Ok(InputCommand {
-        message_type: "InputCommand".to_owned(),
-        commands: out,
-    })
 }

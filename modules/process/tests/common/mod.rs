@@ -8,7 +8,8 @@ use lumio_host_runtime::{KernelError, KernelFired, KernelHandle, KernelTimer, Ti
 use lumio_server_process::entity_chat::{
     normalize_net_entity_id, AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind,
     ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
-    RuntimeQuery, RuntimeSurface, RuntimeTick, MAX_CHAT_INPUTS_PER_TICK,
+    RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    MAX_CHAT_INPUTS_PER_TICK,
 };
 
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -255,10 +256,20 @@ impl RuntimeSurface for ScriptedRuntime {
                 live_connection: Some(connection.to_owned()),
             },
         );
-        RuntimeAdmit::ok(binding)
+        let mut result = RuntimeAdmit::ok(binding);
+        if !self.snapshot_failed {
+            result.frames.push(RuntimeFrame {
+                connection: Some(connection.to_owned()),
+                bytes: self
+                    .planted_snapshot
+                    .clone()
+                    .unwrap_or_else(|| default_snapshot().into_bytes()),
+            });
+        }
+        result
     }
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeBinding, String> {
+    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String> {
         let binding = self
             .by_connection
             .remove(connection)
@@ -274,7 +285,10 @@ impl RuntimeSurface for ScriptedRuntime {
                 live_connection: None,
             },
         );
-        Ok(binding)
+        Ok(RuntimeDisconnect {
+            binding,
+            frames: Vec::new(),
+        })
     }
 
     fn rebind(
@@ -300,7 +314,16 @@ impl RuntimeSurface for ScriptedRuntime {
             binding.connection_generation += 1;
             self.by_connection
                 .insert(connection.to_owned(), binding.clone());
-            return RuntimeAdmit::ok(binding);
+            let mut result = RuntimeAdmit::ok(binding);
+            result.frames.push(RuntimeFrame {
+                connection: Some(old_conn),
+                bytes: superseded_frame(result.binding.as_ref().expect("binding")),
+            });
+            result.frames.push(RuntimeFrame {
+                connection: Some(connection.to_owned()),
+                bytes: default_snapshot().into_bytes(),
+            });
+            return result;
         }
         let Some(occupancy) = self.retained.remove(account_id) else {
             return RuntimeAdmit::reject("binding_not_found");
@@ -319,7 +342,12 @@ impl RuntimeSurface for ScriptedRuntime {
                 live_connection: Some(connection.to_owned()),
             },
         );
-        RuntimeAdmit::ok(binding)
+        let mut result = RuntimeAdmit::ok(binding);
+        result.frames.push(RuntimeFrame {
+            connection: Some(connection.to_owned()),
+            bytes: default_snapshot().into_bytes(),
+        });
+        result
     }
 
     fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
@@ -402,7 +430,7 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         connection: &str,
         _generation: u64,
-        _envelope_json: &str,
+        _envelope_bytes: &[u8],
     ) -> ChatOperation {
         if self.by_connection.contains_key(connection) {
             self.pending_chats
@@ -425,51 +453,29 @@ impl RuntimeSurface for ScriptedRuntime {
                 ok: false,
                 event_count: 0,
                 code: Some("runtime_failure".to_owned()),
+                frames: Vec::new(),
             };
         }
         let event_count = pending.len() as u64;
         self.events_by_tick.insert(tick_id, pending);
-        RuntimeTick::committed(self.tick, self.revision, event_count)
-    }
-
-    fn build_full_snapshot(&mut self, _room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
-        if self.snapshot_failed {
-            return Vec::new();
-        }
-        if let Some(planted) = &self.planted_snapshot {
-            return planted.clone();
-        }
-        format!(
-            r#"{{"messageType":"FullSnapshot","tickId":{tick_id},"revision":{revision},"stateBlocks":[{{"mappingId":"entity.identity","payload":"00","payloadSha256":"00"}}]}}"#
-        )
-        .into_bytes()
-    }
-
-    fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
+        let mut result = RuntimeTick::committed(self.tick, self.revision, event_count);
         if !self.planted_delta.is_empty() {
-            return self.planted_delta.clone();
+            result.frames = self
+                .planted_delta
+                .clone()
+                .into_iter()
+                .map(|bytes| RuntimeFrame {
+                    connection: None,
+                    bytes,
+                })
+                .collect();
+        } else if event_count > 0 {
+            result.frames.push(RuntimeFrame {
+                connection: None,
+                bytes: delta_frame(tick_id).into_bytes(),
+            });
         }
-        let mut frames = Vec::new();
-        if let Some(committed) = self.events_by_tick.get(&tick_id) {
-            for (room, _) in committed {
-                if room == room_id {
-                    frames.push(
-                        format!(
-                            r#"{{"messageType":"Delta","tickId":{tick_id},"revision":{revision},"changedBlocks":[{{"mappingId":"chat.event","payload":"{tick_id}","payloadSha256":"bb"}}]}}"#
-                        )
-                        .into_bytes(),
-                    );
-                }
-            }
-        }
-        if frames.is_empty() {
-            vec![format!(
-                r#"{{"messageType":"Delta","tickId":{tick_id},"revision":{revision},"changedBlocks":[]}}"#
-            )
-            .into_bytes()]
-        } else {
-            frames
-        }
+        result
     }
 
     fn persist(&mut self, _room_id: &str) -> PersistRecord {
@@ -510,7 +516,7 @@ impl RuntimeSurface for SharedRuntime {
             .admit(connection, account_id, room_id, entity_type)
     }
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeBinding, String> {
+    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String> {
         self.lock().disconnect(connection)
     }
 
@@ -557,22 +563,14 @@ impl RuntimeSurface for SharedRuntime {
         room_id: &str,
         connection: &str,
         generation: u64,
-        envelope_json: &str,
+        envelope_bytes: &[u8],
     ) -> ChatOperation {
         self.lock()
-            .admit_input_command(room_id, connection, generation, envelope_json)
+            .admit_input_command(room_id, connection, generation, envelope_bytes)
     }
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
         self.lock().run_tick(room_id, tick_id)
-    }
-
-    fn build_full_snapshot(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
-        self.lock().build_full_snapshot(room_id, tick_id, revision)
-    }
-
-    fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
-        self.lock().build_delta(room_id, tick_id, revision)
     }
 
     fn persist(&mut self, room_id: &str) -> PersistRecord {
@@ -587,6 +585,18 @@ impl RuntimeSurface for SharedRuntime {
 pub fn snapshot_with_state_blocks() -> String {
     r#"{"messageType":"FullSnapshot","tickId":1,"revision":1,"stateBlocks":[{"mappingId":"entity.identity","payload":"01000000010000000000000006000000706c6179657200000000","payloadSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#
         .to_owned()
+}
+
+fn default_snapshot() -> String {
+    snapshot_with_state_blocks()
+}
+
+fn superseded_frame(binding: &RuntimeBinding) -> Vec<u8> {
+    format!(
+        "{{\"messageType\":\"ConnectionSuperseded\",\"netEntityId\":\"{}\",\"newConnectionGeneration\":{},\"reasonCode\":\"connection_superseded\"}}",
+        binding.net_entity_id, binding.connection_generation
+    )
+    .into_bytes()
 }
 
 pub fn delta_frame(seq: u64) -> String {

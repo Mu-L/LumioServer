@@ -405,7 +405,7 @@ fn read_bot_host_logs(log_dir: &Path) -> Result<ClientBotTrace, String> {
             };
             if let Some(source) = value.get("tickSource").and_then(Value::as_str) {
                 if tick_source.is_empty() || source == "native-kernel/tickFrame" {
-                    tick_source = source.to_owned();
+                    source.clone_into(&mut tick_source);
                 }
             }
             if let Some(process_id) = value.get("pid").and_then(Value::as_u64) {

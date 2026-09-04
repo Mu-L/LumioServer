@@ -11,7 +11,7 @@ use super::envelope::normalize_net_entity_id;
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
-    RuntimeQuery, RuntimeSurface, RuntimeTick,
+    RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
 
 /// Files needed to create the CoreCLR Runtime consume host.
@@ -33,7 +33,6 @@ pub struct ClrGameplay {
     replication_assembly: String,
     ecs_assembly: String,
     booted: bool,
-    pending_frames: Vec<Vec<u8>>,
 }
 
 impl ClrGameplay {
@@ -57,7 +56,6 @@ impl ClrGameplay {
             replication_assembly: config.replication_assembly.to_string_lossy().into_owned(),
             ecs_assembly: config.ecs_assembly.to_string_lossy().into_owned(),
             booted: false,
-            pending_frames: Vec::new(),
         })
     }
 
@@ -121,7 +119,7 @@ fn binding_from_entity(value: &Value, room_id: &str) -> Option<RuntimeBinding> {
     }
     Some(RuntimeBinding {
         account_id: value
-            .get("value")
+            .get("accountId")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
@@ -131,7 +129,12 @@ fn binding_from_entity(value: &Value, room_id: &str) -> Option<RuntimeBinding> {
             .unwrap_or(room_id)
             .to_owned(),
         net_entity_id: value.get("netEntityId")?.as_str()?.to_owned(),
-        entity_type: kind_from(value.get("entityType").and_then(Value::as_str)),
+        entity_type: kind_from(
+            value
+                .get("entityType")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("value").and_then(Value::as_str)),
+        ),
         connection_generation: value
             .get("connectionGeneration")
             .and_then(Value::as_u64)
@@ -139,18 +142,45 @@ fn binding_from_entity(value: &Value, room_id: &str) -> Option<RuntimeBinding> {
     })
 }
 
+fn frames_from_runtime(value: &Value) -> Vec<RuntimeFrame> {
+    value
+        .get("frames")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            let bytes = row
+                .get("bytesBase64")
+                .and_then(Value::as_str)
+                .and_then(decode_base64)?;
+            Some(RuntimeFrame {
+                connection: row
+                    .get("connection")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                bytes,
+            })
+        })
+        .collect()
+}
+
 fn admit_from(value: Value) -> RuntimeAdmit {
+    let frames = frames_from_runtime(&value);
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         if let Some(binding) = value.get("binding").and_then(binding_from) {
-            return RuntimeAdmit::ok(binding);
+            let mut result = RuntimeAdmit::ok(binding);
+            result.frames = frames;
+            return result;
         }
     }
-    RuntimeAdmit::reject(
+    let mut result = RuntimeAdmit::reject(
         value
             .get("code")
             .and_then(Value::as_str)
             .unwrap_or("invalid_request"),
-    )
+    );
+    result.frames = frames;
+    result
 }
 
 impl RuntimeSurface for ClrGameplay {
@@ -168,20 +198,21 @@ impl RuntimeSurface for ClrGameplay {
             "roomId": room_id,
             "entityType": entity_type.as_str(),
         })) {
-            Ok(value) => {
-                self.pending_frames.extend(frames_from_runtime(&value));
-                admit_from(value)
-            }
+            Ok(value) => admit_from(value),
             Err(_) => RuntimeAdmit::reject("runtime_failure"),
         }
     }
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeBinding, String> {
+    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String> {
         let value = self.call(json!({ "op": "disconnect", "connection": connection }))?;
-        value
+        let binding = value
             .get("binding")
             .and_then(binding_from)
-            .ok_or_else(|| "binding_not_found".to_owned())
+            .ok_or_else(|| "binding_not_found".to_owned())?;
+        Ok(RuntimeDisconnect {
+            binding,
+            frames: frames_from_runtime(&value),
+        })
     }
 
     fn rebind(
@@ -202,10 +233,7 @@ impl RuntimeSurface for ClrGameplay {
             "roomId": room_id,
             "mode": mode,
         })) {
-            Ok(value) => {
-                self.pending_frames.extend(frames_from_runtime(&value));
-                admit_from(value)
-            }
+            Ok(value) => admit_from(value),
             Err(_) => RuntimeAdmit::reject("runtime_failure"),
         }
     }
@@ -266,7 +294,8 @@ impl RuntimeSurface for ClrGameplay {
     }
 
     fn list_bindings(&mut self, room_id: &str) -> Vec<RuntimeBinding> {
-        let ids = self.call(json!({ "op": "live_ids" }))
+        let ids = self
+            .call(json!({ "op": "live_ids" }))
             .ok()
             .and_then(|value| value.get("ids").and_then(Value::as_array).cloned())
             .unwrap_or_default()
@@ -299,20 +328,14 @@ impl RuntimeSurface for ClrGameplay {
         room_id: &str,
         connection: &str,
         generation: u64,
-        envelope_json: &str,
+        envelope_bytes: &[u8],
     ) -> ChatOperation {
-        let text = serde_json::from_str::<super::envelope::InputCommand>(envelope_json)
-            .ok()
-            .and_then(|input| input.try_decode_chat_text().ok());
-        let Some(text) = text else {
-            return ChatOperation::rejected("bad_envelope");
-        };
         match self.call(json!({
             "op": "admit_input",
             "roomId": room_id,
             "connection": connection,
             "connectionGeneration": generation,
-            "text": text,
+            "envelopeBase64": base64_encode(envelope_bytes),
         })) {
             Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
                 ChatOperation::admitted()
@@ -329,22 +352,9 @@ impl RuntimeSurface for ClrGameplay {
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
         match self.call(json!({ "op": "tick", "roomId": room_id, "tickId": tick_id })) {
-            Ok(value) => {
-                self.pending_frames.extend(frames_from_runtime(&value));
-                tick_from_hostentry_json(value)
-            }
+            Ok(value) => tick_from_hostentry_json(value),
             Err(_) => RuntimeTick::failed("runtime_failure"),
         }
-    }
-
-    fn build_full_snapshot(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
-        let _ = (room_id, tick_id, revision);
-        self.pending_frames.first().cloned().map(|_| self.pending_frames.remove(0)).unwrap_or_default()
-    }
-
-    fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
-        let _ = (room_id, tick_id, revision);
-        std::mem::take(&mut self.pending_frames)
     }
 
     fn persist(&mut self, room_id: &str) -> PersistRecord {
@@ -358,9 +368,7 @@ impl RuntimeSurface for ClrGameplay {
                     .and_then(decode_base64)
             })
             .unwrap_or_default();
-        PersistRecord {
-            bytes: hex,
-        }
+        PersistRecord { bytes: hex }
     }
 
     fn restore(&mut self, room_id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -377,20 +385,9 @@ impl RuntimeSurface for ClrGameplay {
     }
 }
 
-fn frames_from_runtime(value: &Value) -> Vec<Vec<u8>> {
-    value
-        .get("frames")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .filter_map(decode_base64)
-        .collect()
-}
-
 fn decode_base64(value: &str) -> Option<Vec<u8>> {
     let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -407,8 +404,16 @@ fn decode_base64(value: &str) -> Option<Vec<u8>> {
     for chunk in bytes.chunks_exact(4) {
         let a = sextet(chunk[0])?;
         let b = sextet(chunk[1])?;
-        let c = if chunk[2] == b'=' { 0 } else { sextet(chunk[2])? };
-        let d = if chunk[3] == b'=' { 0 } else { sextet(chunk[3])? };
+        let c = if chunk[2] == b'=' {
+            0
+        } else {
+            sextet(chunk[2])?
+        };
+        let d = if chunk[3] == b'=' {
+            0
+        } else {
+            sextet(chunk[3])?
+        };
         out.push((a << 2) | (b >> 4));
         if chunk[2] != b'=' {
             out.push((b << 4) | (c >> 2));
@@ -429,8 +434,16 @@ fn base64_encode(bytes: &[u8]) -> String {
         let c = chunk.get(2).copied().unwrap_or(0);
         out.push(char::from(TABLE[(a >> 2) as usize]));
         out.push(char::from(TABLE[((a << 4 | b >> 4) & 0x3f) as usize]));
-        out.push(if chunk.len() > 1 { char::from(TABLE[((b << 2 | c >> 6) & 0x3f) as usize]) } else { '=' });
-        out.push(if chunk.len() > 2 { char::from(TABLE[(c & 0x3f) as usize]) } else { '=' });
+        out.push(if chunk.len() > 1 {
+            char::from(TABLE[((b << 2 | c >> 6) & 0x3f) as usize])
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            char::from(TABLE[(c & 0x3f) as usize])
+        } else {
+            '='
+        });
     }
     out
 }
@@ -450,16 +463,19 @@ pub(crate) fn tick_from_hostentry_json(value: Value) -> RuntimeTick {
             ok: false,
             event_count: 0,
             code: code.or_else(|| Some("runtime_failure".to_owned())),
+            frames: frames_from_runtime(&value),
         };
     }
-    RuntimeTick::committed(
+    let mut tick = RuntimeTick::committed(
         value
             .get("appliedTick")
             .and_then(Value::as_u64)
             .unwrap_or(0),
         value.get("revision").and_then(Value::as_u64).unwrap_or(0),
         event_count,
-    )
+    );
+    tick.frames = frames_from_runtime(&value);
+    tick
 }
 
 #[cfg(test)]
@@ -485,14 +501,22 @@ mod tests {
     #[test]
     fn runtime_frame_base64_round_trips_binary_wire_bytes() {
         let bytes = [0_u8, 1, 2, 253, 254, 255];
-        assert_eq!(decode_base64(&base64_encode(&bytes)).as_deref(), Some(bytes.as_slice()));
+        assert_eq!(
+            decode_base64(&base64_encode(&bytes)).as_deref(),
+            Some(bytes.as_slice())
+        );
     }
 
     #[test]
-    fn runtime_frames_are_decoded_only_from_the_runtime_envelope() {
+    fn runtime_frames_preserve_connection_association() {
         let encoded = base64_encode(b"wire");
-        let value = json!({ "frames": [encoded], "ok": true });
-        assert_eq!(frames_from_runtime(&value), vec![b"wire".to_vec()]);
-        assert!(frames_from_runtime(&json!({ "frames": ["bad"] })).is_empty());
+        let value =
+            json!({ "frames": [{ "connection": "c1", "bytesBase64": encoded }], "ok": true });
+        assert_eq!(
+            frames_from_runtime(&value)[0].connection.as_deref(),
+            Some("c1")
+        );
+        assert_eq!(frames_from_runtime(&value)[0].bytes, b"wire");
+        assert!(frames_from_runtime(&json!({ "frames": [{ "bytesBase64": "bad" }] })).is_empty());
     }
 }

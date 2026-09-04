@@ -233,6 +233,60 @@ fn host_entry_resolve_forwards_ok_entity_as_binding() {
 }
 
 #[test]
+fn host_entry_uses_runtime_world_manager_passthrough_and_codec() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(&path).expect("HostEntry.cs");
+
+    for required in [
+        "WorldManager",
+        "WireCodec",
+        "DrainOutbox",
+        "CaptureSnapshot",
+        "CreateFromSnapshot",
+        "Enqueue",
+        "Tick",
+    ] {
+        assert!(
+            text.contains(required),
+            "HostEntry must pass through Runtime {required}"
+        );
+    }
+    for removed in ["build_full_snapshot", "build_delta", "TryReadU64"] {
+        assert!(
+            !text.contains(removed),
+            "HostEntry must not own legacy {removed} path"
+        );
+    }
+}
+
+#[test]
+fn runtime_frame_and_input_ownership_stays_at_runtime_boundary() {
+    let clr = fs::read_to_string(process_root().join("src/entity_chat/clr.rs")).expect("clr.rs");
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    assert!(
+        !clr.contains("pending_frames"),
+        "CLR bridge must not buffer Runtime frames"
+    );
+    assert!(
+        !host.contains("parse_input_command_json"),
+        "host must not parse InputCommand JSON"
+    );
+    assert!(
+        !host.contains("payloadSha256"),
+        "host must not inspect InputCommand integrity"
+    );
+    assert!(
+        !clr.contains("try_decode_chat_text"),
+        "CLR bridge must not decode chat payloads"
+    );
+}
+
+#[test]
 fn suite_schedules_kernel_tick_every_max_chat_inputs() {
     let text =
         fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");

@@ -42,6 +42,7 @@ pub struct RuntimeAdmit {
     pub accepted: bool,
     pub code: Option<String>,
     pub binding: Option<RuntimeBinding>,
+    pub frames: Vec<RuntimeFrame>,
 }
 
 impl RuntimeAdmit {
@@ -51,6 +52,7 @@ impl RuntimeAdmit {
             accepted: true,
             code: None,
             binding: Some(binding),
+            frames: Vec::new(),
         }
     }
 
@@ -60,8 +62,23 @@ impl RuntimeAdmit {
             accepted: false,
             code: Some(code.to_owned()),
             binding: None,
+            frames: Vec::new(),
         }
     }
+}
+
+/// A Runtime-owned wire frame with its observer/connection address preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeFrame {
+    pub connection: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+/// Runtime result for a disconnect, including lifecycle frames emitted by the world manager.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeDisconnect {
+    pub binding: RuntimeBinding,
+    pub frames: Vec<RuntimeFrame>,
 }
 
 /// Attribute query forwarded to Runtime.
@@ -170,6 +187,7 @@ pub struct RuntimeTick {
     pub ok: bool,
     pub event_count: u64,
     pub code: Option<String>,
+    pub frames: Vec<RuntimeFrame>,
 }
 
 impl RuntimeTick {
@@ -181,6 +199,7 @@ impl RuntimeTick {
             ok: false,
             event_count: 0,
             code: Some(code.to_owned()),
+            frames: Vec::new(),
         }
     }
 
@@ -192,6 +211,7 @@ impl RuntimeTick {
             ok: true,
             event_count,
             code: None,
+            frames: Vec::new(),
         }
     }
 }
@@ -246,7 +266,7 @@ pub trait RuntimeSurface: Send {
         entity_type: BoundEntityKind,
     ) -> RuntimeAdmit;
 
-    fn disconnect(&mut self, connection: &str) -> Result<RuntimeBinding, String>;
+    fn disconnect(&mut self, connection: &str) -> Result<RuntimeDisconnect, String>;
 
     fn rebind(
         &mut self,
@@ -277,14 +297,10 @@ pub trait RuntimeSurface: Send {
         room_id: &str,
         connection: &str,
         generation: u64,
-        envelope_json: &str,
+        envelope_bytes: &[u8],
     ) -> ChatOperation;
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick;
-
-    fn build_full_snapshot(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<u8>;
-
-    fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>>;
 
     fn persist(&mut self, room_id: &str) -> PersistRecord;
 
