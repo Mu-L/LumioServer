@@ -144,9 +144,9 @@ public static class HostEntry
     {
         if (!TryString(root, "connection", out string? connection) || !TryString(root, "accountId", out string? account) || !TryString(root, "roomId", out string? room) || !TryString(root, "entityType", out string? entityType)) return (EntrySuccess, Fail("invalid_request"));
         Enqueue(NewMessage("AdmitConnectionMessage", connection, account, room, entityType));
-        TickManager();
+        List<object>? messages = TickManager();
         object result = BindingType!.GetMethod("ResolveByConnection")!.Invoke(Bindings, new object[] { room!, connection! })!;
-        return FromBindingResult(result);
+        return FromBindingResult(result, messages);
     }
 
     private static (int, byte[]) Disconnect(JsonElement root)
@@ -161,9 +161,9 @@ public static class HostEntry
     {
         if (!TryString(root, "connection", out string? connection) || !TryString(root, "accountId", out string? account) || !TryString(root, "roomId", out string? room) || !TryString(root, "mode", out string? mode)) return (EntrySuccess, Fail("invalid_request"));
         Enqueue(NewMessage("RebindConnectionMessage", connection, account, room, mode));
-        TickManager();
+        List<object>? messages = TickManager();
         object result = BindingType!.GetMethod("ResolveByConnection")!.Invoke(Bindings, new object[] { room!, connection! })!;
-        return FromBindingResult(result);
+        return FromBindingResult(result, messages);
     }
 
     private static (int, byte[]) Expire(JsonElement root)
@@ -271,11 +271,12 @@ public static class HostEntry
     private static List<object> ToObjectList(IEnumerable rows) { var result = new List<object>(); foreach (object row in rows) result.Add(row); return result; }
     private static ulong WorldValue(string property) { object world = ManagerType!.GetProperty("World")!.GetValue(Manager)!; return Convert.ToUInt64(world.GetType().GetProperty(property)!.GetValue(world), System.Globalization.CultureInfo.InvariantCulture); }
 
-    private static (int, byte[]) FromBindingResult(object result)
+    private static (int, byte[]) FromBindingResult(object result, IEnumerable<object>? messages = null)
     {
         Type type = result.GetType();
         string outcome = type.GetProperty("Outcome")!.GetValue(result) as string ?? "request_error";
         var payload = new Dictionary<string, object?> { ["ok"] = outcome is "ok" or "accepted", ["outcome"] = outcome, ["code"] = type.GetProperty("Code")!.GetValue(result) as string };
+        if (messages is not null) payload["frames"] = EncodeFrames(messages);
         if (type.GetProperty("Binding")!.GetValue(result) is object binding) payload["binding"] = BindingDict(binding);
         if (type.GetProperty("Value")!.GetValue(result) is object value) payload["value"] = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture);
         return (EntrySuccess, Json(payload));
