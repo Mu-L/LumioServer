@@ -115,6 +115,30 @@ fn binding_from(value: &Value) -> Option<RuntimeBinding> {
     })
 }
 
+fn binding_from_entity(value: &Value, room_id: &str) -> Option<RuntimeBinding> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(RuntimeBinding {
+        account_id: value
+            .get("value")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        room_id: value
+            .get("roomId")
+            .and_then(Value::as_str)
+            .unwrap_or(room_id)
+            .to_owned(),
+        net_entity_id: value.get("netEntityId")?.as_str()?.to_owned(),
+        entity_type: kind_from(value.get("entityType").and_then(Value::as_str)),
+        connection_generation: value
+            .get("connectionGeneration")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
 fn admit_from(value: Value) -> RuntimeAdmit {
     if value.get("ok").and_then(Value::as_bool) == Some(true) {
         if let Some(binding) = value.get("binding").and_then(binding_from) {
@@ -212,20 +236,9 @@ impl RuntimeSurface for ClrGameplay {
         net_entity_id: &str,
     ) -> Option<RuntimeBinding> {
         let net_entity_id = normalize_net_entity_id(net_entity_id);
-        if let Some(binding) = self
-            .call(json!({
-                "op": "resolve",
-                "roomId": room_id,
-                "netEntityId": net_entity_id
-            }))
+        self.call(json!({ "op": "resolve", "roomId": room_id, "netEntityId": net_entity_id }))
             .ok()
-            .and_then(|value| value.get("binding").and_then(binding_from))
-        {
-            return Some(binding);
-        }
-        self.list_bindings(room_id)
-            .into_iter()
-            .find(|row| normalize_net_entity_id(&row.net_entity_id) == net_entity_id)
+            .and_then(|value| binding_from_entity(&value, room_id))
     }
 
     fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
@@ -253,13 +266,19 @@ impl RuntimeSurface for ClrGameplay {
     }
 
     fn list_bindings(&mut self, room_id: &str) -> Vec<RuntimeBinding> {
-        self.call(json!({ "op": "list_bindings", "roomId": room_id }))
+        let ids = self.call(json!({ "op": "live_ids" }))
             .ok()
-            .and_then(|value| value.get("bindings").and_then(Value::as_array).cloned())
+            .and_then(|value| value.get("ids").and_then(Value::as_array).cloned())
             .unwrap_or_default()
             .iter()
-            .filter_map(binding_from)
-            .collect()
+            .filter_map(Value::as_str)
+            .filter_map(|id| {
+                self.call(json!({ "op": "resolve", "roomId": room_id, "netEntityId": id }))
+                    .ok()
+                    .and_then(|value| binding_from_entity(&value, room_id))
+            })
+            .collect();
+        ids
     }
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {

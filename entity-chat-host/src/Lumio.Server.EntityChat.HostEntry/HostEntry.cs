@@ -74,6 +74,7 @@ public static class HostEntry
                 "self_lookup" => SelfLookup(root),
                 "resolve" => Resolve(root),
                 "query" => Query(root),
+                "live_ids" => LiveIds(),
                 "attach_member" => AttachMember(root),
                 "admit_input" => AdmitInput(root),
                 "tick" => Tick(root),
@@ -209,6 +210,15 @@ public static class HostEntry
         return (EntrySuccess, ok ? Ok() : Fail("runtime_failure"));
     }
 
+    private static (int, byte[]) LiveIds()
+    {
+        if (Chat is null) return (EntrySuccess, Fail("runtime_failure"));
+        object? ids = ChatType!.GetProperty("LiveNetEntityIds")!.GetValue(Chat);
+        var rows = new List<string>();
+        if (ids is IEnumerable values) foreach (object value in values) rows.Add(value.ToString() ?? string.Empty);
+        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["ids"] = rows }));
+    }
+
     private static (int, byte[]) AdmitInput(JsonElement root)
     {
         if (!TryString(root, "roomId", out string? room) || !TryString(root, "connection", out string? connection) || !TryString(root, "text", out string? text) || !root.TryGetProperty("connectionGeneration", out JsonElement generation) || !generation.TryGetUInt64(out ulong value)) return (EntrySuccess, Fail("invalid_request"));
@@ -279,6 +289,11 @@ public static class HostEntry
         if (messages is not null) payload["frames"] = EncodeFrames(messages);
         if (type.GetProperty("Binding")!.GetValue(result) is object binding) payload["binding"] = BindingDict(binding);
         if (type.GetProperty("Value")!.GetValue(result) is object value) payload["value"] = Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture);
+        foreach (string name in new[] { "NetEntityId", "RoomId", "EntityType", "AttributeId", "ObservedRevision", "ObservedTick" })
+        {
+            object? field = type.GetProperty(name)?.GetValue(result);
+            if (field is not null) payload[char.ToLowerInvariant(name[0]) + name[1..]] = field;
+        }
         return (EntrySuccess, Json(payload));
     }
 
