@@ -33,6 +33,7 @@ pub struct ClrGameplay {
     replication_assembly: String,
     ecs_assembly: String,
     booted: bool,
+    pending_frames: Vec<Vec<u8>>,
 }
 
 impl ClrGameplay {
@@ -56,6 +57,7 @@ impl ClrGameplay {
             replication_assembly: config.replication_assembly.to_string_lossy().into_owned(),
             ecs_assembly: config.ecs_assembly.to_string_lossy().into_owned(),
             booted: false,
+            pending_frames: Vec::new(),
         })
     }
 
@@ -142,7 +144,10 @@ impl RuntimeSurface for ClrGameplay {
             "roomId": room_id,
             "entityType": entity_type.as_str(),
         })) {
-            Ok(value) => admit_from(value),
+            Ok(value) => {
+                self.pending_frames.extend(frames_from_runtime(&value));
+                admit_from(value)
+            }
             Err(_) => RuntimeAdmit::reject("runtime_failure"),
         }
     }
@@ -173,7 +178,10 @@ impl RuntimeSurface for ClrGameplay {
             "roomId": room_id,
             "mode": mode,
         })) {
-            Ok(value) => admit_from(value),
+            Ok(value) => {
+                self.pending_frames.extend(frames_from_runtime(&value));
+                admit_from(value)
+            }
             Err(_) => RuntimeAdmit::reject("runtime_failure"),
         }
     }
@@ -302,51 +310,37 @@ impl RuntimeSurface for ClrGameplay {
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
         match self.call(json!({ "op": "tick", "roomId": room_id, "tickId": tick_id })) {
-            Ok(value) => tick_from_hostentry_json(value),
+            Ok(value) => {
+                self.pending_frames.extend(frames_from_runtime(&value));
+                tick_from_hostentry_json(value)
+            }
             Err(_) => RuntimeTick::failed("runtime_failure"),
         }
     }
 
     fn build_full_snapshot(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<u8> {
-        full_snapshot_bytes_from_runtime(
-            self.call(json!({
-                "op": "build_full_snapshot",
-                "roomId": room_id,
-                "tickId": tick_id,
-                "revision": revision
-            }))
-            .ok(),
-        )
+        let _ = (room_id, tick_id, revision);
+        self.pending_frames.first().cloned().map(|_| self.pending_frames.remove(0)).unwrap_or_default()
     }
 
     fn build_delta(&mut self, room_id: &str, tick_id: u64, revision: u64) -> Vec<Vec<u8>> {
-        self.call(json!({
-            "op": "build_delta",
-            "roomId": room_id,
-            "tickId": tick_id,
-            "revision": revision
-        }))
-        .ok()
-        .and_then(|value| value.get("frames").and_then(Value::as_array).cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| row.as_str().map(|text| text.as_bytes().to_vec()))
-        .collect()
+        let _ = (room_id, tick_id, revision);
+        std::mem::take(&mut self.pending_frames)
     }
 
     fn persist(&mut self, room_id: &str) -> PersistRecord {
         let hex = self
-            .call(json!({ "op": "persist", "roomId": room_id }))
+            .call(json!({ "op": "snapshot", "roomId": room_id }))
             .ok()
             .and_then(|value| {
                 value
-                    .get("bytesHex")
+                    .get("bytesBase64")
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
+                    .and_then(decode_base64)
             })
             .unwrap_or_default();
         PersistRecord {
-            bytes: decode_hex(&hex).unwrap_or_default(),
+            bytes: hex,
         }
     }
 
@@ -354,7 +348,7 @@ impl RuntimeSurface for ClrGameplay {
         let value = self.call(json!({
             "op": "restore",
             "roomId": room_id,
-            "bytesHex": hex_lower(bytes),
+            "bytesBase64": base64_encode(bytes),
         }))?;
         if value.get("ok").and_then(Value::as_bool) == Some(true) {
             Ok(())
@@ -364,36 +358,60 @@ impl RuntimeSurface for ClrGameplay {
     }
 }
 
-fn decode_hex(hex: &str) -> Option<Vec<u8>> {
-    if !hex.len().is_multiple_of(2) {
+fn frames_from_runtime(value: &Value) -> Vec<Vec<u8>> {
+    value
+        .get("frames")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(decode_base64)
+        .collect()
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || bytes.len() % 4 != 0 {
         return None;
     }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    let bytes = hex.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let hi = from_nibble(bytes[i])?;
-        let lo = from_nibble(bytes[i + 1])?;
-        out.push((hi << 4) | lo);
-        i += 2;
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let sextet = |byte: u8| -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    };
+    for chunk in bytes.chunks_exact(4) {
+        let a = sextet(chunk[0])?;
+        let b = sextet(chunk[1])?;
+        let c = if chunk[2] == b'=' { 0 } else { sextet(chunk[2])? };
+        let d = if chunk[3] == b'=' { 0 } else { sextet(chunk[3])? };
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            out.push((b << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push((c << 6) | d);
+        }
     }
     Some(out)
 }
 
-fn from_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
-    }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(char::from(HEX[(byte >> 4) as usize]));
-        out.push(char::from(HEX[(byte & 0x0f) as usize]));
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(char::from(TABLE[(a >> 2) as usize]));
+        out.push(char::from(TABLE[((a << 4 | b >> 4) & 0x3f) as usize]));
+        out.push(if chunk.len() > 1 { char::from(TABLE[((b << 2 | c >> 6) & 0x3f) as usize]) } else { '=' });
+        out.push(if chunk.len() > 2 { char::from(TABLE[(c & 0x3f) as usize]) } else { '=' });
     }
     out
 }
@@ -486,5 +504,19 @@ mod tests {
         let bytes = full_snapshot_bytes_from_runtime(Some(json!({ "ok": true, "json": runtime })));
         assert_eq!(bytes, runtime.as_bytes());
         assert!(String::from_utf8_lossy(&bytes).contains("\"mappingId\":\"entity.identity\""));
+    }
+
+    #[test]
+    fn runtime_frame_base64_round_trips_binary_wire_bytes() {
+        let bytes = [0_u8, 1, 2, 253, 254, 255];
+        assert_eq!(decode_base64(&base64_encode(&bytes)).as_deref(), Some(bytes.as_slice()));
+    }
+
+    #[test]
+    fn runtime_frames_are_decoded_only_from_the_runtime_envelope() {
+        let encoded = base64_encode(b"wire");
+        let value = json!({ "frames": [encoded], "ok": true });
+        assert_eq!(frames_from_runtime(&value), vec![b"wire".to_vec()]);
+        assert!(frames_from_runtime(&json!({ "frames": ["bad"] })).is_empty());
     }
 }

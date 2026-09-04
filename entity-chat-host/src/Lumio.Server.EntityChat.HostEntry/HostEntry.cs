@@ -228,7 +228,7 @@ public static class HostEntry
         ulong revision = WorldValue("Revision");
         int events = 0;
         if (messages is not null) foreach (object message in messages) if (message.GetType().Name == "WorldChangeMessage") events += (message.GetType().GetProperty("Rpcs")!.GetValue(message) as ICollection)?.Count ?? 0;
-        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["appliedTick"] = applied, ["revision"] = revision, ["eventCount"] = events }));
+        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["appliedTick"] = applied, ["revision"] = revision, ["eventCount"] = events, ["frames"] = EncodeFrames(messages) }));
     }
 
     private static (int, byte[]) DrainOutbox()
@@ -296,4 +296,13 @@ public static class HostEntry
     private static byte[] Ok() => Encoding.UTF8.GetBytes("{\"ok\":true}");
     private static byte[] Fail(string code) => Json(new Dictionary<string, object?> { ["ok"] = false, ["code"] = code });
     private static byte[] Json(Dictionary<string, object?> payload) => Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload));
+
+    private static List<string> EncodeFrames(IEnumerable<object>? messages)
+    {
+        var frames = new List<string>();
+        if (messages is null) return frames;
+        foreach (object message in messages)
+            frames.Add(Convert.ToBase64String((byte[])WireCodecType!.GetMethod("EncodePack")!.Invoke(null, new[] { message })!));
+        return frames;
+    }
 }
