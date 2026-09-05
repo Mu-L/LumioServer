@@ -1154,11 +1154,19 @@ impl Inner {
     }
 
     fn retire_superseded(&mut self, connection_id: &str, frames: &[RuntimeFrame]) {
+        self.retire_superseded_frames(frames, Some(connection_id));
+    }
+
+    fn retire_superseded_frames(
+        &mut self,
+        frames: &[RuntimeFrame],
+        replacement_connection: Option<&str>,
+    ) {
         let superseded_connections: Vec<String> = frames
             .iter()
             .filter(|frame| frame.message_type.as_deref() == Some("ConnectionSuperseded"))
             .filter_map(|frame| frame.connection.clone())
-            .filter(|connection| connection != connection_id)
+            .filter(|connection| replacement_connection != Some(connection.as_str()))
             .collect();
         for old_id in superseded_connections {
             // Keep an unattached observer long enough to flush the addressed
@@ -1189,6 +1197,10 @@ impl Inner {
     }
 
     fn route_pending_frames(&mut self, frames: &[RuntimeFrame]) {
+        // Rebind emits the old-connection supersede and the replacement
+        // Welcome in one owner tick. Retire every addressed old connection
+        // before resolving pending admissions so stale input cannot remain live.
+        self.retire_superseded_frames(frames, None);
         let pending_ids: Vec<String> = self.pending_admissions.keys().cloned().collect();
         for connection_id in pending_ids {
             let relevant: Vec<RuntimeFrame> = frames

@@ -714,13 +714,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let previous_session = previous_bot100.session_id.clone();
     let previous_account = previous_bot100.account_id.clone();
     let mut old_bot100 = RoomClient::connect(&host.listen_uri(), "c-bot100").ok();
-    if let Some(client) = old_bot100.as_mut() {
-        let _ = client.recv_text();
-    }
     let re_login = login_or_register(&account.uri(), "Bot100", TEST_PASSWORD, Some(&bot_claim))
         .await
         .unwrap_or_else(|_| empty_login());
-    let mut re_ok = false;
+    let mut binding_ok = false;
     let mut rebound_binding: Option<ConnectionBinding> = None;
     let mut takeover = false;
     if re_login.accepted {
@@ -730,7 +727,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 takeover = rebind.takeover;
                 let _ = host.run_tick(MAIN_ROOM.to_owned());
                 rebound_binding = host.try_self_lookup("c-bot100-re".to_owned());
-                re_ok = rebind.takeover
+                binding_ok = rebind.takeover
                     && rebound_binding.as_ref().is_some_and(|binding| {
                         binding.net_entity_id == entity_a
                             && binding.net_entity_id == entity_a_host
@@ -741,12 +738,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             }
         }
     }
-    let superseded_frame = old_bot100
+    let connection_superseded_received = old_bot100
         .as_mut()
-        .and_then(|client| client.recv_text().ok());
-    let connection_superseded_received = superseded_frame
-        .as_deref()
-        .is_some_and(|frame| frame.contains("\"messageType\":\"ConnectionSuperseded\""));
+        .is_some_and(receive_connection_superseded);
     if connection_superseded_received {
         if let Some(old) = old_bot100.as_mut() {
             let _ = old.is_closed_after();
@@ -755,9 +749,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let rejected = host.admit_input_command("c-bot100".to_owned(), runtime_input.clone());
     let _ = host.admit_input_command("c-browser".to_owned(), runtime_input.clone());
     let _ = host.run_tick(MAIN_ROOM.to_owned());
-    re_ok = re_ok && rejected.kind == ChatOpKind::Rejected && connection_superseded_received;
+    let re_ok =
+        binding_ok && rejected.kind == ChatOpKind::Rejected && connection_superseded_received;
     let reconnect_trace = json!({
         "rebound": re_ok,
+        "bindingOk": binding_ok,
+        "oldInputKind": format!("{:?}", rejected.kind),
         "entityA": entity_a_host,
         "netEntityId": rebound_binding.as_ref().map(|binding| binding.net_entity_id.clone()).unwrap_or(entity_a_host.clone()),
         "previousNetEntityId": entity_a_host,
@@ -774,6 +771,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         json!({
             "ok": re_ok && connection_superseded_received,
             "rebound": re_ok,
+            "bindingOk": binding_ok,
+            "oldInputKind": format!("{:?}", rejected.kind),
             "entityA": entity_a_host,
             "netEntityId": reconnect_trace.get("netEntityId").cloned(),
             "previousNetEntityId": entity_a_host,
@@ -1084,6 +1083,20 @@ fn wait_for_wire_observers(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn receive_connection_superseded(client: &mut RoomClient) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match client.try_recv_text() {
+            Ok(Some(frame)) if frame.contains("\"messageType\":\"ConnectionSuperseded\"") => {
+                return true;
+            }
+            Ok(Some(_)) | Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 fn wait_for_playwright_with_room_ticks(
