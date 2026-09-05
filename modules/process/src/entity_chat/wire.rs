@@ -4,7 +4,9 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
 
-use lumio_host_runtime::{bounded_channel, spawn_supervised, CancelToken, Sender, SupervisedTask};
+use lumio_host_runtime::{
+    bounded_channel, spawn_supervised, CancelToken, SendError, Sender, SupervisedTask,
+};
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
@@ -12,6 +14,8 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocket;
 use tokio_tungstenite::tungstenite::stream::MaybeTlsStream;
 use tokio_tungstenite::tungstenite::{accept_hdr, client::connect as ws_connect, Message};
+
+pub const MAX_WIRE_TEXT_BYTES: usize = 65_536;
 
 /// Egress to one accepted socket.
 #[derive(Clone)]
@@ -25,15 +29,51 @@ pub enum WireOut {
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireSendError {
+    Full,
+    Closed,
+    TooLarge,
+    InvalidUtf8,
+}
+
 impl WireSender {
+    pub fn try_send_text(&self, text: String) -> Result<(), WireSendError> {
+        if text.len() > MAX_WIRE_TEXT_BYTES {
+            return Err(WireSendError::TooLarge);
+        }
+        self.inner
+            .try_send(WireOut::Text(text))
+            .map_err(map_send_error)
+    }
+
+    pub fn try_send_bytes(&self, bytes: &[u8]) -> Result<(), WireSendError> {
+        if bytes.len() > MAX_WIRE_TEXT_BYTES {
+            return Err(WireSendError::TooLarge);
+        }
+        let text = std::str::from_utf8(bytes).map_err(|_| WireSendError::InvalidUtf8)?;
+        self.try_send_text(text.to_owned())
+    }
+
+    pub fn try_close(&self) -> Result<(), WireSendError> {
+        self.inner.try_send(WireOut::Close).map_err(map_send_error)
+    }
+
     #[must_use]
     pub fn send_text(&self, text: String) -> bool {
-        self.inner.send(WireOut::Text(text)).is_ok()
+        self.try_send_text(text).is_ok()
     }
 
     #[must_use]
     pub fn close(&self) -> bool {
-        self.inner.send(WireOut::Close).is_ok()
+        self.try_close().is_ok()
+    }
+}
+
+fn map_send_error(error: SendError<WireOut>) -> WireSendError {
+    match error {
+        SendError::Full(_) => WireSendError::Full,
+        SendError::Closed(_) => WireSendError::Closed,
     }
 }
 
@@ -128,7 +168,7 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         Err(_) => return,
     };
     let first = match ws.read() {
-        Ok(Message::Text(text)) => text,
+        Ok(Message::Text(text)) if is_wire_text_size_valid(&text) => text,
         _ => return,
     };
     let connection_id = match parse_connection_id(&first) {
@@ -167,6 +207,10 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         }
         match ws.read() {
             Ok(Message::Text(text)) => {
+                if !is_wire_text_size_valid(&text) {
+                    let _ = ws.close(None);
+                    break;
+                }
                 if event_tx
                     .send(WireEvent::Input {
                         connection_id: connection_id.clone(),
@@ -205,6 +249,10 @@ fn parse_connection_id(text: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
+}
+
+fn is_wire_text_size_valid(text: &str) -> bool {
+    text.len() <= MAX_WIRE_TEXT_BYTES
 }
 
 /// Test/harness client that actually receives frames.
@@ -315,5 +363,101 @@ impl RoomClient {
     #[must_use]
     pub fn is_closed_after(&mut self) -> bool {
         matches!(self.ws.read(), Ok(Message::Close(_)) | Err(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_sender_reports_full_without_blocking() {
+        let (tx, _rx) = bounded_channel(1);
+        let sender = WireSender { inner: tx };
+        sender
+            .try_send_text("first".to_owned())
+            .expect("first slot");
+
+        assert_eq!(
+            sender.try_send_text("second".to_owned()),
+            Err(WireSendError::Full)
+        );
+    }
+
+    #[test]
+    fn wire_sender_reports_closed_receiver() {
+        let (tx, rx) = bounded_channel(1);
+        let sender = WireSender { inner: tx };
+        drop(rx);
+
+        assert_eq!(
+            sender.try_send_text("frame".to_owned()),
+            Err(WireSendError::Closed)
+        );
+    }
+
+    #[test]
+    fn wire_sender_close_reports_full_without_blocking() {
+        let (tx, _rx) = bounded_channel(1);
+        let sender = WireSender { inner: tx };
+        sender
+            .try_send_text("frame".to_owned())
+            .expect("first slot");
+
+        assert_eq!(sender.try_close(), Err(WireSendError::Full));
+    }
+
+    #[test]
+    fn wire_sender_close_reports_closed_receiver() {
+        let (tx, rx) = bounded_channel(1);
+        let sender = WireSender { inner: tx };
+        drop(rx);
+
+        assert_eq!(sender.try_close(), Err(WireSendError::Closed));
+    }
+
+    #[test]
+    fn wire_sender_accepts_exact_text_byte_limit() {
+        let (tx, rx) = bounded_channel(1);
+        let sender = WireSender { inner: tx };
+
+        sender
+            .try_send_bytes(&vec![b'a'; MAX_WIRE_TEXT_BYTES])
+            .expect("exact limit");
+        assert!(matches!(rx.recv(), Ok(WireOut::Text(text)) if text.len() == MAX_WIRE_TEXT_BYTES));
+    }
+
+    #[test]
+    fn wire_sender_rejects_text_over_byte_limit() {
+        let (tx, _rx) = bounded_channel(1);
+        let sender = WireSender { inner: tx };
+
+        assert_eq!(
+            sender.try_send_bytes(&vec![b'a'; MAX_WIRE_TEXT_BYTES + 1]),
+            Err(WireSendError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn wire_sender_rejects_invalid_utf8() {
+        let (tx, _rx) = bounded_channel(1);
+        let sender = WireSender { inner: tx };
+
+        assert_eq!(
+            sender.try_send_bytes(&[0xff]),
+            Err(WireSendError::InvalidUtf8)
+        );
+    }
+
+    #[test]
+    fn inbound_wire_text_accepts_exact_byte_limit() {
+        assert!(is_wire_text_size_valid(&"a".repeat(MAX_WIRE_TEXT_BYTES)));
+    }
+
+    #[test]
+    fn inbound_wire_text_rejects_over_byte_limit() {
+        assert!(!is_wire_text_size_valid(
+            &"a".repeat(MAX_WIRE_TEXT_BYTES + 1)
+        ));
     }
 }
