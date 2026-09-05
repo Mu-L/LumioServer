@@ -468,7 +468,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
-        attribute_id: "EntityIdentity.claimedMark".to_owned(),
+        attribute_id: "IdentityComponent.realName".to_owned(),
         connection_generation: None,
     };
     let missing_request = AttributeQueryRequest {
@@ -798,6 +798,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     }
     host.clock().advance_ms(RECONNECT_WINDOW_MS + 1_000);
     let expiry_tick_fired = host.drive_kernel();
+    // Expire is an owner-thread Runtime intent; settle it before admitting the
+    // replacement account so the old entity is tombstoned first.
+    let _ = host.run_tick(MAIN_ROOM.to_owned());
     let stale_a_rejected = host
         .admit_input_command("c-bot99".to_owned(), runtime_input.clone())
         .kind
@@ -924,6 +927,19 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                         .is_ok_and(|resolved| resolved.is_some())
                     })
                     .count();
+                if iso_total < iso_ids.len() {
+                    let _ = host.run_tick(ISO_ROOM.to_owned());
+                    iso_total = iso_ids
+                        .iter()
+                        .filter(|net_entity_id| {
+                            host.try_resolve_by_net_entity_id(
+                                ISO_ROOM.to_owned(),
+                                (*net_entity_id).clone(),
+                            )
+                            .is_ok_and(|resolved| resolved.is_some())
+                        })
+                        .count();
+                }
                 iso_ok = iso_total == 2
                     && !leaked
                     && cross.error_code.as_deref() == Some("cross_room_reference");

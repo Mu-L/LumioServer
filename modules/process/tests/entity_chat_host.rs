@@ -1069,6 +1069,30 @@ fn duplicate_pending_admission_is_rejected_before_runtime_enqueue() {
 }
 
 #[test]
+fn active_account_selects_takeover_before_async_runtime_admission() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(host
+        .admit(
+            "room-main".to_owned(),
+            "c-old".to_owned(),
+            credential(&keys, "ActiveTakeoverBot", true),
+        )
+        .accepted);
+
+    let takeover = host.admit(
+        "room-main".to_owned(),
+        "c-new".to_owned(),
+        credential(&keys, "ActiveTakeoverBot", true),
+    );
+
+    assert!(takeover.accepted && takeover.takeover);
+    assert!(host.try_self_lookup("c-new".to_owned()).is_some());
+    assert!(host.try_self_lookup("c-old".to_owned()).is_none());
+    assert_eq!(runtime.lock().admit_calls().len(), 1);
+}
+
+#[test]
 fn takeover_cleans_a_superseded_pending_admission() {
     let runtime = SharedRuntime::new();
     runtime.lock().enable_async_admissions();

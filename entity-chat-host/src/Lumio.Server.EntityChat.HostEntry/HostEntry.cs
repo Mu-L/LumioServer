@@ -27,6 +27,11 @@ public static class HostEntry
     private static Type? EcsRegistryType;
     private static object? Bindings;
     private static object? Manager;
+    // A BufferTooSmall response must be replayed without executing the operation
+    // again. DrainOutbox and CaptureSnapshot are destructive/read-once calls.
+    private static byte[]? PendingResponse;
+    private static byte[]? PendingRequest;
+    private static int PendingCode;
 
     [UnmanagedCallersOnly(EntryPoint = "lumio_entity_chat_entry")]
     public static unsafe int LumioEntityChatEntry(byte* input, int inputLength, byte* output, int outputCapacity, int* bytesWritten)
@@ -34,25 +39,49 @@ public static class HostEntry
         if (bytesWritten is null) return EntryInvalidInput;
         bytesWritten[0] = 0;
         if (inputLength < 0 || outputCapacity < 0 || (inputLength > 0 && input is null) || (outputCapacity > 0 && output is null)) return EntryInvalidInput;
-        int code;
-        byte[] response;
-        try { (code, response) = Execute(input, inputLength); }
-        catch (Exception) { code = EntryRuntimeFailure; response = Fail("runtime_failure"); }
-        if (response.Length > outputCapacity)
+        byte[] request = new ReadOnlySpan<byte>(input, inputLength).ToArray();
+        lock (Gate)
         {
+            int code;
+            byte[] response;
+            if (PendingResponse is not null
+                && PendingRequest is not null
+                && PendingRequest.AsSpan().SequenceEqual(request))
+            {
+                code = PendingCode;
+                response = PendingResponse;
+                PendingResponse = null;
+                PendingRequest = null;
+                PendingCode = EntrySuccess;
+            }
+            else
+            {
+                PendingResponse = null;
+                PendingRequest = null;
+                PendingCode = EntrySuccess;
+                try { (code, response) = Execute(request); }
+                catch (Exception) { code = EntryRuntimeFailure; response = Fail("runtime_failure"); }
+            }
+
+            if (response.Length > outputCapacity)
+            {
+                PendingResponse = response;
+                PendingRequest = request;
+                PendingCode = code;
+                bytesWritten[0] = response.Length;
+                return EntryBufferTooSmall;
+            }
+            response.AsSpan().CopyTo(new Span<byte>(output, response.Length));
             bytesWritten[0] = response.Length;
-            return EntryBufferTooSmall;
+            return code;
         }
-        response.AsSpan().CopyTo(new Span<byte>(output, response.Length));
-        bytesWritten[0] = response.Length;
-        return code;
     }
 
-    private static unsafe (int, byte[]) Execute(byte* input, int inputLength)
+    private static (int, byte[]) Execute(byte[] input)
     {
         try
         {
-            using JsonDocument document = JsonDocument.Parse(new ReadOnlySpan<byte>(input, inputLength).ToArray());
+            using JsonDocument document = JsonDocument.Parse(input);
             return Dispatch(document.RootElement);
         }
         catch (JsonException) { return (EntryInvalidInput, Fail("bad_envelope")); }

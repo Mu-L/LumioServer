@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-const FLEET_WAIT: Duration = Duration::from_secs(15);
+// A full three-cadence fleet may need several owner-pump turns to flush the
+// final batch over 100 independent WebSocket connections.
+const FLEET_WAIT: Duration = Duration::from_secs(60);
 const FLEET_PROGRESS_POLL: Duration = Duration::from_millis(1);
 const R4_04_BLOCKED: &str = "BLOCKED: 等 R4-04";
 const BOT_CHAT_CADENCE_TICKS: [u64; 3] = [5, 10, 15];
@@ -624,11 +626,13 @@ fn is_lower_sha256(value: &str) -> bool {
 mod tests {
     use super::{
         bot_host_launch, discover_bot_host_in, expected_submission_count, try_read_bot_host_logs,
-        wait_for_client_bot_fleet, BotHostEnv, ClientBotFleet, ClientBotTrace, R4_04_BLOCKED,
+        wait_for_client_bot_fleet, BotHostEnv, ClientBotFleet, ClientBotTrace, FLEET_WAIT,
+        R4_04_BLOCKED,
     };
     use std::collections::HashMap;
     use std::fs;
     use std::path::Path;
+    use std::time::Duration;
 
     struct MapEnv(HashMap<String, String>);
 
@@ -764,6 +768,11 @@ mod tests {
     #[test]
     fn fleet_waits_for_exactly_one_submission_per_bot() {
         assert_eq!(expected_submission_count(100), 100);
+    }
+
+    #[test]
+    fn fleet_wait_window_covers_all_three_cadence_batches() {
+        assert!(FLEET_WAIT >= Duration::from_secs(60));
     }
 
     #[test]

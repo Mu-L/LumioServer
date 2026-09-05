@@ -830,8 +830,19 @@ impl Inner {
             self.clear_pending_admission(connection_id);
             return RoomAdmitResult::reject("admission_capacity");
         }
-        self.retired_connections.remove(connection_id);
         let kind = super::runtime::entity_type_of(&payload.login_name, payload.bot_tool_context);
+        // Runtime admission is asynchronous. Use the host's live session table
+        // to select the takeover path before enqueueing a duplicate account.
+        // Runtime remains authoritative for the actual rebind and emits the
+        // supersession/Welcome frames on the next owner tick.
+        if self
+            .sessions
+            .values()
+            .any(|session| session.account_id == payload.account_id)
+        {
+            return self.takeover(room_id, connection_id, payload, kind);
+        }
+        self.retired_connections.remove(connection_id);
         let admitted = self
             .runtime
             .admit(connection_id, &payload.account_id, room_id, kind);
