@@ -112,6 +112,24 @@ pub struct RuntimeControlError {
     pub frames: Vec<RuntimeFrame>,
 }
 
+/// Runtime C-2 query result drained by the owner tick. The server keeps this
+/// record opaque and correlates it by `request_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeQueryRecord {
+    pub request_id: String,
+    pub result_type: String,
+    pub outcome: String,
+    pub binding: Option<RuntimeBinding>,
+    pub value: Option<String>,
+    pub net_entity_id: Option<String>,
+    pub room_id: Option<String>,
+    pub attribute_id: Option<String>,
+    pub code: Option<String>,
+    pub detail: Option<String>,
+    pub observed_revision: Option<u64>,
+    pub observed_tick: Option<u64>,
+}
+
 impl RuntimeControlError {
     #[must_use]
     pub const fn new(message: String, frames: Vec<RuntimeFrame>) -> Self {
@@ -353,6 +371,11 @@ pub trait RuntimeSurface: Send {
     ) -> ChatOperation;
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick;
+
+    /// Drains C-2 query records emitted by the most recent owner tick.
+    fn drain_queries(&mut self) -> Vec<RuntimeQueryRecord> {
+        Vec::new()
+    }
 
     fn persist(&mut self, room_id: &str) -> Result<PersistRecord, String>;
 

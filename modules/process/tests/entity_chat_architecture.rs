@@ -441,6 +441,47 @@ fn clr_runtime_input_stays_opaque_until_runtime_wire_codec() {
 }
 
 #[test]
+fn clr_lifecycle_controls_enqueue_without_implicit_runtime_ticks() {
+    let clr = fs::read_to_string(process_root().join("src/entity_chat/clr.rs")).expect("clr.rs");
+    for marker in [
+        "fn admit(\n        &mut self",
+        "fn disconnect(\n        &mut self",
+        "fn rebind(\n        &mut self",
+        "fn expire(\n        &mut self",
+        "fn resolve_by_net_entity_id(\n        &mut self",
+        "fn query_attribute(\n        &mut self",
+    ] {
+        let body = rust_fn_src(&clr, marker);
+        assert!(
+            !body.contains("tick_and_drain"),
+            "{marker} must enqueue an intent; only run_tick may advance Runtime"
+        );
+    }
+    let tick = rust_fn_src(&clr, "fn run_tick(");
+    assert!(
+        tick.contains("tick_and_drain"),
+        "run_tick is the sole Runtime tick owner"
+    );
+}
+
+#[test]
+fn host_admit_result_does_not_expose_runtime_binding_identity() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    let start = host
+        .find("pub struct RoomAdmitResult")
+        .expect("RoomAdmitResult");
+    let body = &host[start
+        ..host[start..]
+            .find("}\n\nimpl RoomAdmitResult")
+            .expect("result body")
+            + start];
+    assert!(
+        !body.contains("binding"),
+        "admission only reports accepted/rejected state"
+    );
+}
+
+#[test]
 fn clr_runtime_state_is_only_connection_route_state() {
     let path = process_root().join("src/entity_chat/clr.rs");
     let text = fs::read_to_string(&path).expect("clr.rs");

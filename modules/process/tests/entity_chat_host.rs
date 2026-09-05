@@ -58,13 +58,10 @@ fn admit_creates_bot_and_player_and_resolves_bindings() {
         credential(&keys, "Browser01", false),
     );
     assert!(bot.accepted && player.accepted);
+    assert_eq!(host.must_self("c-bot01").entity_type, BoundEntityKind::Bot);
     assert_eq!(
-        bot.binding.as_ref().map(|binding| binding.entity_type),
-        Some(BoundEntityKind::Bot)
-    );
-    assert_eq!(
-        player.binding.as_ref().map(|binding| binding.entity_type),
-        Some(BoundEntityKind::Player)
+        host.must_self("c-browser").entity_type,
+        BoundEntityKind::Player
     );
     let self_bot = host.must_self("c-bot01");
     assert!(host
@@ -95,7 +92,7 @@ fn reconnect_within_window_rebinds_entity_a() {
         credential(&keys, "Bot01", true),
     );
     assert!(rebind.reconnected);
-    let rebound = rebind.binding.expect("rebind binding");
+    let rebound = host.must_self("c-bot01-re");
     assert_eq!(rebound.net_entity_id, entity_a);
     assert_ne!(rebound.session_id, first_session);
     assert_ne!(rebound.net_entity_id, rebound.session_id);
@@ -138,7 +135,7 @@ fn wall_clock_kernel_expire_tombstones_a_and_creates_b() {
         credential(&keys, "Bot01", true),
     );
     assert!(created_b.accepted);
-    let entity_b = created_b.binding.unwrap().net_entity_id;
+    let entity_b = host.must_self("c-bot01-b").net_entity_id;
     assert_ne!(entity_b, entity_a);
     let tomb = host.query_attribute(AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
@@ -179,12 +176,12 @@ fn isolation_rejects_cross_room_query() {
 fn runtime_resolve_and_query_bridge_failures_remain_explicit() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
-    let admitted = host.admit(
+    let _admitted = host.admit(
         "room-main".to_owned(),
         "c-browser".to_owned(),
         credential(&keys, "Browser01", false),
     );
-    let net_entity_id = admitted.binding.expect("binding").net_entity_id;
+    let net_entity_id = host.must_self("c-browser").net_entity_id;
 
     runtime.lock().fail_resolve("resolve_result_missing");
     let resolve_error = host
@@ -632,6 +629,27 @@ fn sixty_five_chat_inputs_one_tick_empty_delta_is_not_success() {
 }
 
 #[test]
+fn oversized_direct_input_is_rejected_before_runtime() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-oversized-input".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let result = host.admit_input_command(
+        "c-oversized-input".to_owned(),
+        vec![b'a'; lumio_server_process::entity_chat::MAX_WIRE_TEXT_BYTES + 1],
+    );
+    assert_eq!(result.kind, ChatOpKind::Rejected);
+    assert_eq!(result.error_code.as_deref(), Some("bad_envelope"));
+    assert!(runtime.lock().run_tick_input_counts().is_empty());
+}
+
+#[test]
 fn claimed_mark_client_replica_is_contract_unauthorized() {
     let (host, keys) = host_with(SharedRuntime::new());
     let _ = host.admit(
@@ -658,12 +676,12 @@ fn claimed_mark_client_replica_is_contract_unauthorized() {
 #[test]
 fn resolve_requires_canonical_runtime_id() {
     let (host, keys) = host_with(SharedRuntime::new());
-    let bot = host.admit(
+    let _bot = host.admit(
         "room-main".to_owned(),
         "c-bot01".to_owned(),
         credential(&keys, "Bot01", true),
     );
-    let hex = bot.binding.expect("binding").net_entity_id;
+    let hex = host.must_self("c-bot01").net_entity_id;
     assert_eq!(hex.len(), 32);
     assert!(host
         .try_resolve_by_net_entity_id("room-main".to_owned(), hex.clone())

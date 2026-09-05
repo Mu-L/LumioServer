@@ -9,7 +9,8 @@ use common::{
 use lumio_host_runtime::{bounded_channel, SharedClock};
 use lumio_server_process::entity_chat::{
     drain_chat_event_deltas, generate_keys, issue_admission_credential, ChatOpKind, EntityChatHost,
-    RoomClient, ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
+    RoomClient, ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, MAX_WIRE_TEXT_BYTES,
+    RECONNECT_WINDOW_MS,
 };
 
 fn credential(
@@ -454,4 +455,25 @@ fn second_c_browser_attach_still_receives_room_delta() {
         second_frame.contains("\"messageType\":\"WorldChange\""),
         "Playwright-style second c-browser attach must also receive WorldChange, got {second_frame}"
     );
+}
+
+#[test]
+fn oversized_post_admission_text_closes_socket_before_runtime_input() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_ready(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-oversized".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-oversized").expect("connect");
+    let _ = client.recv_text();
+    client
+        .send_text(&"a".repeat(MAX_WIRE_TEXT_BYTES + 1))
+        .expect("wire send reaches server boundary");
+    assert!(client.is_closed_after());
+    assert!(runtime.lock().run_tick_input_counts().is_empty());
 }

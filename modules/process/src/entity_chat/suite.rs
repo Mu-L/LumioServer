@@ -19,7 +19,7 @@ use super::bots::{
 use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::crypto::hex_lower;
-use super::host::{AttributeQueryRequest, ConnectionBinding, EntityChatHost, RoomAdmitResult};
+use super::host::{AttributeQueryRequest, ConnectionBinding, EntityChatHost};
 use super::runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, RuntimeSurface,
     RuntimeTick,
@@ -282,13 +282,11 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         match verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now) {
             Ok(_) => {
                 let admit = host.admit(MAIN_ROOM.to_owned(), "c-browser".to_owned(), credential);
-                browser_ok = admit.accepted
-                    && admit
-                        .binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.entity_type == BoundEntityKind::Player);
+                browser_ok = admit.accepted;
                 if browser_ok {
-                    if let Some(trace) = observed_admit("c-browser", BROWSER_NAME, &admit) {
+                    if let Some(trace) =
+                        observed_host_admit(&host, "c-browser", BROWSER_NAME, admit.accepted)
+                    {
                         admits.push(trace);
                     } else {
                         browser_ok = false;
@@ -355,14 +353,15 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             blocked = Some(format!("bot admit failed: {name}"));
             break;
         }
-        let Some(trace) = observed_admit(connection, name, &admit) else {
-            blocked = Some(format!("bot admit returned no Runtime binding: {name}"));
-            break;
-        };
-        admits.push(trace);
+        if let Some(trace) = observed_host_admit(&host, connection, name, admit.accepted) {
+            admits.push(trace);
+        }
         connections.push((connection.clone(), name.clone()));
         thread::sleep(Duration::from_millis(10));
     }
+    // Admission is an intent; the owner tick publishes Runtime Welcome
+    // identities before any census or query evidence is collected.
+    let _ = host.run_tick(MAIN_ROOM.to_owned());
     let bot_count = admits
         .iter()
         .filter(|row| row.entity_type == BoundEntityKind::Bot)
@@ -510,6 +509,26 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 ClientBotTrace::default()
             }
         };
+    for (connection, name) in &connections {
+        if !admits.iter().any(|row| row.connection_id == *connection) {
+            if let Some(trace) = observed_host_admit(&host, connection, name, true) {
+                admits.push(trace);
+            }
+        }
+    }
+    if !admits.iter().any(|row| row.connection_id == "c-browser") {
+        if let Some(trace) = observed_host_admit(&host, "c-browser", BROWSER_NAME, true) {
+            admits.push(trace);
+        }
+    }
+    if let Some(scenario) = scenarios.get_mut("2") {
+        let bot_count = admits
+            .iter()
+            .filter(|row| row.entity_type == BoundEntityKind::Bot)
+            .count();
+        scenario["botCount"] = json!(bot_count);
+        scenario["ok"] = json!(bot_count == BOT_COUNT as usize);
+    }
     let runtime_input = wire_input_rx
         .recv_timeout(Duration::from_secs(2))
         .unwrap_or_default();
@@ -667,15 +686,16 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
                 let rebind = host.admit(MAIN_ROOM.to_owned(), "c-bot100-re".to_owned(), credential);
                 takeover = rebind.takeover;
+                let _ = host.run_tick(MAIN_ROOM.to_owned());
+                rebound_binding = host.try_self_lookup("c-bot100-re".to_owned());
                 re_ok = rebind.takeover
-                    && rebind.binding.as_ref().is_some_and(|binding| {
+                    && rebound_binding.as_ref().is_some_and(|binding| {
                         binding.net_entity_id == entity_a
                             && binding.net_entity_id == entity_a_host
                             && binding.session_id != previous_session
                             && binding.net_entity_id != binding.session_id
                             && binding.account_id == previous_account
                     });
-                rebound_binding = rebind.binding;
             }
         }
     }
@@ -755,6 +775,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
                 let created_b =
                     host.admit(MAIN_ROOM.to_owned(), "c-bot99-b".to_owned(), credential);
+                let _ = host.run_tick(MAIN_ROOM.to_owned());
+                let created_binding = host.try_self_lookup("c-bot99-b".to_owned());
                 let tombstoned = host.query_attribute(AttributeQueryRequest {
                     caller_scope: AttributeQueryScope::ServerAuthoritative,
                     room_id: MAIN_ROOM.to_owned(),
@@ -765,7 +787,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 tombstoned_observed = tombstoned.outcome == AttributeQueryOutcome::Tombstoned;
                 expired = usize::from(tombstoned_observed);
                 expiry_ok = created_b.accepted
-                    && created_b.binding.as_ref().is_some_and(|binding| {
+                    && created_binding.as_ref().is_some_and(|binding| {
                         binding.net_entity_id != entity_99
                             && binding.net_entity_id != entity_99_host
                             && binding.account_id == account_99
@@ -774,8 +796,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                     && stale_a_rejected
                     && expiry_tick_fired;
                 entity_b_host = created_b
-                    .binding
-                    .as_ref()
+                    .accepted
+                    .then_some(created_binding.as_ref())
+                    .flatten()
                     .map(|binding| binding.net_entity_id.clone());
             }
         }
@@ -818,14 +841,15 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                     host.admit(ISO_ROOM.to_owned(), "iso-a".to_owned(), cred_a),
                     host.admit(ISO_ROOM.to_owned(), "iso-b".to_owned(), cred_b),
                 ];
+                let _ = host.run_tick(ISO_ROOM.to_owned());
                 let iso_ids: Vec<String> = iso_admits
                     .iter()
-                    .filter(|admit| admit.accepted)
-                    .filter_map(|admit| {
-                        admit
-                            .binding
-                            .as_ref()
-                            .map(|binding| binding.net_entity_id.clone())
+                    .enumerate()
+                    .filter(|(_, admit)| admit.accepted)
+                    .filter_map(|(index, _)| {
+                        let connection = if index == 0 { "iso-a" } else { "iso-b" };
+                        host.try_self_lookup(connection.to_owned())
+                            .map(|binding| binding.net_entity_id)
                     })
                     .collect();
                 let _ = host.admit_input_command("iso-a".to_owned(), runtime_input.clone());
@@ -1179,12 +1203,16 @@ fn empty_login() -> super::AccountLoginResult {
     }
 }
 
-fn observed_admit(
+fn observed_host_admit(
+    host: &EntityChatHost,
     connection_id: &str,
     login_name: &str,
-    result: &RoomAdmitResult,
+    accepted: bool,
 ) -> Option<AdmitTrace> {
-    let binding = result.binding.as_ref()?;
+    let binding = host.try_self_lookup(connection_id.to_owned())?;
+    if !accepted {
+        return None;
+    }
     Some(AdmitTrace {
         connection_id: connection_id.to_owned(),
         session_id: binding.session_id.clone(),

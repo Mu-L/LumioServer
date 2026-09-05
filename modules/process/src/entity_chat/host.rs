@@ -13,7 +13,7 @@ use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
-    RuntimeAdmit, RuntimeBinding, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    RuntimeBinding, RuntimeFrame, RuntimeQuery, RuntimeQueryRecord, RuntimeSurface, RuntimeTick,
 };
 use super::wire::{RoomListener, WireEvent, WireSendError, WireSender, MAX_WIRE_TEXT_BYTES};
 use super::MAX_CHAT_INPUTS_PER_TICK;
@@ -83,17 +83,24 @@ pub struct EntityResolution {
 pub struct RoomAdmitResult {
     pub accepted: bool,
     pub error_code: Option<String>,
-    pub binding: Option<ConnectionBinding>,
     pub reconnected: bool,
     pub takeover: bool,
 }
 
 impl RoomAdmitResult {
-    fn ok(binding: ConnectionBinding, reconnected: bool, takeover: bool) -> Self {
+    fn pending(reconnected: bool, takeover: bool) -> Self {
         Self {
             accepted: true,
             error_code: None,
-            binding: Some(binding),
+            reconnected,
+            takeover,
+        }
+    }
+
+    fn ok(reconnected: bool, takeover: bool) -> Self {
+        Self {
+            accepted: true,
+            error_code: None,
             reconnected,
             takeover,
         }
@@ -103,7 +110,6 @@ impl RoomAdmitResult {
         Self {
             accepted: false,
             error_code: Some(code.to_owned()),
-            binding: None,
             reconnected: false,
             takeover: false,
         }
@@ -130,16 +136,16 @@ struct Session {
     egresses: Vec<WireSender>,
 }
 
+struct PendingAdmission {
+    room_id: String,
+    payload: AdmissionPayload,
+    reconnected: bool,
+    takeover: bool,
+}
+
 struct ExpireTarget {
     room_id: String,
     net_entity_id: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeliveryOutcome {
-    Delivered,
-    Unavailable,
-    InvalidFrame,
 }
 
 struct Inner {
@@ -151,6 +157,8 @@ struct Inner {
     runtime: Box<dyn RuntimeSurface>,
     kernel: Box<dyn KernelTimer>,
     sessions: HashMap<String, Session>,
+    pending_admissions: HashMap<String, PendingAdmission>,
+    runtime_queries: Vec<RuntimeQueryRecord>,
     expire_watch: HashMap<KernelHandle, ExpireTarget>,
     pending_egress: HashMap<String, Vec<WireSender>>,
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
@@ -162,6 +170,44 @@ struct Inner {
 enum OwnerWork {
     Run(Box<dyn FnOnce(&mut Inner) + Send>),
     Wire(WireEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Delivered,
+    Backpressured,
+    Unavailable,
+    Invalid,
+}
+
+fn deliver_to_egresses(egresses: &mut Vec<WireSender>, bytes: &[u8]) -> Delivery {
+    let mut delivered = false;
+    let mut backpressured = false;
+    let mut invalid = false;
+    egresses.retain(|egress| match egress.try_send_bytes(bytes) {
+        Ok(()) => {
+            delivered = true;
+            true
+        }
+        Err(WireSendError::Full) => {
+            backpressured = true;
+            true
+        }
+        Err(WireSendError::Closed) => false,
+        Err(WireSendError::TooLarge | WireSendError::InvalidUtf8) => {
+            invalid = true;
+            false
+        }
+    });
+    if delivered {
+        Delivery::Delivered
+    } else if invalid {
+        Delivery::Invalid
+    } else if backpressured {
+        Delivery::Backpressured
+    } else {
+        Delivery::Unavailable
+    }
 }
 
 /// Slice-scoped Room host. All authoritative work runs on one owner thread.
@@ -212,6 +258,8 @@ impl EntityChatHost {
                 runtime,
                 kernel,
                 sessions: HashMap::new(),
+                pending_admissions: HashMap::new(),
+                runtime_queries: Vec::new(),
                 expire_watch: HashMap::new(),
                 pending_egress: HashMap::new(),
                 deferred_frames: HashMap::new(),
@@ -381,6 +429,12 @@ impl EntityChatHost {
         self.on_owner(move |inner| usize::try_from(inner.wire_chat_pending).unwrap_or(usize::MAX))
     }
 
+    /// Returns C-2 query records drained by the latest owner tick.
+    #[must_use]
+    pub fn drain_runtime_queries(&self) -> Vec<RuntimeQueryRecord> {
+        self.on_owner(|inner| std::mem::take(&mut inner.runtime_queries))
+    }
+
     /// Count live Room WS observers for a connection (harness wait).
     #[must_use]
     pub fn wire_observer_count(&self, connection_id: String) -> usize {
@@ -473,7 +527,14 @@ impl Inner {
             .runtime
             .admit(connection_id, &payload.account_id, room_id, kind);
         if admitted.accepted {
-            return self.commit_session(connection_id, payload, admitted, false, false);
+            return self.stage_admission(
+                room_id,
+                connection_id,
+                payload,
+                admitted.frames,
+                false,
+                false,
+            );
         }
         if !self.route_frames(room_id, &admitted.frames) {
             return RoomAdmitResult::reject("runtime_failure");
@@ -492,13 +553,14 @@ impl Inner {
             kind,
         );
         if rebound.accepted {
-            self.cancel_expire_for(
-                rebound
-                    .binding
-                    .as_ref()
-                    .map(|row| row.net_entity_id.as_str()),
+            return self.stage_admission(
+                room_id,
+                connection_id,
+                payload,
+                rebound.frames,
+                true,
+                false,
             );
-            return self.commit_session(connection_id, payload, rebound, true, false);
         }
         if !self.route_frames(room_id, &rebound.frames) {
             return RoomAdmitResult::reject("runtime_failure");
@@ -520,54 +582,66 @@ impl Inner {
             RebindMode::Takeover,
             kind,
         );
-        let Some(_binding) = rebound.binding.clone() else {
-            if !self.route_frames(room_id, &rebound.frames) {
-                return RoomAdmitResult::reject("runtime_failure");
-            }
-            return RoomAdmitResult::reject(rebound.code.as_deref().unwrap_or("invalid_request"));
-        };
-        let superseded_connections: Vec<String> = rebound
-            .frames
-            .iter()
-            .filter(|frame| frame.message_type.as_deref() == Some("ConnectionSuperseded"))
-            .filter_map(|frame| frame.connection.clone())
-            .filter(|connection| connection != connection_id)
-            .collect();
-        if superseded_connections.is_empty() {
-            return RoomAdmitResult::reject("runtime_failure");
-        }
-        let result = self.commit_session(connection_id, payload, rebound, false, true);
-        if result.accepted {
-            for old_id in superseded_connections {
-                if let Some(old) = self.sessions.remove(&old_id) {
-                    for egress in &old.egresses {
-                        let _ = egress.try_close();
-                    }
-                }
-                self.deferred_frames.remove(&old_id);
-            }
-        }
-        result
+        self.stage_admission(room_id, connection_id, payload, rebound.frames, false, true)
     }
 
-    fn commit_session(
+    fn stage_admission(
         &mut self,
+        room_id: &str,
         connection_id: &str,
         payload: &AdmissionPayload,
-        admitted: RuntimeAdmit,
+        frames: Vec<RuntimeFrame>,
         reconnected: bool,
         takeover: bool,
     ) -> RoomAdmitResult {
-        let frames = admitted.frames.clone();
-        let Some(runtime_binding) = admitted.binding else {
-            return RoomAdmitResult::reject("invalid_request");
+        let pending = PendingAdmission {
+            room_id: room_id.to_owned(),
+            payload: payload.clone(),
+            reconnected,
+            takeover,
         };
+        self.pending_admissions
+            .insert(connection_id.to_owned(), pending);
         if self
-            .runtime
-            .attach_member(&runtime_binding.room_id, connection_id)
-            .is_err()
+            .complete_pending_admission(connection_id, &frames)
+            .is_some()
         {
-            return RoomAdmitResult::reject("runtime_failure");
+            let _ = self.route_frames(room_id, &frames);
+            self.retire_superseded(connection_id, &frames);
+            return RoomAdmitResult::ok(reconnected, takeover);
+        }
+        RoomAdmitResult::pending(reconnected, takeover)
+    }
+
+    fn complete_pending_admission(
+        &mut self,
+        connection_id: &str,
+        frames: &[RuntimeFrame],
+    ) -> Option<ConnectionBinding> {
+        let pending = self.pending_admissions.get(connection_id)?;
+        let welcome = frames.iter().find(|frame| {
+            frame.connection.as_deref() == Some(connection_id)
+                && frame.message_type.as_deref() == Some("Welcome")
+                && frame.observer_net_entity_id.is_some()
+                && frame.connection_generation.is_some()
+        })?;
+        let room_id = pending.room_id.clone();
+        let payload = pending.payload.clone();
+        let reconnected = pending.reconnected;
+        let takeover = pending.takeover;
+        let runtime_binding = RuntimeBinding {
+            account_id: payload.account_id.clone(),
+            room_id: room_id.clone(),
+            net_entity_id: welcome.observer_net_entity_id.clone().unwrap_or_default(),
+            entity_type: super::runtime::entity_type_of(
+                &payload.login_name,
+                payload.bot_tool_context,
+            ),
+            connection_generation: welcome.connection_generation.unwrap_or_default(),
+        };
+        if self.runtime.attach_member(&room_id, connection_id).is_err() {
+            self.pending_admissions.remove(connection_id);
+            return None;
         }
         let session_id = session_id_for(&payload.login_name, reconnected || takeover);
         let egresses = self
@@ -577,19 +651,86 @@ impl Inner {
         let session = Session {
             session_id: session_id.clone(),
             account_id: payload.account_id.clone(),
-            room_id: runtime_binding.room_id.clone(),
+            room_id: room_id.clone(),
             net_entity_id: runtime_binding.net_entity_id.clone(),
             entity_type: runtime_binding.entity_type,
             generation: runtime_binding.connection_generation,
             egresses,
         };
-        let binding = ConnectionBinding::from_runtime(runtime_binding, session_id);
         self.sessions.insert(connection_id.to_owned(), session);
-        if !self.route_frames(&binding.room_id, &frames) {
-            let _ = self.fail_connection(connection_id);
-            return RoomAdmitResult::reject("runtime_failure");
+        self.pending_admissions.remove(connection_id);
+        Some(ConnectionBinding::from_runtime(runtime_binding, session_id))
+    }
+
+    fn retire_superseded(&mut self, connection_id: &str, frames: &[RuntimeFrame]) {
+        let superseded_connections: Vec<String> = frames
+            .iter()
+            .filter(|frame| frame.message_type.as_deref() == Some("ConnectionSuperseded"))
+            .filter_map(|frame| frame.connection.clone())
+            .filter(|connection| connection != connection_id)
+            .collect();
+        for old_id in superseded_connections {
+            if let Some(old) = self.sessions.remove(&old_id) {
+                for egress in &old.egresses {
+                    let _ = egress.try_close();
+                }
+            }
+            self.deferred_frames.remove(&old_id);
         }
-        RoomAdmitResult::ok(binding, reconnected, takeover)
+    }
+
+    fn route_pending_frames(&mut self, frames: &[RuntimeFrame]) {
+        let pending_ids: Vec<String> = self.pending_admissions.keys().cloned().collect();
+        for connection_id in pending_ids {
+            let relevant: Vec<RuntimeFrame> = frames
+                .iter()
+                .filter(|frame| frame.connection.as_deref() == Some(connection_id.as_str()))
+                .cloned()
+                .collect();
+            if relevant.is_empty() {
+                continue;
+            }
+            if relevant
+                .iter()
+                .any(|frame| frame.message_type.as_deref() == Some("Error"))
+            {
+                continue;
+            }
+            if self
+                .complete_pending_admission(&connection_id, &relevant)
+                .is_some()
+            {
+                let room_id = self
+                    .sessions
+                    .get(&connection_id)
+                    .map(|session| session.room_id.clone())
+                    .unwrap_or_default();
+                let _ = self.route_frames(&room_id, &relevant);
+                self.retire_superseded(&connection_id, &relevant);
+            }
+        }
+    }
+
+    fn retire_failed_admissions(&mut self, frames: &[RuntimeFrame]) {
+        let failed: Vec<String> = self
+            .pending_admissions
+            .keys()
+            .filter(|connection_id| {
+                frames.iter().any(|frame| {
+                    frame.connection.as_deref() == Some(connection_id.as_str())
+                        && frame.message_type.as_deref() == Some("Error")
+                })
+            })
+            .cloned()
+            .collect();
+        for connection_id in failed {
+            self.pending_admissions.remove(&connection_id);
+            self.pending_egress
+                .remove(&connection_id)
+                .into_iter()
+                .flatten()
+                .for_each(|egress| egress.abort());
+        }
     }
 
     fn disconnect(&mut self, connection_id: &str) -> Result<bool, String> {
@@ -631,22 +772,6 @@ impl Inner {
         }
     }
 
-    fn cancel_expire_for(&mut self, net_entity_id: Option<&str>) {
-        let Some(net_entity_id) = net_entity_id else {
-            return;
-        };
-        let handles: Vec<KernelHandle> = self
-            .expire_watch
-            .iter()
-            .filter(|(_, target)| target.net_entity_id == net_entity_id)
-            .map(|(handle, _)| *handle)
-            .collect();
-        for handle in handles {
-            let _ = self.kernel.cancel(handle);
-            self.expire_watch.remove(&handle);
-        }
-    }
-
     fn drive_wall(&mut self) -> bool {
         let now = self.clock.now_ms();
         let Ok(fired) = self.kernel.pump_wall_clock(now) else {
@@ -672,6 +797,9 @@ impl Inner {
     }
 
     fn admit_input_command(&mut self, connection_id: &str, envelope_bytes: &[u8]) -> ChatOperation {
+        if envelope_bytes.len() > MAX_WIRE_TEXT_BYTES {
+            return ChatOperation::rejected("bad_envelope");
+        }
         let Some(session) = self.sessions.get(connection_id) else {
             return ChatOperation::rejected("disconnected");
         };
@@ -689,18 +817,24 @@ impl Inner {
 
     fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
         if self.wire_chat_pending > MAX_CHAT_INPUTS_PER_TICK as u64 {
+            self.wire_chat_pending = 0;
             return RuntimeTick::failed("runtime_failure");
         }
         self.tick_id = self.tick_id.saturating_add(1);
         let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
+            self.wire_chat_pending = 0;
             return RuntimeTick::failed("runtime_failure");
         };
         if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
+            self.wire_chat_pending = 0;
             return RuntimeTick::failed("runtime_failure");
         }
         let tick = self.runtime.run_tick(room_id, self.tick_id);
-        self.wire_chat_pending = 0;
+        self.runtime_queries.extend(self.runtime.drain_queries());
+        self.route_pending_frames(&tick.frames);
         let routed = self.route_frames(room_id, &tick.frames);
+        self.retire_failed_admissions(&tick.frames);
+        self.wire_chat_pending = 0;
         if !tick.ok {
             return tick;
         }
@@ -713,20 +847,9 @@ impl Inner {
     fn route_frames(&mut self, room_id: &str, frames: &[RuntimeFrame]) -> bool {
         let mut routed = true;
         for frame in frames {
+            self.apply_runtime_identity(frame);
             if let Some(connection) = frame.connection.as_deref() {
-                match self.deliver_to_connection(connection, &frame.bytes) {
-                    DeliveryOutcome::Delivered => {}
-                    DeliveryOutcome::Unavailable => {
-                        if !self.defer_frame(connection, &frame.bytes) {
-                            let _ = self.fail_connection(connection);
-                            routed = false;
-                        }
-                    }
-                    DeliveryOutcome::InvalidFrame => {
-                        let _ = self.fail_connection(connection);
-                        routed = false;
-                    }
-                }
+                routed &= self.route_frame_to_connection(connection, &frame.bytes);
                 continue;
             }
             let targets: Vec<String> = self
@@ -736,71 +859,62 @@ impl Inner {
                 .map(|(connection, _)| connection.clone())
                 .collect();
             for connection in targets {
-                match self.deliver_to_connection(&connection, &frame.bytes) {
-                    DeliveryOutcome::Delivered => {}
-                    DeliveryOutcome::Unavailable => {
-                        if !self.defer_frame(&connection, &frame.bytes) {
-                            let _ = self.fail_connection(&connection);
-                            routed = false;
-                        }
-                    }
-                    DeliveryOutcome::InvalidFrame => {
-                        let _ = self.fail_connection(&connection);
-                        routed = false;
-                    }
-                }
+                routed &= self.route_frame_to_connection(&connection, &frame.bytes);
             }
         }
         routed
     }
 
-    fn deliver_to_connection(&mut self, connection: &str, bytes: &[u8]) -> DeliveryOutcome {
-        if bytes.len() > MAX_WIRE_TEXT_BYTES || std::str::from_utf8(bytes).is_err() {
-            return DeliveryOutcome::InvalidFrame;
-        }
-        if let Some(egresses) = self.pending_egress.get_mut(connection) {
-            let mut delivered = false;
-            egresses.retain(|egress| match egress.try_send_bytes(bytes) {
-                Ok(()) => {
-                    delivered = true;
+    fn route_frame_to_connection(&mut self, connection: &str, bytes: &[u8]) -> bool {
+        match self.deliver_to_connection(connection, bytes) {
+            Delivery::Delivered => true,
+            Delivery::Invalid => {
+                let _ = self.fail_connection(connection);
+                false
+            }
+            Delivery::Backpressured | Delivery::Unavailable => {
+                if self.defer_frame(connection, bytes) {
                     true
-                }
-                Err(WireSendError::Full) => {
-                    let _ = egress.try_close();
+                } else {
+                    let _ = self.fail_connection(connection);
                     false
                 }
-                Err(
-                    WireSendError::Closed | WireSendError::TooLarge | WireSendError::InvalidUtf8,
-                ) => false,
-            });
-            if delivered {
-                return DeliveryOutcome::Delivered;
+            }
+        }
+    }
+
+    fn apply_runtime_identity(&mut self, frame: &RuntimeFrame) {
+        let Some(connection) = frame.connection.as_deref() else {
+            return;
+        };
+        if frame.message_type.as_deref() != Some("Welcome") {
+            return;
+        }
+        let Some(net_entity_id) = frame.observer_net_entity_id.as_ref() else {
+            return;
+        };
+        if let Some(session) = self.sessions.get_mut(connection) {
+            session.net_entity_id.clone_from(net_entity_id);
+            if let Some(generation) = frame.connection_generation {
+                session.generation = generation;
+            }
+        }
+    }
+
+    fn deliver_to_connection(&mut self, connection: &str, bytes: &[u8]) -> Delivery {
+        if bytes.len() > MAX_WIRE_TEXT_BYTES || std::str::from_utf8(bytes).is_err() {
+            return Delivery::Invalid;
+        }
+        if let Some(egresses) = self.pending_egress.get_mut(connection) {
+            let result = deliver_to_egresses(egresses, bytes);
+            if result != Delivery::Unavailable {
+                return result;
             }
         }
         let Some(session) = self.sessions.get_mut(connection) else {
-            return DeliveryOutcome::Unavailable;
+            return Delivery::Unavailable;
         };
-        let mut delivered = false;
-        session
-            .egresses
-            .retain(|egress| match egress.try_send_bytes(bytes) {
-                Ok(()) => {
-                    delivered = true;
-                    true
-                }
-                Err(WireSendError::Full) => {
-                    let _ = egress.try_close();
-                    false
-                }
-                Err(
-                    WireSendError::Closed | WireSendError::TooLarge | WireSendError::InvalidUtf8,
-                ) => false,
-            });
-        if delivered {
-            DeliveryOutcome::Delivered
-        } else {
-            DeliveryOutcome::Unavailable
-        }
+        deliver_to_egresses(&mut session.egresses, bytes)
     }
 
     fn flush_deferred(&mut self, connection: &str) {
@@ -808,18 +922,8 @@ impl Inner {
             return;
         };
         for bytes in frames {
-            match self.deliver_to_connection(connection, &bytes) {
-                DeliveryOutcome::Delivered => {}
-                DeliveryOutcome::Unavailable => {
-                    if !self.defer_frame(connection, &bytes) {
-                        let _ = self.fail_connection(connection);
-                        break;
-                    }
-                }
-                DeliveryOutcome::InvalidFrame => {
-                    let _ = self.fail_connection(connection);
-                    break;
-                }
+            if !self.route_frame_to_connection(connection, &bytes) {
+                break;
             }
         }
     }
@@ -854,7 +958,7 @@ impl Inner {
                 .into_iter()
                 .flatten()
                 .for_each(|egress| {
-                    let _ = egress.try_close();
+                    egress.abort();
                 });
             self.deferred_frames.remove(connection);
             return Ok(());
@@ -866,11 +970,11 @@ impl Inner {
         };
         self.deferred_frames.remove(connection);
         for egress in &session.egresses {
-            let _ = egress.try_close();
+            egress.abort();
         }
         if let Some(egresses) = self.pending_egress.remove(connection) {
             for egress in egresses {
-                let _ = egress.try_close();
+                egress.abort();
             }
         }
 
@@ -893,7 +997,7 @@ impl Inner {
                 if self.sessions.contains_key(&connection_id) {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
                         if session.egresses.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
-                            let _ = egress.try_close();
+                            egress.abort();
                             let _ = self.fail_connection(&connection_id);
                             return;
                         }
@@ -902,12 +1006,12 @@ impl Inner {
                     self.flush_deferred(&connection_id);
                 } else {
                     if self.pending_egress.len() >= MAX_PENDING_EGRESS_CONNECTIONS {
-                        let _ = egress.try_close();
+                        egress.abort();
                         return;
                     }
                     let queue = self.pending_egress.entry(connection_id).or_default();
                     if queue.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
-                        let _ = egress.try_close();
+                        egress.abort();
                     } else {
                         queue.push(egress);
                     }
@@ -917,6 +1021,10 @@ impl Inner {
                 connection_id,
                 text,
             } => {
+                if text.as_bytes().len() > MAX_WIRE_TEXT_BYTES {
+                    let _ = self.fail_connection(&connection_id);
+                    return;
+                }
                 let room_id = self
                     .sessions
                     .get(&connection_id)
@@ -936,7 +1044,14 @@ impl Inner {
                 }
             }
             WireEvent::Closed { connection_id } => {
-                let _ = self.disconnect(&connection_id);
+                if !self.disconnect(&connection_id).unwrap_or(false) {
+                    self.pending_admissions.remove(&connection_id);
+                    self.pending_egress
+                        .remove(&connection_id)
+                        .into_iter()
+                        .flatten()
+                        .for_each(|egress| egress.abort());
+                }
             }
         }
     }

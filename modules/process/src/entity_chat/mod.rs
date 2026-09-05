@@ -50,14 +50,14 @@ pub use host::{
 pub use runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,
     PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeControlError,
-    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface,
-    RuntimeTick,
+    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeQueryRecord,
+    RuntimeSurface, RuntimeTick,
 };
 pub use suite::{
     apply_pending_chat_ticks, drain_chat_event_deltas, run_round, run_round_blocking,
     run_two_rounds, SuiteOptions, SuiteReport,
 };
-pub use wire::{RoomClient, RoomListener};
+pub use wire::{RoomClient, RoomListener, MAX_WIRE_TEXT_BYTES};
 
 pub const MAIN_ROOM: &str = "room-main";
 pub const ISO_ROOM: &str = "room-iso";

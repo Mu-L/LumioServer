@@ -11,8 +11,9 @@ use super::runtime::BoundEntityKind;
 use super::runtime::{
     ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
     RuntimeControlError, RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery,
-    RuntimeSurface, RuntimeTick,
+    RuntimeQueryRecord, RuntimeSurface, RuntimeTick,
 };
+use super::wire::MAX_WIRE_TEXT_BYTES;
 
 /// Files needed to create the CoreCLR Runtime consume host.
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ pub struct ClrGameplay {
     registry_assembly: String,
     booted: bool,
     next_request_id: u64,
+    completed_queries: Vec<RuntimeQueryRecord>,
 }
 
 impl ClrGameplay {
@@ -61,6 +63,7 @@ impl ClrGameplay {
             registry_assembly: config.registry_assembly.to_string_lossy().into_owned(),
             booted: false,
             next_request_id: 1,
+            completed_queries: Vec::new(),
         })
     }
 
@@ -195,6 +198,7 @@ enum QueryRecord {
 }
 
 impl QueryRecord {
+    #[cfg(test)]
     fn request_id(&self) -> &str {
         match self {
             Self::Expire { request_id, .. }
@@ -203,12 +207,83 @@ impl QueryRecord {
         }
     }
 
+    #[cfg(test)]
     fn type_name(&self) -> &'static str {
         match self {
             Self::Expire { .. } => "ExpireEntityResult",
             Self::Resolve { .. } => "ResolveBindingResult",
             Self::Attribute { .. } => "AttributeQueryResult",
         }
+    }
+}
+
+fn query_record_for_host(record: QueryRecord) -> RuntimeQueryRecord {
+    match record {
+        QueryRecord::Expire {
+            request_id,
+            outcome,
+            code,
+            detail,
+        } => RuntimeQueryRecord {
+            request_id,
+            result_type: "ExpireEntityResult".to_owned(),
+            outcome,
+            binding: None,
+            value: None,
+            net_entity_id: None,
+            room_id: None,
+            attribute_id: None,
+            code,
+            detail,
+            observed_revision: None,
+            observed_tick: None,
+        },
+        QueryRecord::Resolve {
+            request_id,
+            outcome,
+            binding,
+            code,
+            detail,
+            observed_revision,
+        } => RuntimeQueryRecord {
+            request_id,
+            result_type: "ResolveBindingResult".to_owned(),
+            outcome,
+            binding,
+            value: None,
+            net_entity_id: None,
+            room_id: None,
+            attribute_id: None,
+            code,
+            detail,
+            observed_revision,
+            observed_tick: None,
+        },
+        QueryRecord::Attribute {
+            request_id,
+            outcome,
+            net_entity_id,
+            room_id,
+            attribute_id,
+            value,
+            observed_revision,
+            observed_tick,
+            code,
+            detail,
+        } => RuntimeQueryRecord {
+            request_id,
+            result_type: "AttributeQueryResult".to_owned(),
+            outcome,
+            binding: None,
+            value,
+            net_entity_id,
+            room_id,
+            attribute_id,
+            code,
+            detail,
+            observed_revision,
+            observed_tick,
+        },
     }
 }
 
@@ -512,26 +587,7 @@ fn ensure_query_keys(
     Ok(())
 }
 
-fn query_error(code: Option<&str>, detail: Option<&str>) -> String {
-    match (code, detail) {
-        (Some(code), Some(detail)) => format!("{code}: {detail}"),
-        (Some(code), None) => code.to_owned(),
-        _ => "runtime_failure".to_owned(),
-    }
-}
-
-fn ensure_tick_ok(tick: &Value, frames: &[RuntimeFrame]) -> Result<(), String> {
-    if tick.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(());
-    }
-    Err(tick
-        .get("code")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| error_from_frames(frames))
-        .unwrap_or_else(|| "runtime_failure".to_owned()))
-}
-
+#[cfg(test)]
 fn correlated_query<'a>(
     queries: &'a [QueryRecord],
     request_id: &str,
@@ -604,20 +660,6 @@ fn error_from_frames(frames: &[RuntimeFrame]) -> Option<String> {
     })
 }
 
-fn welcome_from_frames(frames: &[RuntimeFrame], connection: &str) -> Option<(String, u64)> {
-    frames.iter().find_map(|frame| {
-        (frame.connection.as_deref() == Some(connection)
-            && frame.message_type.as_deref() == Some("Welcome"))
-        .then(|| {
-            Some((
-                frame.observer_net_entity_id.clone()?,
-                frame.connection_generation?,
-            ))
-        })
-        .flatten()
-    })
-}
-
 impl RuntimeSurface for ClrGameplay {
     fn admit(
         &mut self,
@@ -635,39 +677,17 @@ impl RuntimeSurface for ClrGameplay {
             "entityType": entity_type.as_str(),
         });
         if let Err(code) = self.enqueue(enqueue) {
-            return RuntimeAdmit::reject(&code);
+            return RuntimeAdmit::reject_with_frames(&code, Vec::new());
         }
-        let (tick, drain) = match self.tick_and_drain() {
-            Ok(result) => result,
-            Err(_) => return RuntimeAdmit::reject("runtime_failure"),
-        };
-        let RuntimeDrain { frames, queries } = drain;
-        if !queries.is_empty() {
-            return RuntimeAdmit::reject_with_frames("runtime_failure", frames);
+        // Admission is an intent. The owner tick applies it and emits the
+        // Runtime-issued identity in the Welcome outbox frame.
+        let _ = (account_id, room_id, entity_type);
+        RuntimeAdmit {
+            accepted: true,
+            code: None,
+            binding: None,
+            frames: Vec::new(),
         }
-        if tick.get("ok").and_then(Value::as_bool) != Some(true) {
-            let code = tick
-                .get("code")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| error_from_frames(&frames))
-                .unwrap_or_else(|| "runtime_failure".to_owned());
-            return RuntimeAdmit::reject_with_frames(&code, frames);
-        }
-        let Some((net_entity_id, generation)) = welcome_from_frames(&frames, connection) else {
-            let code = error_from_frames(&frames).unwrap_or_else(|| "runtime_failure".to_owned());
-            return RuntimeAdmit::reject_with_frames(&code, frames);
-        };
-        let binding = RuntimeBinding {
-            account_id: account_id.to_owned(),
-            room_id: room_id.to_owned(),
-            net_entity_id,
-            entity_type,
-            connection_generation: generation,
-        };
-        let mut result = RuntimeAdmit::ok(binding);
-        result.frames = frames;
-        result
     }
 
     fn disconnect(
@@ -680,23 +700,9 @@ impl RuntimeSurface for ClrGameplay {
             "messageType": "DisconnectConnectionMessage",
             "connection": connection,
         }))?;
-        let (tick, drain) = self.tick_and_drain()?;
-        let RuntimeDrain { frames, queries } = drain;
-        if !queries.is_empty() {
-            return Err("unexpected runtime query result".to_owned());
-        }
-        if tick.get("ok").and_then(Value::as_bool) != Some(true) {
-            let code = tick
-                .get("code")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| error_from_frames(&frames))
-                .unwrap_or_else(|| "runtime_failure".to_owned());
-            return Err(code);
-        }
         Ok(RuntimeDisconnect {
             binding: binding.clone(),
-            frames,
+            frames: Vec::new(),
         })
     }
 
@@ -720,39 +726,15 @@ impl RuntimeSurface for ClrGameplay {
             "roomId": room_id,
             "mode": mode_text,
         })) {
-            return RuntimeAdmit::reject(&code);
+            return RuntimeAdmit::reject_with_frames(&code, Vec::new());
         }
-        let (tick, drain) = match self.tick_and_drain() {
-            Ok(result) => result,
-            Err(_) => return RuntimeAdmit::reject("runtime_failure"),
-        };
-        let RuntimeDrain { frames, queries } = drain;
-        if !queries.is_empty() {
-            return RuntimeAdmit::reject_with_frames("runtime_failure", frames);
+        let _ = (account_id, room_id, entity_type);
+        RuntimeAdmit {
+            accepted: true,
+            code: None,
+            binding: None,
+            frames: Vec::new(),
         }
-        if tick.get("ok").and_then(Value::as_bool) != Some(true) {
-            let code = tick
-                .get("code")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| error_from_frames(&frames))
-                .unwrap_or_else(|| "runtime_failure".to_owned());
-            return RuntimeAdmit::reject_with_frames(&code, frames);
-        }
-        let Some((net_entity_id, generation)) = welcome_from_frames(&frames, connection) else {
-            let code = error_from_frames(&frames).unwrap_or_else(|| "runtime_failure".to_owned());
-            return RuntimeAdmit::reject_with_frames(&code, frames);
-        };
-        let binding = RuntimeBinding {
-            account_id: account_id.to_owned(),
-            room_id: room_id.to_owned(),
-            net_entity_id,
-            entity_type,
-            connection_generation: generation,
-        };
-        let mut result = RuntimeAdmit::ok(binding);
-        result.frames = frames;
-        result
     }
 
     fn expire(
@@ -766,22 +748,11 @@ impl RuntimeSurface for ClrGameplay {
             "requestId": request_id.clone(),
             "netEntityId": net_entity_id,
         }))?;
-        let (tick, drain) = self.tick_and_drain()?;
-        ensure_tick_ok(&tick, &drain.frames)?;
-        let result = correlated_query(&drain.queries, &request_id, "ExpireEntityResult")?.clone();
-        match result {
-            QueryRecord::Expire { outcome, .. } if outcome != "request_error" => {
-                Ok(RuntimeControlResult::new((), drain.frames))
-            }
-            QueryRecord::Expire { code, detail, .. } => Err(RuntimeControlError::new(
-                query_error(code.as_deref(), detail.as_deref()),
-                drain.frames,
-            )),
-            _ => Err(RuntimeControlError::new(
-                "runtime query result type mismatch".to_owned(),
-                drain.frames,
-            )),
-        }
+        let _ = request_id;
+        Err(RuntimeControlError::new(
+            "runtime_query_pending".to_owned(),
+            Vec::new(),
+        ))
     }
 
     fn resolve_by_net_entity_id(
@@ -790,51 +761,18 @@ impl RuntimeSurface for ClrGameplay {
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
         let request_id = self.next_request_id("resolve");
-        let result = self
-            .enqueue(json!({
-                "op": "enqueue",
-                "messageType": "ResolveBindingMessage",
-                "requestId": request_id.clone(),
-                "roomId": room_id,
-                "netEntityId": net_entity_id,
-            }))
-            .and_then(|()| self.tick_and_drain())
-            .and_then(|(tick, drain)| {
-                ensure_tick_ok(&tick, &drain.frames)?;
-                let record =
-                    correlated_query(&drain.queries, &request_id, "ResolveBindingResult")?.clone();
-                Ok((record, drain.frames))
-            });
-        let (record, frames) = result?;
-        match record {
-            QueryRecord::Resolve {
-                outcome,
-                binding: Some(binding),
-                ..
-            } if outcome == "ok" => {
-                if binding.room_id != room_id || binding.net_entity_id != net_entity_id {
-                    return Err(RuntimeControlError::new(
-                        "runtime query result request mismatch".to_owned(),
-                        frames,
-                    ));
-                }
-                Ok(RuntimeControlResult::new(Some(binding), frames))
-            }
-            QueryRecord::Resolve {
-                outcome,
-                code,
-                detail,
-                ..
-            } if outcome == "request_error" => Err(RuntimeControlError::new(
-                query_error(code.as_deref(), detail.as_deref()),
-                frames,
-            )),
-            QueryRecord::Resolve { .. } => Ok(RuntimeControlResult::new(None, frames)),
-            _ => Err(RuntimeControlError::new(
-                "runtime query result type mismatch".to_owned(),
-                frames,
-            )),
-        }
+        self.enqueue(json!({
+            "op": "enqueue",
+            "messageType": "ResolveBindingMessage",
+            "requestId": request_id.clone(),
+            "roomId": room_id,
+            "netEntityId": net_entity_id,
+        }))?;
+        let _ = (request_id, room_id, net_entity_id);
+        Err(RuntimeControlError::new(
+            "runtime_query_pending".to_owned(),
+            Vec::new(),
+        ))
     }
 
     fn query_attribute(
@@ -854,53 +792,12 @@ impl RuntimeSurface for ClrGameplay {
         if let Some(generation) = request.connection_generation {
             message["connectionGeneration"] = json!(generation);
         }
-        let result = self
-            .enqueue(message)
-            .and_then(|()| self.tick_and_drain())
-            .and_then(|(tick, drain)| {
-                ensure_tick_ok(&tick, &drain.frames)?;
-                let record =
-                    correlated_query(&drain.queries, &request_id, "AttributeQueryResult")?.clone();
-                Ok((record, drain.frames))
-            });
-        let (record, frames) = result?;
-        let value = match record {
-            QueryRecord::Attribute {
-                outcome,
-                net_entity_id,
-                room_id,
-                attribute_id,
-                value,
-                observed_tick,
-                observed_revision,
-                ..
-            } if outcome == "ok" => {
-                if net_entity_id.as_deref() != Some(request.net_entity_id.as_str())
-                    || room_id.as_deref() != Some(request.room_id.as_str())
-                    || attribute_id.as_deref() != Some(request.attribute_id.as_str())
-                {
-                    return Err(RuntimeControlError::new(
-                        "runtime query result request mismatch".to_owned(),
-                        frames,
-                    ));
-                }
-                QueryResult::ok(
-                    value.unwrap_or_default(),
-                    observed_tick.unwrap_or_default(),
-                    observed_revision.unwrap_or_default(),
-                )
-            }
-            QueryRecord::Attribute { outcome, code, .. } => {
-                QueryResult::from_runtime(&outcome, code.as_deref(), None)
-            }
-            _ => {
-                return Err(RuntimeControlError::new(
-                    "runtime query result type mismatch".to_owned(),
-                    frames,
-                ))
-            }
-        };
-        Ok(RuntimeControlResult::new(value, frames))
+        self.enqueue(message)?;
+        let _ = request_id;
+        Err(RuntimeControlError::new(
+            "runtime_query_pending".to_owned(),
+            Vec::new(),
+        ))
     }
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {
@@ -916,6 +813,9 @@ impl RuntimeSurface for ClrGameplay {
         net_entity_id: &str,
         envelope_bytes: &[u8],
     ) -> ChatOperation {
+        if envelope_bytes.len() > MAX_WIRE_TEXT_BYTES {
+            return ChatOperation::rejected("bad_envelope");
+        }
         if let Err(code) = self.enqueue(json!({
             "op": "enqueue",
             "messageType": "InputCommandMessage",
@@ -934,9 +834,8 @@ impl RuntimeSurface for ClrGameplay {
             Ok(result) => result,
             Err(_) => return RuntimeTick::failed("runtime_failure"),
         };
-        if !drain.queries.is_empty() {
-            return RuntimeTick::failed("unexpected_query_result");
-        }
+        self.completed_queries
+            .extend(drain.queries.into_iter().map(query_record_for_host));
         let mut tick = match tick_from_hostentry_json(value) {
             Ok(tick) => tick,
             Err(_) => return RuntimeTick::failed("runtime_failure"),
@@ -947,6 +846,10 @@ impl RuntimeSurface for ClrGameplay {
             tick.code = Some(code);
         }
         tick
+    }
+
+    fn drain_queries(&mut self) -> Vec<RuntimeQueryRecord> {
+        std::mem::take(&mut self.completed_queries)
     }
 
     fn persist(&mut self, room_id: &str) -> Result<PersistRecord, String> {

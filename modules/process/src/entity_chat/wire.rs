@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use lumio_host_runtime::{
-    bounded_channel, spawn_supervised, CancelToken, SendError, Sender, SupervisedTask,
+    bounded_channel, spawn_supervised, CancelToken, RecvError, SendError, Sender, SupervisedTask,
 };
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
@@ -21,11 +21,12 @@ pub const MAX_WIRE_TEXT_BYTES: usize = 65_536;
 #[derive(Clone)]
 pub struct WireSender {
     inner: Sender<WireOut>,
+    cancel: CancelToken,
 }
 
 #[derive(Debug, Clone)]
 pub enum WireOut {
-    Text(String),
+    Text(Vec<u8>),
     Close,
 }
 
@@ -39,24 +40,32 @@ pub enum WireSendError {
 
 impl WireSender {
     pub fn try_send_text(&self, text: String) -> Result<(), WireSendError> {
-        if text.len() > MAX_WIRE_TEXT_BYTES {
-            return Err(WireSendError::TooLarge);
-        }
-        self.inner
-            .try_send(WireOut::Text(text))
-            .map_err(map_send_error)
+        self.try_send_bytes(text.as_bytes())
     }
 
     pub fn try_send_bytes(&self, bytes: &[u8]) -> Result<(), WireSendError> {
         if bytes.len() > MAX_WIRE_TEXT_BYTES {
             return Err(WireSendError::TooLarge);
         }
-        let text = std::str::from_utf8(bytes).map_err(|_| WireSendError::InvalidUtf8)?;
-        self.try_send_text(text.to_owned())
+        std::str::from_utf8(bytes).map_err(|_| WireSendError::InvalidUtf8)?;
+        self.inner
+            .try_send(WireOut::Text(bytes.to_vec()))
+            .map_err(map_send_error)
     }
 
     pub fn try_close(&self) -> Result<(), WireSendError> {
-        self.inner.try_send(WireOut::Close).map_err(map_send_error)
+        match self.inner.try_send(WireOut::Close) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let error = map_send_error(error);
+                self.cancel.cancel();
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn abort(&self) {
+        self.cancel.cancel();
     }
 }
 
@@ -166,7 +175,10 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         None => return,
     };
     let (out_tx, out_rx) = bounded_channel(64);
-    let egress = WireSender { inner: out_tx };
+    let egress = WireSender {
+        inner: out_tx,
+        cancel: cancel.clone(),
+    };
     if event_tx
         .send(WireEvent::Attached {
             connection_id: connection_id.clone(),
@@ -184,7 +196,11 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
             break;
         }
         match out_rx.try_recv() {
-            Ok(WireOut::Text(text)) => {
+            Ok(WireOut::Text(bytes)) => {
+                let Ok(text) = String::from_utf8(bytes) else {
+                    let _ = ws.close(None);
+                    break;
+                };
                 if ws.send(Message::Text(text.into())).is_err() {
                     break;
                 }
@@ -193,14 +209,11 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
                 let _ = ws.close(None);
                 break;
             }
-            Err(_) => {}
+            Err(RecvError::Empty) => {}
+            Err(RecvError::Closed) => break,
         }
         match ws.read() {
-            Ok(Message::Text(text)) => {
-                if !is_wire_text_size_valid(&text) {
-                    let _ = ws.close(None);
-                    break;
-                }
+            Ok(Message::Text(text)) if is_wire_text_size_valid(&text) => {
                 if event_tx
                     .send(WireEvent::Input {
                         connection_id: connection_id.clone(),
@@ -210,6 +223,10 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
                 {
                     break;
                 }
+            }
+            Ok(Message::Text(_)) => {
+                let _ = ws.close(None);
+                break;
             }
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(payload)) => {
@@ -242,7 +259,7 @@ fn parse_connection_id(text: &str) -> Option<String> {
 }
 
 fn is_wire_text_size_valid(text: &str) -> bool {
-    text.len() <= MAX_WIRE_TEXT_BYTES
+    text.as_bytes().len() <= MAX_WIRE_TEXT_BYTES
 }
 
 /// Test/harness client that actually receives frames.
@@ -363,7 +380,10 @@ mod tests {
     #[test]
     fn wire_sender_reports_full_without_blocking() {
         let (tx, _rx) = bounded_channel(1);
-        let sender = WireSender { inner: tx };
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+        };
         sender
             .try_send_text("first".to_owned())
             .expect("first slot");
@@ -377,7 +397,10 @@ mod tests {
     #[test]
     fn wire_sender_reports_closed_receiver() {
         let (tx, rx) = bounded_channel(1);
-        let sender = WireSender { inner: tx };
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+        };
         drop(rx);
 
         assert_eq!(
@@ -389,18 +412,26 @@ mod tests {
     #[test]
     fn wire_sender_close_reports_full_without_blocking() {
         let (tx, _rx) = bounded_channel(1);
-        let sender = WireSender { inner: tx };
+        let cancel = CancelToken::new();
+        let sender = WireSender {
+            inner: tx,
+            cancel: cancel.clone(),
+        };
         sender
             .try_send_text("frame".to_owned())
             .expect("first slot");
 
         assert_eq!(sender.try_close(), Err(WireSendError::Full));
+        assert!(cancel.is_cancelled());
     }
 
     #[test]
     fn wire_sender_close_reports_closed_receiver() {
         let (tx, rx) = bounded_channel(1);
-        let sender = WireSender { inner: tx };
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+        };
         drop(rx);
 
         assert_eq!(sender.try_close(), Err(WireSendError::Closed));
@@ -409,7 +440,10 @@ mod tests {
     #[test]
     fn wire_sender_accepts_exact_text_byte_limit() {
         let (tx, rx) = bounded_channel(1);
-        let sender = WireSender { inner: tx };
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+        };
 
         sender
             .try_send_bytes(&vec![b'a'; MAX_WIRE_TEXT_BYTES])
@@ -420,7 +454,10 @@ mod tests {
     #[test]
     fn wire_sender_rejects_text_over_byte_limit() {
         let (tx, _rx) = bounded_channel(1);
-        let sender = WireSender { inner: tx };
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+        };
 
         assert_eq!(
             sender.try_send_bytes(&vec![b'a'; MAX_WIRE_TEXT_BYTES + 1]),
@@ -431,7 +468,10 @@ mod tests {
     #[test]
     fn wire_sender_rejects_invalid_utf8() {
         let (tx, _rx) = bounded_channel(1);
-        let sender = WireSender { inner: tx };
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+        };
 
         assert_eq!(
             sender.try_send_bytes(&[0xff]),
@@ -449,5 +489,14 @@ mod tests {
         assert!(!is_wire_text_size_valid(
             &"a".repeat(MAX_WIRE_TEXT_BYTES + 1)
         ));
+    }
+
+    #[test]
+    fn inbound_wire_text_limit_counts_utf8_bytes() {
+        let exact = "é".repeat(MAX_WIRE_TEXT_BYTES / 2);
+        let over = format!("{exact}é");
+        assert_eq!(exact.as_bytes().len(), MAX_WIRE_TEXT_BYTES);
+        assert!(is_wire_text_size_valid(&exact));
+        assert!(!is_wire_text_size_valid(&over));
     }
 }
