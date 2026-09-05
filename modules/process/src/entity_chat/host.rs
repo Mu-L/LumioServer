@@ -760,13 +760,21 @@ impl Inner {
     }
 
     fn deliver_to_connection(&mut self, connection: &str, bytes: &[u8]) -> bool {
+        let text = String::from_utf8_lossy(bytes).into_owned();
+        if let Some(egresses) = self.pending_egress.get_mut(connection) {
+            let mut delivered = false;
+            egresses.retain(|egress| {
+                let sent = egress.send_text(text.clone());
+                delivered |= sent;
+                sent
+            });
+            if delivered {
+                return true;
+            }
+        }
         let Some(session) = self.sessions.get_mut(connection) else {
             return false;
         };
-        if session.egresses.is_empty() {
-            return false;
-        }
-        let text = String::from_utf8_lossy(bytes).into_owned();
         let mut delivered = false;
         session.egresses.retain(|egress| {
             let sent = egress.send_text(text.clone());
@@ -882,9 +890,18 @@ impl Inner {
                 connection_id,
                 text,
             } => {
+                let room_id = self
+                    .sessions
+                    .get(&connection_id)
+                    .map(|session| session.room_id.clone());
                 let admitted = self.admit_chat_input(&connection_id, text.as_bytes());
                 if admitted.kind == ChatOpKind::Admitted {
                     self.wire_chat_pending = self.wire_chat_pending.saturating_add(1);
+                    if self.wire_chat_pending >= MAX_CHAT_INPUTS_PER_TICK as u64 {
+                        if let Some(room_id) = room_id {
+                            let _ = self.run_tick(&room_id);
+                        }
+                    }
                 }
             }
             WireEvent::Closed { connection_id } => {

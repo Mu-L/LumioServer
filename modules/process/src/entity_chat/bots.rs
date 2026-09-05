@@ -11,6 +11,7 @@ use serde_json::Value;
 use super::envelope::InputCommand;
 
 const FLEET_WAIT: Duration = Duration::from_secs(15);
+const FLEET_PROGRESS_POLL: Duration = Duration::from_millis(1);
 const R4_04_BLOCKED: &str = "BLOCKED: 等 R4-04";
 
 /// Observed Bot.Host log evidence. Empty unless R4-04 Bot.Host wrote logs.
@@ -29,6 +30,10 @@ pub struct ClientBotFleet {
     pub trace: ClientBotTrace,
     child: Option<Child>,
     release_path: PathBuf,
+    log_dir: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    expected_submissions: u32,
 }
 
 impl ClientBotFleet {
@@ -175,11 +180,35 @@ pub fn run_client_bot_fleet<F>(
     envelopes: &[(String, InputCommand)],
     out_dir: &Path,
     dotnet: &str,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<ClientBotFleet, String>
 where
     F: FnMut(),
 {
+    let fleet = start_client_bot_fleet(
+        bot_host,
+        engine_native,
+        room_uri,
+        envelopes,
+        out_dir,
+        dotnet,
+    )?;
+    wait_for_client_bot_fleet(fleet, on_progress)
+}
+
+/// Starts Bot.Host without waiting for sessions to become active.
+///
+/// # Errors
+///
+/// Returns BLOCKED when the host cannot be built or spawned.
+pub fn start_client_bot_fleet(
+    bot_host: &Path,
+    engine_native: &Path,
+    room_uri: &str,
+    envelopes: &[(String, InputCommand)],
+    out_dir: &Path,
+    dotnet: &str,
+) -> Result<ClientBotFleet, String> {
     std::fs::create_dir_all(out_dir).map_err(|error| error.to_string())?;
     let host = ensure_bot_host_executable(bot_host, dotnet)?;
     let launch = bot_host_launch(room_uri, envelopes, engine_native, out_dir);
@@ -195,24 +224,55 @@ where
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr));
-    let mut child = command
+    let child = command
         .spawn()
         .map_err(|error| format!("BLOCKED: spawn Lumio.Client.Bot.Host: {error}"))?;
+    Ok(ClientBotFleet {
+        trace: ClientBotTrace::default(),
+        child: Some(child),
+        release_path,
+        log_dir: launch.log_dir,
+        stdout_path,
+        stderr_path,
+        expected_submissions: u32::try_from(envelopes.len())
+            .unwrap_or(u32::MAX)
+            .saturating_mul(3),
+    })
+}
+
+/// Waits for Bot.Host evidence while the suite advances host work.
+///
+/// # Errors
+///
+/// Returns BLOCKED when Bot.Host exits or times out before evidence.
+pub fn wait_for_client_bot_fleet<F>(
+    mut fleet: ClientBotFleet,
+    mut on_progress: F,
+) -> Result<ClientBotFleet, String>
+where
+    F: FnMut(),
+{
     let deadline = Instant::now() + FLEET_WAIT;
     loop {
         on_progress();
-        if let Ok(trace) = read_bot_host_logs(&launch.log_dir) {
-            return Ok(ClientBotFleet {
-                trace,
-                child: Some(child),
-                release_path,
-            });
+        if let Ok(trace) = read_bot_host_logs(&fleet.log_dir) {
+            let complete = trace.submitted >= fleet.expected_submissions
+                && [5_u64, 10, 15]
+                    .iter()
+                    .all(|tick| trace.utterance_ticks.contains(tick));
+            fleet.trace = trace;
+            if complete {
+                return Ok(fleet);
+            }
         }
+        let Some(child) = fleet.child.as_mut() else {
+            return Err("BLOCKED: Lumio.Client.Bot.Host process missing".to_owned());
+        };
         match child.try_wait() {
             Ok(Some(status)) => {
                 return Err(format!(
                     "{R4_04_BLOCKED}: Lumio.Client.Bot.Host exited {status} without log evidence{}",
-                    tail_logs(&stdout_path, &stderr_path)
+                    tail_logs(&fleet.stdout_path, &fleet.stderr_path)
                 ));
             }
             Ok(None) => {}
@@ -225,10 +285,10 @@ where
             let _ = child.wait();
             return Err(format!(
                 "{R4_04_BLOCKED}: Lumio.Client.Bot.Host timed out without log evidence{}",
-                tail_logs(&stdout_path, &stderr_path)
+                tail_logs(&fleet.stdout_path, &fleet.stderr_path)
             ));
         }
-        thread::sleep(Duration::from_millis(50));
+        thread::sleep(FLEET_PROGRESS_POLL);
     }
 }
 
@@ -581,6 +641,10 @@ mod tests {
             trace: ClientBotTrace::default(),
             child: None,
             release_path: release_path.clone(),
+            log_dir: tmp.path().to_path_buf(),
+            stdout_path: tmp.path().join("stdout"),
+            stderr_path: tmp.path().join("stderr"),
+            expected_submissions: 0,
         };
         fleet.release();
         assert!(

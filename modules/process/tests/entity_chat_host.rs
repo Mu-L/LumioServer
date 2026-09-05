@@ -378,7 +378,7 @@ fn sixty_four_chat_inputs_one_tick_emit_chat_event() {
 }
 
 #[test]
-fn host_run_tick_must_not_runtick_more_than_max_chat_inputs() {
+fn host_wire_ingress_ticks_at_max_chat_inputs() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
     let _ = host.admit(
@@ -396,21 +396,13 @@ fn host_run_tick_must_not_runtick_more_than_max_chat_inputs() {
             .expect("wire chat.input");
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while host.pending_wire_chat_inputs() < MAX_CHAT_INPUTS_PER_TICK + 1
-        && std::time::Instant::now() < deadline
+    while runtime.lock().run_tick_input_counts().is_empty() && std::time::Instant::now() < deadline
     {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(
-        host.pending_wire_chat_inputs(),
-        MAX_CHAT_INPUTS_PER_TICK + 1
-    );
-    let tick = host.run_tick("room-main".to_owned());
-    assert!(
-        !tick.ok,
-        "RunTick of more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs is not SUCCESS, got {tick:?}"
-    );
     let counts = runtime.lock().run_tick_input_counts().to_vec();
+    assert_eq!(counts.first().copied(), Some(MAX_CHAT_INPUTS_PER_TICK));
+    assert!(host.pending_wire_chat_inputs() < MAX_CHAT_INPUTS_PER_TICK);
     assert!(
         counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),
         "host must not forward more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs to Runtime RunTick, got {counts:?}"

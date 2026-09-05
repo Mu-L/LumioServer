@@ -6,9 +6,12 @@ use std::time::Duration;
 
 use lumio_host_runtime::{bounded_channel, spawn_supervised, CancelToken, Sender, SupervisedTask};
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocket;
 use tokio_tungstenite::tungstenite::stream::MaybeTlsStream;
-use tokio_tungstenite::tungstenite::{accept, client::connect as ws_connect, Message};
+use tokio_tungstenite::tungstenite::{accept_hdr, client::connect as ws_connect, Message};
 
 /// Egress to one accepted socket.
 #[derive(Clone)]
@@ -102,11 +105,25 @@ impl RoomListener {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelToken) {
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let mut ws = match accept(stream) {
+    let mut ws = match accept_hdr(stream, |request: &Request, mut response: Response| {
+        let offers_mvp = request
+            .headers()
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|item| item.trim() == "lumio.mvp.v0"));
+        if offers_mvp {
+            response.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static("lumio.mvp.v0"),
+            );
+        }
+        Ok(response)
+    }) {
         Ok(ws) => ws,
         Err(_) => return,
     };

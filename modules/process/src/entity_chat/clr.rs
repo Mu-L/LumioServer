@@ -25,6 +25,7 @@ pub struct ClrGameplayConfig {
     pub entry_method: String,
     pub replication_assembly: PathBuf,
     pub ecs_assembly: PathBuf,
+    pub registry_assembly: PathBuf,
 }
 
 /// CoreCLR-backed [`RuntimeSurface`].
@@ -32,6 +33,7 @@ pub struct ClrGameplay {
     bridge: ClrBridge,
     replication_assembly: String,
     ecs_assembly: String,
+    registry_assembly: String,
     booted: bool,
     next_request_id: u64,
 }
@@ -56,6 +58,7 @@ impl ClrGameplay {
             bridge,
             replication_assembly: config.replication_assembly.to_string_lossy().into_owned(),
             ecs_assembly: config.ecs_assembly.to_string_lossy().into_owned(),
+            registry_assembly: config.registry_assembly.to_string_lossy().into_owned(),
             booted: false,
             next_request_id: 1,
         })
@@ -67,6 +70,7 @@ impl ClrGameplay {
                 "op": "boot",
                 "replicationAssembly": self.replication_assembly,
                 "ecsAssembly": self.ecs_assembly,
+                "registryAssembly": self.registry_assembly,
             });
             let body = self
                 .bridge
@@ -639,7 +643,7 @@ impl RuntimeSurface for ClrGameplay {
         };
         let RuntimeDrain { frames, queries } = drain;
         if !queries.is_empty() {
-            return RuntimeAdmit::reject("runtime_failure");
+            return RuntimeAdmit::reject_with_frames("runtime_failure", frames);
         }
         if tick.get("ok").and_then(Value::as_bool) != Some(true) {
             let code = tick
@@ -648,14 +652,11 @@ impl RuntimeSurface for ClrGameplay {
                 .map(str::to_owned)
                 .or_else(|| error_from_frames(&frames))
                 .unwrap_or_else(|| "runtime_failure".to_owned());
-            return RuntimeAdmit::reject(&code);
+            return RuntimeAdmit::reject_with_frames(&code, frames);
         }
         let Some((net_entity_id, generation)) = welcome_from_frames(&frames, connection) else {
-            return RuntimeAdmit::reject(
-                error_from_frames(&frames)
-                    .as_deref()
-                    .unwrap_or("runtime_failure"),
-            );
+            let code = error_from_frames(&frames).unwrap_or_else(|| "runtime_failure".to_owned());
+            return RuntimeAdmit::reject_with_frames(&code, frames);
         };
         let binding = RuntimeBinding {
             account_id: account_id.to_owned(),
@@ -727,7 +728,7 @@ impl RuntimeSurface for ClrGameplay {
         };
         let RuntimeDrain { frames, queries } = drain;
         if !queries.is_empty() {
-            return RuntimeAdmit::reject("runtime_failure");
+            return RuntimeAdmit::reject_with_frames("runtime_failure", frames);
         }
         if tick.get("ok").and_then(Value::as_bool) != Some(true) {
             let code = tick
@@ -736,14 +737,11 @@ impl RuntimeSurface for ClrGameplay {
                 .map(str::to_owned)
                 .or_else(|| error_from_frames(&frames))
                 .unwrap_or_else(|| "runtime_failure".to_owned());
-            return RuntimeAdmit::reject(&code);
+            return RuntimeAdmit::reject_with_frames(&code, frames);
         }
         let Some((net_entity_id, generation)) = welcome_from_frames(&frames, connection) else {
-            return RuntimeAdmit::reject(
-                error_from_frames(&frames)
-                    .as_deref()
-                    .unwrap_or("runtime_failure"),
-            );
+            let code = error_from_frames(&frames).unwrap_or_else(|| "runtime_failure".to_owned());
+            return RuntimeAdmit::reject_with_frames(&code, frames);
         };
         let binding = RuntimeBinding {
             account_id: account_id.to_owned(),

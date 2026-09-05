@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use lumio_host_runtime::{KernelError, KernelFired, KernelHandle, KernelTimer, TimerMode};
 use lumio_server_process::entity_chat::{
-    normalize_net_entity_id, AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind,
-    ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
-    RuntimeControlError, RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery,
-    RuntimeSurface, RuntimeTick, MAX_CHAT_INPUTS_PER_TICK,
+    AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOperation, PersistRecord,
+    QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeControlError,
+    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface,
+    RuntimeTick, MAX_CHAT_INPUTS_PER_TICK,
 };
 
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -149,6 +149,7 @@ pub struct ScriptedRuntime {
     run_tick_input_counts: Vec<usize>,
     resolve_error: Option<RuntimeControlError>,
     query_error: Option<RuntimeControlError>,
+    reject_next_admit: Option<String>,
 }
 
 impl ScriptedRuntime {
@@ -175,6 +176,7 @@ impl ScriptedRuntime {
             run_tick_input_counts: Vec::new(),
             resolve_error: None,
             query_error: None,
+            reject_next_admit: None,
         }
     }
 
@@ -194,6 +196,10 @@ impl ScriptedRuntime {
 
     pub fn fail_query(&mut self, message: &str) {
         self.query_error = Some(RuntimeControlError::new(message.to_owned(), Vec::new()));
+    }
+
+    pub fn reject_next_admit_with_frame(&mut self, code: &str) {
+        self.reject_next_admit = Some(code.to_owned());
     }
 
     pub fn plant_snapshot(&mut self, json: &str) {
@@ -246,6 +252,24 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         entity_type: BoundEntityKind,
     ) -> RuntimeAdmit {
+        if let Some(code) = self.reject_next_admit.take() {
+            return RuntimeAdmit {
+                accepted: false,
+                code: Some(code.clone()),
+                binding: None,
+                frames: vec![RuntimeFrame {
+                    connection: Some(connection.to_owned()),
+                    bytes: format!(
+                        r#"{{"code":"{code}","detail":"rejected","messageType":"Error"}}"#
+                    )
+                    .into_bytes(),
+                    observer_net_entity_id: None,
+                    connection_generation: None,
+                    message_type: Some("Error".to_owned()),
+                    code: Some(code),
+                }],
+            };
+        }
         if self
             .by_connection
             .values()
@@ -402,7 +426,7 @@ impl RuntimeSurface for ScriptedRuntime {
         &mut self,
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
-        let net_entity_id = normalize_net_entity_id(net_entity_id);
+        let net_entity_id = net_entity_id.to_owned();
         self.expire_calls.push(net_entity_id.clone());
         if let Some(occupancy) = self.entities.remove(&net_entity_id) {
             self.tombstoned
@@ -440,7 +464,7 @@ impl RuntimeSurface for ScriptedRuntime {
         if let Some(error) = self.query_error.take() {
             return Err(error);
         }
-        let net_entity_id = normalize_net_entity_id(&request.net_entity_id);
+        let net_entity_id = request.net_entity_id.clone();
         if let Some(planted) = self.planted_query.get(&(
             request.room_id.clone(),
             net_entity_id.clone(),

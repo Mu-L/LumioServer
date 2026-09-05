@@ -5,9 +5,8 @@ mod common;
 use common::{welcome_frame, world_change_frame, SharedRuntime, TestKernel};
 use lumio_host_runtime::SharedClock;
 use lumio_server_process::entity_chat::{
-    apply_pending_chat_ticks, drain_chat_event_deltas, generate_keys, issue_admission_credential,
-    ChatOpKind, EntityChatHost, InputCommand, RoomClient, ADMISSION_KEY_ID,
-    MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
+    drain_chat_event_deltas, generate_keys, issue_admission_credential, ChatOpKind, EntityChatHost,
+    InputCommand, RoomClient, ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
 };
 
 fn credential(
@@ -270,16 +269,37 @@ fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
     );
 }
 
-fn wait_pending(host: &EntityChatHost, want: usize) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while host.pending_wire_chat_inputs() < want && std::time::Instant::now() < deadline {
+#[test]
+fn pre_admission_socket_receives_runtime_rejection_frame() {
+    let runtime = SharedRuntime::new();
+    runtime
+        .lock()
+        .reject_next_admit_with_frame("invalid_binding_shape");
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(runtime),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-rejected").expect("connect");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while host.wire_observer_count("c-rejected".to_owned()) == 0
+        && std::time::Instant::now() < deadline
+    {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(
-        host.pending_wire_chat_inputs(),
-        want,
-        "expected {want} Room-observed chat.input frames"
+    let result = host.admit(
+        "room-main".to_owned(),
+        "c-rejected".to_owned(),
+        credential(&keys, "Bot01", true),
     );
+    assert!(!result.accepted);
+    let frame = client.recv_text().expect("runtime rejection frame");
+    assert!(frame.contains("\"messageType\":\"Error\""), "got {frame}");
 }
 
 fn send_n_wire_chats(client: &mut RoomClient, n: usize) {
@@ -322,7 +342,7 @@ fn drain_chat_event_deltas_returns_before_deadline_when_idle() {
 }
 
 #[test]
-fn apply_pending_chat_ticks_returns_when_over_budget_pending_does_not_fall() {
+fn wire_ingress_auto_ticks_before_runtime_budget_overflow() {
     let runtime = SharedRuntime::new();
     let keys = generate_keys();
     let host = EntityChatHost::new(
@@ -343,26 +363,18 @@ fn apply_pending_chat_ticks_returns_when_over_budget_pending_does_not_fall() {
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
     send_n_wire_chats(&mut client, MAX_CHAT_INPUTS_PER_TICK + 1);
-    wait_pending(&host, MAX_CHAT_INPUTS_PER_TICK + 1);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut tick = lumio_server_process::entity_chat::RuntimeTick::default();
-        let mut received = Vec::new();
-        let mut wire = Some(client);
-        apply_pending_chat_ticks(&host, &mut tick, &mut wire, &mut received);
-        let counts = runtime.lock().run_tick_input_counts().to_vec();
-        let _ = tx.send((tick, host.pending_wire_chat_inputs(), counts));
-    });
-    let (tick, pending, counts) = rx
-        .recv_timeout(std::time::Duration::from_millis(800))
-        .expect("apply_pending_chat_ticks must return when pending does not fall");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while runtime.lock().run_tick_input_counts().is_empty() && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let counts = runtime.lock().run_tick_input_counts().to_vec();
     assert!(
-        !tick.ok,
-        "65+ one-tick budget fault must not be SUCCESS, got {tick:?}"
-    );
-    assert!(
-        pending >= MAX_CHAT_INPUTS_PER_TICK,
-        "over-budget pending must remain, got {pending}"
+        !counts.is_empty()
+            && host.pending_wire_chat_inputs() < MAX_CHAT_INPUTS_PER_TICK
+            && counts.iter().sum::<usize>() == MAX_CHAT_INPUTS_PER_TICK,
+        "wire ingress must commit a batch at the limit, pending={}, counts={counts:?}",
+        host.pending_wire_chat_inputs()
     );
     assert!(
         counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),

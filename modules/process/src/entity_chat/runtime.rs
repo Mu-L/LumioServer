@@ -58,11 +58,16 @@ impl RuntimeAdmit {
 
     #[must_use]
     pub fn reject(code: &str) -> Self {
+        Self::reject_with_frames(code, Vec::new())
+    }
+
+    #[must_use]
+    pub fn reject_with_frames(code: &str, frames: Vec<RuntimeFrame>) -> Self {
         Self {
             accepted: false,
             code: Some(code.to_owned()),
             binding: None,
-            frames: Vec::new(),
+            frames,
         }
     }
 }

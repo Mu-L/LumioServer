@@ -100,7 +100,6 @@ public static class HostEntry
         Manager = ManagerType.GetMethod("Create", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { registry, instanceId });
         ManagerType.GetMethod("Start", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
-        AttachBindingAdapter();
         return Manager is null || Bindings is null ? (EntrySuccess, Fail("boot_failed")) : (EntrySuccess, Ok());
     }
 
@@ -284,27 +283,10 @@ public static class HostEntry
         Manager = restored;
         ManagerType.GetMethod("Start")!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
-        AttachBindingAdapter();
         return (EntrySuccess, Ok());
     }
 
     private static object NewMessage(string typeName, params object?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;
-    private static void AttachBindingAdapter()
-    {
-        MethodInfo attach = ManagerType!.GetMethod("AttachControlAdapter", BindingFlags.Public | BindingFlags.Instance)
-            ?? throw new MissingMethodException(ManagerType.FullName, "AttachControlAdapter");
-        try
-        {
-            attach.Invoke(Manager, new[] { Bindings });
-        }
-        catch (TargetInvocationException error)
-            when (error.InnerException is InvalidOperationException duplicate &&
-                duplicate.Message.Contains("already has a control adapter", StringComparison.Ordinal))
-        {
-            // EntityBindingQuery attaches itself on newer Runtime builds; keep the explicit
-            // HostEntry attachment for older builds while retaining that adapter instance.
-        }
-    }
     private static void Enqueue(object message) => ManagerType!.GetMethod("Enqueue")!.Invoke(Manager, new[] { message });
     private static void TickManager() => ManagerType!.GetMethod("Tick")!.Invoke(Manager, null);
     private static List<object> ToObjectList(IEnumerable? rows) { var result = new List<object>(); if (rows is null) return result; foreach (object row in rows) result.Add(row); return result; }

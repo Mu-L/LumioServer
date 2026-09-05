@@ -36,12 +36,13 @@ pub use admission::{
     generate_keys, issue_admission_credential, issue_bot_tool_credential, verify_admission,
     AdmissionPayload, Ed25519KeyPair,
 };
-pub use bots::{discover_bot_host, run_client_bot_fleet, ClientBotFleet, ClientBotTrace};
+pub use bots::{
+    discover_bot_host, run_client_bot_fleet, start_client_bot_fleet, wait_for_client_bot_fleet,
+    ClientBotFleet, ClientBotTrace,
+};
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
-pub use envelope::{
-    normalize_net_entity_id, CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE,
-};
+pub use envelope::{CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE};
 pub use host::{
     AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
     RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,

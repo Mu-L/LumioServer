@@ -53,6 +53,12 @@ pub fn discover() -> Result<ReplayArtifacts, String> {
             "BLOCKED: Lumio.GameRuntime.Ecs.dll not found (set LUMIO_RUNTIME_ECS_DLL)".to_owned()
         })
     })?;
+    let registry = env_file("LUMIO_RUNTIME_REGISTRY_DLL").or_else(|_| {
+        runtime_registry_dll(&repo).ok_or_else(|| {
+            "BLOCKED: Runtime gameplay registry dll not found (set LUMIO_RUNTIME_REGISTRY_DLL)"
+                .to_owned()
+        })
+    })?;
 
     let hostfxr = env_file("LUMIO_HOSTFXR").or_else(|_| {
         discover_hostfxr()
@@ -73,6 +79,7 @@ pub fn discover() -> Result<ReplayArtifacts, String> {
             entry_method: "LumioEntityChatEntry".to_owned(),
             replication_assembly: replication,
             ecs_assembly: ecs,
+            registry_assembly: registry,
         },
     })
 }
@@ -113,6 +120,17 @@ fn runtime_dll(repo: &Path, file_name: &str) -> Option<PathBuf> {
         root.join(format!(
             "modules/ecs/src/Lumio.GameRuntime.Ecs/bin/Release/net10.0/{file_name}"
         )),
+    ])
+}
+
+fn runtime_registry_dll(repo: &Path) -> Option<PathBuf> {
+    let root = std::env::var("LUMIO_RUNTIME_ROOT")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| repo.parent().map(|parent| parent.join("LumioGameRuntime")))?;
+    first_existing(&[
+        root.join("modules/ecs/samples/username/bin/Debug/net10.0/Lumio.GameRuntime.Samples.Username.Server.dll"),
+        root.join("modules/ecs/samples/username/bin/Release/net10.0/Lumio.GameRuntime.Samples.Username.Server.dll"),
     ])
 }
 
