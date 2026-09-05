@@ -515,11 +515,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         && bot_trace.utterance_ticks.contains(&15)
         && tick.ok
         && tick.applied_tick >= 1;
-    let chat_events: Vec<String> = received
-        .iter()
-        .filter(|frame| is_chat_event_delta(frame))
-        .cloned()
-        .collect();
+    let chat_events = received.clone();
     let chat_ok = chat_events.len() == 101 && timer_ok;
     let event_order: Vec<String> = chat_events.clone();
     let applied_ticks: Vec<u64> = chat_events
@@ -579,7 +575,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .and_then(|client| client.recv_text().ok());
     let refilled = extra_after_restore
         .as_ref()
-        .is_some_and(|frame| is_chat_event_delta(frame));
+        .is_some_and(|frame| !chat_event_records(frame).is_empty());
     let restored_window = if snapshot.bytes.is_empty() {
         None
     } else if refilled {
@@ -952,20 +948,34 @@ fn wait_for_playwright_with_room_ticks(
         .unwrap_or_else(|_| super::browser::PlaywrightCapture::failed("playwright thread"))
 }
 
-fn is_chat_event_delta(frame: &str) -> bool {
+fn chat_event_records(frame: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<Value>(frame) else {
-        return false;
+        return Vec::new();
     };
-    value.get("messageType").and_then(Value::as_str) == Some("WorldChange")
-        && value
-            .get("rpcs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|rpc| {
-                rpc.get("componentId").and_then(Value::as_str) == Some("ChatComponent")
-                    && rpc.get("method").and_then(Value::as_str) == Some("OnChatMessage")
+    if value.get("messageType").and_then(Value::as_str) != Some("WorldChange") {
+        return Vec::new();
+    }
+    let Some(tick) = value.get("tick").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    value
+        .get("rpcs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|rpc| {
+            rpc.get("componentId").and_then(Value::as_str) == Some("ChatComponent")
+                && rpc.get("method").and_then(Value::as_str) == Some("OnChatMessage")
+        })
+        .map(|rpc| {
+            json!({
+                "messageType": "WorldChange",
+                "rpcs": [rpc],
+                "tick": tick,
             })
+            .to_string()
+        })
+        .collect()
 }
 
 fn delta_tick_id(frame: &str) -> Option<u64> {
@@ -983,8 +993,7 @@ pub fn drain_chat_event_deltas(client: &mut Option<RoomClient>, received: &mut V
     let deadline = Instant::now() + Duration::from_millis(50);
     while received.len() < 101 && Instant::now() < deadline {
         match client.try_recv_text() {
-            Ok(Some(frame)) if is_chat_event_delta(&frame) => received.push(frame),
-            Ok(Some(_)) => {}
+            Ok(Some(frame)) => received.extend(chat_event_records(&frame)),
             Ok(None) | Err(_) => break,
         }
     }
@@ -1091,6 +1100,38 @@ fn spawn_restore_process(snapshot_path: &Path, out_dir: &Path) -> Option<Value> 
             .and_then(Value::as_str)
             .unwrap_or("lumio-entity-chat-replay"),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_world_change_yields_one_record_per_chat_rpc() {
+        let frame = json!({
+            "messageType": "WorldChange",
+            "rpcs": [
+                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 1},
+                {"componentId": "OtherComponent", "method": "OnChatMessage", "messageId": 2},
+                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 3}
+            ],
+            "tick": 9
+        })
+        .to_string();
+
+        let records = chat_event_records(&frame);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| delta_tick_id(record))
+                .collect::<Vec<_>>(),
+            vec![9, 9]
+        );
+        assert!(records[0].contains("\"messageId\":1"));
+        assert!(records[1].contains("\"messageId\":3"));
+    }
 }
 
 fn empty_login() -> super::AccountLoginResult {
