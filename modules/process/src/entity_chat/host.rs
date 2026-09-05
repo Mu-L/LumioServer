@@ -1108,7 +1108,7 @@ impl Inner {
             let _ = egress.try_close();
         }
         let routed = self.route_frames(&room_id, &runtime_result.frames);
-        self.schedule_expire(&session.room_id, &session.net_entity_id);
+        self.schedule_expire(&session.room_id, &session.net_entity_id)?;
         if routed {
             Ok(true)
         } else {
@@ -1116,9 +1116,13 @@ impl Inner {
         }
     }
 
-    fn schedule_expire(&mut self, room_id: &str, net_entity_id: &str) {
+    fn schedule_expire(&mut self, room_id: &str, net_entity_id: &str) -> Result<(), String> {
         let due = self.clock.now_ms().saturating_add(self.reconnect_window_ms);
-        let _ = self.schedule_expire_at(due, room_id, net_entity_id);
+        if self.schedule_expire_at(due, room_id, net_entity_id) {
+            Ok(())
+        } else {
+            Err("kernel_timer_schedule_failed".to_owned())
+        }
     }
 
     fn schedule_expire_at(&mut self, due: u64, room_id: &str, net_entity_id: &str) -> bool {
@@ -1407,7 +1411,7 @@ impl Inner {
             }
             let _ = self.route_frames(&session.room_id, &[frame]);
         }
-        self.schedule_expire(&session.room_id, &session.net_entity_id);
+        self.schedule_expire(&session.room_id, &session.net_entity_id)?;
         Ok(())
     }
 

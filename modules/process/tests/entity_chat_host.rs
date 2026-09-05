@@ -634,6 +634,37 @@ fn runtime_disconnect_failure_preserves_session_and_does_not_schedule_expiry() {
 }
 
 #[test]
+fn expiry_timer_schedule_failure_is_returned_to_disconnect_caller() {
+    let clock = SharedClock::test();
+    let runtime = SharedRuntime::new();
+    let keys = generate_keys();
+    let mut kernel = TestKernel::new();
+    kernel.fail_next_one_shot();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        clock,
+        Box::new(runtime),
+        Box::new(kernel),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-timer-failure".to_owned(),
+            credential(&keys, "TimerFailureBot", true),
+        )
+        .accepted
+    );
+
+    let error = host
+        .disconnect("c-timer-failure".to_owned())
+        .expect_err("timer scheduling failure must be explicit");
+    assert_eq!(error, "kernel_timer_schedule_failed");
+}
+
+#[test]
 fn failed_tick_releases_pending_wire_batch_for_the_next_tick() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());

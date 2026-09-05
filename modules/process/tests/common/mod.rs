@@ -27,6 +27,7 @@ pub struct TestKernel {
     next: u32,
     committed_ms: u64,
     committed_tick: u64,
+    fail_next_one_shot: bool,
 }
 
 impl TestKernel {
@@ -38,6 +39,7 @@ impl TestKernel {
             next: 1,
             committed_ms: 0,
             committed_tick: 0,
+            fail_next_one_shot: false,
         }
     }
 
@@ -49,6 +51,10 @@ impl TestKernel {
         };
         self.next += 1;
         handle
+    }
+
+    pub fn fail_next_one_shot(&mut self) {
+        self.fail_next_one_shot = true;
     }
 }
 
@@ -66,6 +72,13 @@ impl KernelTimer for TestKernel {
         dispatch_id: u32,
     ) -> Result<KernelHandle, KernelError> {
         assert_eq!(mode, TimerMode::WallClock);
+        if self.fail_next_one_shot {
+            self.fail_next_one_shot = false;
+            return Err(KernelError {
+                status: 1,
+                detail: "scheduled one-shot rejected".to_owned(),
+            });
+        }
         let handle = self.alloc();
         self.one_shots.push((due, dispatch_id, handle));
         Ok(handle)
