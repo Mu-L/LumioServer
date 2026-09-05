@@ -949,18 +949,9 @@ impl RuntimeSurface for ClrGameplay {
         tick
     }
 
-    fn persist(&mut self, room_id: &str) -> PersistRecord {
-        let hex = self
-            .call(json!({ "op": "snapshot", "roomId": room_id }))
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("bytesBase64")
-                    .and_then(Value::as_str)
-                    .and_then(decode_base64)
-            })
-            .unwrap_or_default();
-        PersistRecord { bytes: hex }
+    fn persist(&mut self, room_id: &str) -> Result<PersistRecord, String> {
+        let value = self.call(json!({ "op": "snapshot", "roomId": room_id }))?;
+        persist_record_from_hostentry_json(&value)
     }
 
     fn restore(&mut self, room_id: &str, bytes: &[u8]) -> Result<(), String> {
@@ -969,11 +960,36 @@ impl RuntimeSurface for ClrGameplay {
             "roomId": room_id,
             "bytesBase64": base64_encode(bytes),
         }))?;
-        if value.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(())
-        } else {
-            Err("restore_failed".to_owned())
-        }
+        restore_result_from_hostentry_json(&value)
+    }
+}
+
+fn persist_record_from_hostentry_json(value: &Value) -> Result<PersistRecord, String> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(value
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("snapshot_failed")
+            .to_owned());
+    }
+    let encoded = value
+        .get("bytesBase64")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "snapshot response missing bytesBase64".to_owned())?;
+    let bytes =
+        decode_base64(encoded).ok_or_else(|| "snapshot bytesBase64 is malformed".to_owned())?;
+    Ok(PersistRecord { bytes })
+}
+
+fn restore_result_from_hostentry_json(value: &Value) -> Result<(), String> {
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(value
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("restore_failed")
+            .to_owned())
     }
 }
 
@@ -1283,5 +1299,38 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    #[test]
+    fn snapshot_response_preserves_call_and_decode_failures() {
+        assert_eq!(
+            persist_record_from_hostentry_json(&json!({
+                "ok": false,
+                "code": "snapshot_failed"
+            })),
+            Err("snapshot_failed".to_owned())
+        );
+        assert_eq!(
+            persist_record_from_hostentry_json(&json!({ "ok": true })),
+            Err("snapshot response missing bytesBase64".to_owned())
+        );
+        assert_eq!(
+            persist_record_from_hostentry_json(&json!({
+                "ok": true,
+                "bytesBase64": "bad"
+            })),
+            Err("snapshot bytesBase64 is malformed".to_owned())
+        );
+    }
+
+    #[test]
+    fn restore_response_preserves_runtime_error_code() {
+        assert_eq!(
+            restore_result_from_hostentry_json(&json!({
+                "ok": false,
+                "code": "restore_rejected"
+            })),
+            Err("restore_rejected".to_owned())
+        );
     }
 }

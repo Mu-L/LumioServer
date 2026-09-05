@@ -15,7 +15,7 @@ use super::runtime::{
     AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
     RuntimeAdmit, RuntimeBinding, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
 };
-use super::wire::{RoomListener, WireEvent, WireSender};
+use super::wire::{RoomListener, WireEvent, WireSendError, WireSender, MAX_WIRE_TEXT_BYTES};
 use super::MAX_CHAT_INPUTS_PER_TICK;
 
 /// Maximum number of sockets waiting for admission before new sockets are closed.
@@ -156,6 +156,13 @@ struct Session {
 struct ExpireTarget {
     room_id: String,
     net_entity_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOutcome {
+    Delivered,
+    Unavailable,
+    InvalidFrame,
 }
 
 struct Inner {
@@ -323,7 +330,7 @@ impl EntityChatHost {
 
     /// Disconnects a live connection and schedules the NativeCore wallClock expire.
     #[must_use]
-    pub fn disconnect(&self, connection_id: String) -> bool {
+    pub fn disconnect(&self, connection_id: String) -> Result<bool, String> {
         self.on_owner(move |inner| inner.disconnect(&connection_id))
     }
 
@@ -422,15 +429,17 @@ impl EntityChatHost {
 
     /// Runtime persist bytes. Restore must not create Active bindings.
     #[must_use]
-    pub fn capture_persist_snapshot(&self, room_id: String) -> PersistRecord {
+    pub fn capture_persist_snapshot(&self, room_id: String) -> Result<PersistRecord, String> {
         self.on_owner(move |inner| inner.runtime.persist(&room_id))
     }
 
     /// Restores persist-only fields. Does not Admit or create sessions.
-    pub fn restore_persist_snapshot(&self, room_id: String, snapshot: PersistRecord) {
-        self.on_owner(move |inner| {
-            let _ = inner.runtime.restore(&room_id, &snapshot.bytes);
-        });
+    pub fn restore_persist_snapshot(
+        &self,
+        room_id: String,
+        snapshot: PersistRecord,
+    ) -> Result<(), String> {
+        self.on_owner(move |inner| inner.runtime.restore(&room_id, &snapshot.bytes))
     }
 
     /// Live entity census from Runtime ListBindings.
@@ -508,17 +517,7 @@ impl Inner {
             return RoomAdmitResult::reject("invalid_request");
         }
         if admitted.code.as_deref() == Some("account_already_online") {
-            let old_id = self
-                .sessions
-                .iter()
-                .filter(|(_, session)| session.account_id == payload.account_id)
-                .map(|(connection, _)| connection)
-                .min()
-                .cloned();
-            let Some(old_id) = old_id else {
-                return RoomAdmitResult::reject("runtime_failure");
-            };
-            return self.takeover(room_id, connection_id, payload, kind, &old_id);
+            return self.takeover(room_id, connection_id, payload, kind);
         }
         let rebound = self.runtime.rebind(
             connection_id,
@@ -548,13 +547,7 @@ impl Inner {
         connection_id: &str,
         payload: &AdmissionPayload,
         kind: BoundEntityKind,
-        old_id: &str,
     ) -> RoomAdmitResult {
-        if let Some(old) = self.sessions.get(old_id) {
-            if old.room_id != room_id {
-                return RoomAdmitResult::reject("invalid_request");
-            }
-        }
         let rebound = self.runtime.rebind(
             connection_id,
             &payload.account_id,
@@ -568,12 +561,25 @@ impl Inner {
             }
             return RoomAdmitResult::reject(rebound.code.as_deref().unwrap_or("invalid_request"));
         };
+        let superseded_connections: Vec<String> = rebound
+            .frames
+            .iter()
+            .filter(|frame| frame.message_type.as_deref() == Some("ConnectionSuperseded"))
+            .filter_map(|frame| frame.connection.clone())
+            .filter(|connection| connection != connection_id)
+            .collect();
+        if superseded_connections.is_empty() {
+            return RoomAdmitResult::reject("runtime_failure");
+        }
         let result = self.commit_session(connection_id, payload, rebound, false, true);
         if result.accepted {
-            if let Some(old) = self.sessions.remove(old_id) {
-                for egress in &old.egresses {
-                    let _ = egress.close();
+            for old_id in superseded_connections {
+                if let Some(old) = self.sessions.remove(&old_id) {
+                    for egress in &old.egresses {
+                        let _ = egress.try_close();
+                    }
                 }
+                self.deferred_frames.remove(&old_id);
             }
         }
         result
@@ -617,33 +623,33 @@ impl Inner {
         let binding = ConnectionBinding::from_runtime(runtime_binding, session_id);
         self.sessions.insert(connection_id.to_owned(), session);
         if !self.route_frames(&binding.room_id, &frames) {
-            self.fail_connection(connection_id);
+            let _ = self.fail_connection(connection_id);
             return RoomAdmitResult::reject("runtime_failure");
         }
         RoomAdmitResult::ok(binding, reconnected, takeover)
     }
 
-    fn disconnect(&mut self, connection_id: &str) -> bool {
+    fn disconnect(&mut self, connection_id: &str) -> Result<bool, String> {
         let Some(session) = self.sessions.get(connection_id) else {
-            return false;
+            return Ok(false);
         };
         let room_id = session.room_id.clone();
         let runtime_binding = Self::session_binding(session);
-        let runtime_result = self.runtime.disconnect(connection_id, &runtime_binding);
+        let runtime_result = self.runtime.disconnect(connection_id, &runtime_binding)?;
         let Some(session) = self.sessions.remove(connection_id) else {
-            return false;
+            return Ok(false);
         };
         self.deferred_frames.remove(connection_id);
         for egress in &session.egresses {
-            let _ = egress.close();
+            let _ = egress.try_close();
         }
-        if let Ok(result) = runtime_result {
-            if !self.route_frames(&room_id, &result.frames) {
-                return false;
-            }
-        }
+        let routed = self.route_frames(&room_id, &runtime_result.frames);
         self.schedule_expire(&session.room_id, &session.net_entity_id);
-        true
+        if routed {
+            Ok(true)
+        } else {
+            Err("runtime_failure".to_owned())
+        }
     }
 
     fn schedule_expire(&mut self, room_id: &str, net_entity_id: &str) {
@@ -730,6 +736,7 @@ impl Inner {
             return RuntimeTick::failed("runtime_failure");
         }
         let tick = self.runtime.run_tick(room_id, self.tick_id);
+        self.wire_chat_pending = 0;
         let routed = self.route_frames(room_id, &tick.frames);
         if !tick.ok {
             return tick;
@@ -737,7 +744,6 @@ impl Inner {
         if !routed {
             return RuntimeTick::failed("runtime_failure");
         }
-        self.wire_chat_pending = 0;
         tick
     }
 
@@ -745,10 +751,18 @@ impl Inner {
         let mut routed = true;
         for frame in frames {
             if let Some(connection) = frame.connection.as_deref() {
-                let delivered = self.deliver_to_connection(connection, &frame.bytes);
-                if !delivered && !self.defer_frame(connection, &frame.bytes) {
-                    self.fail_connection(connection);
-                    routed = false;
+                match self.deliver_to_connection(connection, &frame.bytes) {
+                    DeliveryOutcome::Delivered => {}
+                    DeliveryOutcome::Unavailable => {
+                        if !self.defer_frame(connection, &frame.bytes) {
+                            let _ = self.fail_connection(connection);
+                            routed = false;
+                        }
+                    }
+                    DeliveryOutcome::InvalidFrame => {
+                        let _ = self.fail_connection(connection);
+                        routed = false;
+                    }
                 }
                 continue;
             }
@@ -759,40 +773,71 @@ impl Inner {
                 .map(|(connection, _)| connection.clone())
                 .collect();
             for connection in targets {
-                if !self.deliver_to_connection(&connection, &frame.bytes)
-                    && !self.defer_frame(&connection, &frame.bytes)
-                {
-                    self.fail_connection(&connection);
-                    routed = false;
+                match self.deliver_to_connection(&connection, &frame.bytes) {
+                    DeliveryOutcome::Delivered => {}
+                    DeliveryOutcome::Unavailable => {
+                        if !self.defer_frame(&connection, &frame.bytes) {
+                            let _ = self.fail_connection(&connection);
+                            routed = false;
+                        }
+                    }
+                    DeliveryOutcome::InvalidFrame => {
+                        let _ = self.fail_connection(&connection);
+                        routed = false;
+                    }
                 }
             }
         }
         routed
     }
 
-    fn deliver_to_connection(&mut self, connection: &str, bytes: &[u8]) -> bool {
-        let text = String::from_utf8_lossy(bytes).into_owned();
+    fn deliver_to_connection(&mut self, connection: &str, bytes: &[u8]) -> DeliveryOutcome {
+        if bytes.len() > MAX_WIRE_TEXT_BYTES || std::str::from_utf8(bytes).is_err() {
+            return DeliveryOutcome::InvalidFrame;
+        }
         if let Some(egresses) = self.pending_egress.get_mut(connection) {
             let mut delivered = false;
-            egresses.retain(|egress| {
-                let sent = egress.send_text(text.clone());
-                delivered |= sent;
-                sent
+            egresses.retain(|egress| match egress.try_send_bytes(bytes) {
+                Ok(()) => {
+                    delivered = true;
+                    true
+                }
+                Err(WireSendError::Full) => {
+                    let _ = egress.try_close();
+                    false
+                }
+                Err(
+                    WireSendError::Closed | WireSendError::TooLarge | WireSendError::InvalidUtf8,
+                ) => false,
             });
             if delivered {
-                return true;
+                return DeliveryOutcome::Delivered;
             }
         }
         let Some(session) = self.sessions.get_mut(connection) else {
-            return false;
+            return DeliveryOutcome::Unavailable;
         };
         let mut delivered = false;
-        session.egresses.retain(|egress| {
-            let sent = egress.send_text(text.clone());
-            delivered |= sent;
-            sent
-        });
-        delivered
+        session
+            .egresses
+            .retain(|egress| match egress.try_send_bytes(bytes) {
+                Ok(()) => {
+                    delivered = true;
+                    true
+                }
+                Err(WireSendError::Full) => {
+                    let _ = egress.try_close();
+                    false
+                }
+                Err(
+                    WireSendError::Closed | WireSendError::TooLarge | WireSendError::InvalidUtf8,
+                ) => false,
+            });
+        if delivered {
+            DeliveryOutcome::Delivered
+        } else {
+            DeliveryOutcome::Unavailable
+        }
     }
 
     fn flush_deferred(&mut self, connection: &str) {
@@ -800,11 +845,18 @@ impl Inner {
             return;
         };
         for bytes in frames {
-            if !self.deliver_to_connection(connection, &bytes)
-                && !self.defer_frame(connection, &bytes)
-            {
-                self.fail_connection(connection);
-                break;
+            match self.deliver_to_connection(connection, &bytes) {
+                DeliveryOutcome::Delivered => {}
+                DeliveryOutcome::Unavailable => {
+                    if !self.defer_frame(connection, &bytes) {
+                        let _ = self.fail_connection(connection);
+                        break;
+                    }
+                }
+                DeliveryOutcome::InvalidFrame => {
+                    let _ = self.fail_connection(connection);
+                    break;
+                }
             }
         }
     }
@@ -832,40 +884,41 @@ impl Inner {
         true
     }
 
-    fn fail_connection(&mut self, connection: &str) {
-        let Some(session) = self.sessions.remove(connection) else {
+    fn fail_connection(&mut self, connection: &str) -> Result<(), String> {
+        let Some(session) = self.sessions.get(connection) else {
             self.pending_egress
                 .remove(connection)
                 .into_iter()
                 .flatten()
                 .for_each(|egress| {
-                    let _ = egress.close();
+                    let _ = egress.try_close();
                 });
             self.deferred_frames.remove(connection);
-            return;
+            return Ok(());
+        };
+        let runtime_binding = Self::session_binding(session);
+        let runtime_result = self.runtime.disconnect(connection, &runtime_binding)?;
+        let Some(session) = self.sessions.remove(connection) else {
+            return Ok(());
         };
         self.deferred_frames.remove(connection);
         for egress in &session.egresses {
-            let _ = egress.close();
+            let _ = egress.try_close();
         }
         if let Some(egresses) = self.pending_egress.remove(connection) {
             for egress in egresses {
-                let _ = egress.close();
+                let _ = egress.try_close();
             }
         }
 
-        // Overflow is terminal for the logical session. Runtime must observe
-        // the disconnect so a subsequent admission can reconnect immediately.
-        let runtime_binding = Self::session_binding(&session);
-        if let Ok(result) = self.runtime.disconnect(connection, &runtime_binding) {
-            for frame in result.frames {
-                if frame.connection.as_deref() == Some(connection) {
-                    continue;
-                }
-                let _ = self.route_frames(&session.room_id, &[frame]);
+        for frame in runtime_result.frames {
+            if frame.connection.as_deref() == Some(connection) {
+                continue;
             }
+            let _ = self.route_frames(&session.room_id, &[frame]);
         }
         self.schedule_expire(&session.room_id, &session.net_entity_id);
+        Ok(())
     }
 
     fn on_wire(&mut self, event: WireEvent) {
@@ -877,8 +930,8 @@ impl Inner {
                 if self.sessions.contains_key(&connection_id) {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
                         if session.egresses.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
-                            let _ = egress.close();
-                            self.fail_connection(&connection_id);
+                            let _ = egress.try_close();
+                            let _ = self.fail_connection(&connection_id);
                             return;
                         }
                         session.egresses.push(egress.clone());
@@ -886,12 +939,12 @@ impl Inner {
                     self.flush_deferred(&connection_id);
                 } else {
                     if self.pending_egress.len() >= MAX_PENDING_EGRESS_CONNECTIONS {
-                        let _ = egress.close();
+                        let _ = egress.try_close();
                         return;
                     }
                     let queue = self.pending_egress.entry(connection_id).or_default();
                     if queue.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
-                        let _ = egress.close();
+                        let _ = egress.try_close();
                     } else {
                         queue.push(egress);
                     }
@@ -920,9 +973,7 @@ impl Inner {
                 }
             }
             WireEvent::Closed { connection_id } => {
-                if !self.disconnect(&connection_id) {
-                    self.fail_connection(&connection_id);
-                }
+                let _ = self.disconnect(&connection_id);
             }
         }
     }

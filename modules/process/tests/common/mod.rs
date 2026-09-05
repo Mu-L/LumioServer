@@ -155,6 +155,10 @@ pub struct ScriptedRuntime {
     resolve_error: Option<RuntimeControlError>,
     query_error: Option<RuntimeControlError>,
     reject_next_admit: Option<String>,
+    disconnect_error: Option<String>,
+    tick_error: Option<String>,
+    persist_error: Option<String>,
+    restore_error: Option<String>,
 }
 
 impl ScriptedRuntime {
@@ -182,6 +186,10 @@ impl ScriptedRuntime {
             resolve_error: None,
             query_error: None,
             reject_next_admit: None,
+            disconnect_error: None,
+            tick_error: None,
+            persist_error: None,
+            restore_error: None,
         }
     }
 
@@ -219,6 +227,51 @@ impl ScriptedRuntime {
 
     pub fn plant_delta(&mut self, frames: Vec<String>) {
         self.planted_delta = frames.into_iter().map(String::into_bytes).collect();
+    }
+
+    pub fn plant_raw_delta(&mut self, frames: Vec<Vec<u8>>) {
+        self.planted_delta = frames;
+    }
+
+    pub fn fail_disconnect(&mut self, message: &str) {
+        self.disconnect_error = Some(message.to_owned());
+    }
+
+    pub fn fail_next_tick(&mut self, message: &str) {
+        self.tick_error = Some(message.to_owned());
+    }
+
+    pub fn fail_persist(&mut self, message: &str) {
+        self.persist_error = Some(message.to_owned());
+    }
+
+    pub fn fail_restore(&mut self, message: &str) {
+        self.restore_error = Some(message.to_owned());
+    }
+
+    pub fn seed_live_binding(
+        &mut self,
+        connection: &str,
+        account_id: &str,
+        room_id: &str,
+        entity_type: BoundEntityKind,
+    ) {
+        let binding = RuntimeBinding {
+            account_id: account_id.to_owned(),
+            room_id: room_id.to_owned(),
+            net_entity_id: self.alloc(),
+            entity_type,
+            connection_generation: 1,
+        };
+        self.by_connection
+            .insert(connection.to_owned(), binding.clone());
+        self.entities.insert(
+            binding.net_entity_id.clone(),
+            Occupancy {
+                binding,
+                live_connection: Some(connection.to_owned()),
+            },
+        );
     }
 
     #[must_use]
@@ -334,6 +387,9 @@ impl RuntimeSurface for ScriptedRuntime {
         _binding: &RuntimeBinding,
     ) -> Result<RuntimeDisconnect, String> {
         self.disconnect_calls.push(connection.to_owned());
+        if let Some(error) = &self.disconnect_error {
+            return Err(error.clone());
+        }
         let binding = self
             .by_connection
             .remove(connection)
@@ -549,6 +605,9 @@ impl RuntimeSurface for ScriptedRuntime {
         self.revision += 1;
         let pending = std::mem::take(&mut self.pending_chats);
         self.run_tick_input_counts.push(pending.len());
+        if let Some(error) = self.tick_error.take() {
+            return RuntimeTick::failed(&error);
+        }
         if pending.len() > MAX_CHAT_INPUTS_PER_TICK {
             return RuntimeTick {
                 applied_tick: 0,
@@ -589,13 +648,19 @@ impl RuntimeSurface for ScriptedRuntime {
         result
     }
 
-    fn persist(&mut self, _room_id: &str) -> PersistRecord {
-        PersistRecord {
-            bytes: self.persist_bytes.clone(),
+    fn persist(&mut self, _room_id: &str) -> Result<PersistRecord, String> {
+        if let Some(error) = &self.persist_error {
+            return Err(error.clone());
         }
+        Ok(PersistRecord {
+            bytes: self.persist_bytes.clone(),
+        })
     }
 
     fn restore(&mut self, _room_id: &str, _bytes: &[u8]) -> Result<(), String> {
+        if let Some(error) = &self.restore_error {
+            return Err(error.clone());
+        }
         self.restore_calls += 1;
         Ok(())
     }
@@ -694,7 +759,7 @@ impl RuntimeSurface for SharedRuntime {
         self.lock().run_tick(room_id, tick_id)
     }
 
-    fn persist(&mut self, room_id: &str) -> PersistRecord {
+    fn persist(&mut self, room_id: &str) -> Result<PersistRecord, String> {
         self.lock().persist(room_id)
     }
 

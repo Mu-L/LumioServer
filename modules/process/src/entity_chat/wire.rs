@@ -58,16 +58,6 @@ impl WireSender {
     pub fn try_close(&self) -> Result<(), WireSendError> {
         self.inner.try_send(WireOut::Close).map_err(map_send_error)
     }
-
-    #[must_use]
-    pub fn send_text(&self, text: String) -> bool {
-        self.try_send_text(text).is_ok()
-    }
-
-    #[must_use]
-    pub fn close(&self) -> bool {
-        self.try_close().is_ok()
-    }
 }
 
 fn map_send_error(error: SendError<WireOut>) -> WireSendError {

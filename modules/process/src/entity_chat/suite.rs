@@ -534,7 +534,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     merge_input_evidence(&mut scenario_6, bot_trace.input_evidence_json());
     scenarios.insert("6".to_owned(), scenario_6);
 
-    let snapshot = host.capture_persist_snapshot(MAIN_ROOM.to_owned());
+    let snapshot = match host.capture_persist_snapshot(MAIN_ROOM.to_owned()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return write_blocked(out_dir, &format!("Runtime snapshot failed: {error}")),
+    };
     let window_before = chat_events.len();
     let last_before = host.query_attribute(AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
@@ -551,7 +554,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         Some(sha256_hex(&snapshot.bytes))
     };
     if !snapshot.bytes.is_empty() {
-        host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone());
+        if let Err(error) = host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone()) {
+            return write_blocked(out_dir, &format!("Runtime restore failed: {error}"));
+        }
     }
     let history_max = 0;
     let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
@@ -696,7 +701,13 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let entity_99 = previous_99.net_entity_id.clone();
     let entity_99_host = previous_99.net_entity_id.clone();
     let account_99 = previous_99.account_id;
-    assert!(host.disconnect("c-bot99".to_owned()));
+    match host.disconnect("c-bot99".to_owned()) {
+        Ok(true) => {}
+        Ok(false) => return write_blocked(out_dir, "scenario 9 connection c-bot99 is not live"),
+        Err(error) => {
+            return write_blocked(out_dir, &format!("Runtime disconnect failed: {error}"))
+        }
+    }
     host.clock().advance_ms(RECONNECT_WINDOW_MS + 1_000);
     host.drive_kernel();
     let expired = 1_usize;

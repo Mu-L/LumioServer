@@ -354,7 +354,7 @@ pub trait RuntimeSurface: Send {
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick;
 
-    fn persist(&mut self, room_id: &str) -> PersistRecord;
+    fn persist(&mut self, room_id: &str) -> Result<PersistRecord, String>;
 
     fn restore(&mut self, room_id: &str, bytes: &[u8]) -> Result<(), String>;
 }

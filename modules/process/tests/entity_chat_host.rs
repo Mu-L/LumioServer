@@ -87,7 +87,9 @@ fn reconnect_within_window_rebinds_entity_a() {
     let first = host.must_self("c-bot01");
     let entity_a = first.net_entity_id.clone();
     let first_session = first.session_id.clone();
-    assert!(host.disconnect("c-bot01".to_owned()));
+    assert!(host
+        .disconnect("c-bot01".to_owned())
+        .expect("Runtime disconnect"));
     let rejected = host.admit_input_command("c-bot01".to_owned(), runtime_wire_chat_input());
     assert_eq!(rejected.kind, ChatOpKind::Rejected);
     let rebind = host.admit(
@@ -123,7 +125,9 @@ fn wall_clock_kernel_expire_tombstones_a_and_creates_b() {
     );
     let entity_a = host.must_self("c-bot01").net_entity_id;
     let account = host.must_self("c-bot01").account_id;
-    assert!(host.disconnect("c-bot01".to_owned()));
+    assert!(host
+        .disconnect("c-bot01".to_owned())
+        .expect("Runtime disconnect"));
     clock.advance_ms(RECONNECT_WINDOW_MS + 1);
     assert!(host.drive_kernel());
     assert!(runtime
@@ -294,11 +298,170 @@ fn restore_does_not_create_active_sessions() {
         "c-bot01".to_owned(),
         credential(&keys, "Bot01", true),
     );
-    let snapshot = host.capture_persist_snapshot("room-main".to_owned());
-    host.restore_persist_snapshot("room-main".to_owned(), snapshot);
+    let snapshot = host
+        .capture_persist_snapshot("room-main".to_owned())
+        .expect("capture");
+    host.restore_persist_snapshot("room-main".to_owned(), snapshot)
+        .expect("restore");
     assert_eq!(runtime.lock().restore_calls(), 1);
     assert!(host.try_self_lookup("c-bot01".to_owned()).is_some());
     assert_eq!(host.census("room-main".to_owned()).total, 1);
+}
+
+#[test]
+fn runtime_disconnect_failure_preserves_session_and_does_not_schedule_expiry() {
+    let clock = SharedClock::test();
+    let runtime = SharedRuntime::new();
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        clock.clone(),
+        Box::new(runtime.clone()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    runtime.lock().fail_disconnect("disconnect_failed");
+
+    assert_eq!(
+        host.disconnect("c-bot01".to_owned())
+            .expect_err("Runtime disconnect error"),
+        "disconnect_failed"
+    );
+    assert!(host.try_self_lookup("c-bot01".to_owned()).is_some());
+    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.drive_kernel());
+    assert!(runtime.lock().expire_calls().is_empty());
+}
+
+#[test]
+fn failed_tick_releases_pending_wire_batch_for_the_next_tick() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let mut client =
+        lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-bot01")
+            .expect("connect");
+    let _ = client.recv_text();
+    client
+        .send_text(RUNTIME_WIRE_CHAT_INPUT)
+        .expect("first input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    runtime.lock().fail_next_tick("tick_failed");
+
+    let failed = host.run_tick("room-main".to_owned());
+    assert!(!failed.ok);
+    assert_eq!(host.pending_wire_chat_inputs(), 0);
+
+    client
+        .send_text(RUNTIME_WIRE_CHAT_INPUT)
+        .expect("second input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(host.run_tick("room-main".to_owned()).ok);
+}
+
+#[test]
+fn takeover_uses_runtime_addressed_connection_when_local_session_is_missing() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().seed_live_binding(
+        "runtime-old",
+        "acct_Bot01",
+        "room-main",
+        BoundEntityKind::Bot,
+    );
+    let (host, keys) = host_with(runtime);
+
+    let takeover = host.admit(
+        "room-main".to_owned(),
+        "c-new".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+
+    assert!(takeover.accepted);
+    assert!(takeover.takeover);
+    assert!(host.try_self_lookup("c-new".to_owned()).is_some());
+}
+
+#[test]
+fn persist_and_restore_failures_are_returned_to_the_caller() {
+    let runtime = SharedRuntime::new();
+    let (host, _) = host_with(runtime.clone());
+    runtime.lock().fail_persist("snapshot_failed");
+    assert_eq!(
+        host.capture_persist_snapshot("room-main".to_owned())
+            .expect_err("capture error"),
+        "snapshot_failed"
+    );
+
+    runtime.lock().fail_restore("restore_failed");
+    assert_eq!(
+        host.restore_persist_snapshot(
+            "room-main".to_owned(),
+            lumio_server_process::entity_chat::PersistRecord {
+                bytes: b"persist".to_vec(),
+            },
+        )
+        .expect_err("restore error"),
+        "restore_failed"
+    );
+}
+
+#[test]
+fn malformed_runtime_frame_fails_closed_without_lossy_text() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-invalid".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    runtime.lock().plant_raw_delta(vec![vec![0xff]]);
+
+    assert!(!host.run_tick("room-main".to_owned()).ok);
+    assert!(host.try_self_lookup("c-invalid".to_owned()).is_none());
+}
+
+#[test]
+fn oversized_runtime_frame_fails_closed() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-oversized".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    runtime.lock().plant_raw_delta(vec![vec![b'a'; 65_537]]);
+
+    assert!(!host.run_tick("room-main".to_owned()).ok);
+    assert!(host.try_self_lookup("c-oversized".to_owned()).is_none());
 }
 
 #[test]
