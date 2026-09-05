@@ -123,6 +123,11 @@ fn assert_identical_suite_stamps(evidence: &Value) {
         );
     }
 
+    assert_persist_evidence(evidence);
+}
+
+fn assert_persist_evidence(evidence: &Value) {
+    let empty = json!({});
     let s7 = evidence.pointer("/scenarios/7").unwrap_or(&empty);
     let source = s7
         .get("snapshotSource")
@@ -140,8 +145,12 @@ fn assert_identical_suite_stamps(evidence: &Value) {
             .unwrap_or(0)
             > 0
     );
-    assert_eq!(s7.get("historyCountMax").and_then(Value::as_i64), Some(0));
+    assert!(
+        s7.get("historyCountMax").is_none(),
+        "S7 must not publish a fabricated Runtime history maximum"
+    );
     if s7.get("ok") == Some(&Value::Bool(true)) {
+        assert_eq!(s7.get("historyCount").and_then(Value::as_u64), Some(0));
         assert_eq!(s7.get("restoredWindow").and_then(Value::as_u64), Some(0));
         let persist = evidence.pointer("/traces/persist").unwrap_or(&empty);
         let pid_a = persist

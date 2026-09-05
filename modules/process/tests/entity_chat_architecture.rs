@@ -407,6 +407,26 @@ fn host_session_occupancy_has_no_account_index() {
 }
 
 #[test]
+fn suite_evidence_does_not_treat_host_sessions_as_runtime_census_or_invent_history() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(!host.contains("fn census("));
+    assert!(!host.contains("fn list_admits("));
+    assert!(!suite.contains("host.census("));
+    assert!(!suite.contains("host.list_admits("));
+    assert!(!suite.contains("historyCountMax"));
+    assert!(!suite.contains("let history_max = 0"));
+    assert!(!suite.contains("let expired = 1_usize"));
+    assert!(!suite.contains("\"snapshotEntities\": snapshot.bytes.len()"));
+    assert!(suite.contains("\"historyCount\": restored_window"));
+    assert!(
+        suite.contains("let stale_a_rejected = host")
+            && suite.contains(".admit_input_command(\"c-bot99\"")
+    );
+}
+
+#[test]
 fn clr_runtime_input_stays_opaque_until_runtime_wire_codec() {
     let path = process_root().join("src/entity_chat/clr.rs");
     let text = fs::read_to_string(&path).expect("clr.rs");

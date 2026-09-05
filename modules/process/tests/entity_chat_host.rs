@@ -66,9 +66,6 @@ fn admit_creates_bot_and_player_and_resolves_bindings() {
         player.binding.as_ref().map(|binding| binding.entity_type),
         Some(BoundEntityKind::Player)
     );
-    let census = host.census("room-main".to_owned());
-    assert_eq!(census.bot_count, 1);
-    assert_eq!(census.player_count, 1);
     let self_bot = host.must_self("c-bot01");
     assert!(host
         .try_resolve_by_net_entity_id("room-main".to_owned(), self_bot.net_entity_id)
@@ -305,7 +302,6 @@ fn restore_does_not_create_active_sessions() {
         .expect("restore");
     assert_eq!(runtime.lock().restore_calls(), 1);
     assert!(host.try_self_lookup("c-bot01".to_owned()).is_some());
-    assert_eq!(host.census("room-main".to_owned()).total, 1);
 }
 
 #[test]

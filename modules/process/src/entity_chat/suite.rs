@@ -19,7 +19,7 @@ use super::bots::{
 use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::crypto::hex_lower;
-use super::host::{AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost};
+use super::host::{AttributeQueryRequest, ConnectionBinding, EntityChatHost, RoomAdmitResult};
 use super::runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, RuntimeSurface,
     RuntimeTick,
@@ -43,6 +43,16 @@ pub struct SuiteReport {
     pub ok: bool,
     pub blocked: Option<String>,
     pub rounds: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmitTrace {
+    connection_id: String,
+    session_id: String,
+    net_entity_id: String,
+    entity_type: BoundEntityKind,
+    account_id: String,
+    login_name: String,
 }
 
 /// Runs one suite round. CoreCLR can be created only once per process, so
@@ -256,6 +266,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         Err(reason) => return write_blocked(out_dir, &reason),
     };
 
+    let mut admits = Vec::new();
     let browser_login = login_or_register(&account.uri(), BROWSER_NAME, TEST_PASSWORD, None)
         .await
         .unwrap_or_else(|_| empty_login());
@@ -276,6 +287,13 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                         .binding
                         .as_ref()
                         .is_some_and(|binding| binding.entity_type == BoundEntityKind::Player);
+                if browser_ok {
+                    if let Some(trace) = observed_admit("c-browser", BROWSER_NAME, &admit) {
+                        admits.push(trace);
+                    } else {
+                        browser_ok = false;
+                    }
+                }
                 browser_admit_code = admit.error_code;
             }
             Err(code) => browser_verify = Some(code),
@@ -337,20 +355,32 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             blocked = Some(format!("bot admit failed: {name}"));
             break;
         }
+        let Some(trace) = observed_admit(connection, name, &admit) else {
+            blocked = Some(format!("bot admit returned no Runtime binding: {name}"));
+            break;
+        };
+        admits.push(trace);
         connections.push((connection.clone(), name.clone()));
         thread::sleep(Duration::from_millis(10));
     }
-    let bots_only = host.census(MAIN_ROOM.to_owned());
+    let bot_count = admits
+        .iter()
+        .filter(|row| row.entity_type == BoundEntityKind::Bot)
+        .count();
     scenarios.insert(
         "2".to_owned(),
         json!({
-            "ok": bots_only.bot_count == 100 && bots_only.player_count == 0,
-            "botCount": bots_only.bot_count,
+            "ok": bot_count == 100,
+            "botCount": bot_count,
         }),
     );
 
-    let full = host.census(MAIN_ROOM.to_owned());
-    let admits = host.list_admits(MAIN_ROOM.to_owned());
+    admits.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
+    let player_count = admits
+        .iter()
+        .filter(|row| row.entity_type == BoundEntityKind::Player)
+        .count();
+    let total_entities = admits.len();
     let process_name = replay_process_name();
     let census_payload = census_payload(&admits);
     let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
@@ -558,7 +588,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             return write_blocked(out_dir, &format!("Runtime restore failed: {error}"));
         }
     }
-    let history_max = 0;
     let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
     let last_after = host.query_attribute(AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
@@ -580,6 +609,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     } else {
         Some(0_u64)
     };
+    let history_count = restored_window;
     let process_a = json!({
         "pid": std::process::id(),
         "process": process_name,
@@ -592,15 +622,14 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         && last_after.outcome == AttributeQueryOutcome::Ok
         && last_after.value == last_before.value
         && last_after.value.is_some()
-        && host.census(MAIN_ROOM.to_owned()).total == 101
+        && runtime_resolved_count(&host, MAIN_ROOM, &admits) == 101
         && snapshot_sha256.is_some()
         && process_b.is_some();
     scenarios.insert(
         "7".to_owned(),
         json!({
-            "ok": persist_ok && window_before > 0 && history_max == 0 && restored_window == Some(0),
-            "snapshotEntities": snapshot.bytes.len(),
-            "historyCountMax": history_max,
+            "ok": persist_ok && window_before > 0 && history_count == Some(0),
+            "historyCount": restored_window,
             "restoredWindow": restored_window,
             "windowBeforeSnapshot": window_before,
             "snapshotSource": process_name,
@@ -709,12 +738,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }
     }
     host.clock().advance_ms(RECONNECT_WINDOW_MS + 1_000);
-    host.drive_kernel();
-    let expired = 1_usize;
+    let expiry_tick_fired = host.drive_kernel();
+    let stale_a_rejected = host
+        .admit_input_command("c-bot99".to_owned(), runtime_input.clone())
+        .kind
+        == ChatOpKind::Rejected;
     let after_expiry = login_or_register(&account.uri(), "Bot99", TEST_PASSWORD, Some(&bot_claim))
         .await
         .unwrap_or_else(|_| empty_login());
     let mut expiry_ok = false;
+    let mut expired = 0_usize;
+    let mut tombstoned_observed = false;
     let mut entity_b_host: Option<String> = None;
     if after_expiry.accepted {
         if let Some(credential) = after_expiry.admission_credential {
@@ -728,13 +762,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                     attribute_id: "EntityIdentity.entityType".to_owned(),
                     connection_generation: None,
                 });
+                tombstoned_observed = tombstoned.outcome == AttributeQueryOutcome::Tombstoned;
+                expired = usize::from(tombstoned_observed);
                 expiry_ok = created_b.accepted
                     && created_b.binding.as_ref().is_some_and(|binding| {
                         binding.net_entity_id != entity_99
                             && binding.net_entity_id != entity_99_host
                             && binding.account_id == account_99
                     })
-                    && tombstoned.outcome == AttributeQueryOutcome::Tombstoned;
+                    && tombstoned_observed
+                    && stale_a_rejected
+                    && expiry_tick_fired;
                 entity_b_host = created_b
                     .binding
                     .as_ref()
@@ -743,8 +781,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }
     }
     let expiry_trace = json!({
-        "tombstoned": expiry_ok,
-        "staleARejected": expiry_ok,
+        "tombstoned": tombstoned_observed,
+        "staleARejected": stale_a_rejected,
         "entityA": entity_99_host,
         "entityB": entity_b_host,
     });
@@ -755,8 +793,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "expired": expired,
             "entityA": entity_99_host,
             "entityB": entity_b_host,
-            "tombstoned": expiry_ok,
-            "staleARejected": expiry_ok,
+            "tombstoned": tombstoned_observed,
+            "staleARejected": stale_a_rejected,
         }),
     );
 
@@ -767,6 +805,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .await
         .unwrap_or_else(|_| empty_login());
     let mut iso_ok = false;
+    let mut iso_total = 0_usize;
     if iso_a.accepted && iso_b.accepted {
         if let (Some(cred_a), Some(cred_b)) = (
             iso_a.admission_credential.clone(),
@@ -775,8 +814,20 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             if verify_admission(&cred_a, ADMISSION_KEY_ID, &admission.public, now).is_ok()
                 && verify_admission(&cred_b, ADMISSION_KEY_ID, &admission.public, now).is_ok()
             {
-                let _ = host.admit(ISO_ROOM.to_owned(), "iso-a".to_owned(), cred_a);
-                let _ = host.admit(ISO_ROOM.to_owned(), "iso-b".to_owned(), cred_b);
+                let iso_admits = [
+                    host.admit(ISO_ROOM.to_owned(), "iso-a".to_owned(), cred_a),
+                    host.admit(ISO_ROOM.to_owned(), "iso-b".to_owned(), cred_b),
+                ];
+                let iso_ids: Vec<String> = iso_admits
+                    .iter()
+                    .filter(|admit| admit.accepted)
+                    .filter_map(|admit| {
+                        admit
+                            .binding
+                            .as_ref()
+                            .map(|binding| binding.net_entity_id.clone())
+                    })
+                    .collect();
                 let _ = host.admit_input_command("iso-a".to_owned(), runtime_input.clone());
                 let _ = host.run_tick(ISO_ROOM.to_owned());
                 let cross = host.query_attribute(AttributeQueryRequest {
@@ -792,7 +843,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                         .iter()
                         .any(|frame| frame.contains("iso-only"))
                 });
-                iso_ok = host.census(ISO_ROOM.to_owned()).total == 2
+                iso_total = iso_ids
+                    .iter()
+                    .filter(|net_entity_id| {
+                        host.try_resolve_by_net_entity_id(
+                            ISO_ROOM.to_owned(),
+                            (*net_entity_id).clone(),
+                        )
+                        .is_ok_and(|resolved| resolved.is_some())
+                    })
+                    .count();
+                iso_ok = iso_total == 2
                     && !leaked
                     && cross.error_code.as_deref() == Some("cross_room_reference");
             }
@@ -802,19 +863,19 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "10".to_owned(),
         json!({
             "ok": iso_ok,
-            "isoTotal": host.census(ISO_ROOM.to_owned()).total,
+            "isoTotal": iso_total,
         }),
     );
 
     let scale_ok =
-        full.total == 101 && chat_ok && event_order.len() == 101 && applied_ticks.len() == 101;
+        total_entities == 101 && chat_ok && event_order.len() == 101 && applied_ticks.len() == 101;
     scenarios.insert(
         "11".to_owned(),
         json!({
             "ok": scale_ok,
-            "totalEntities": full.total,
-            "botCount": full.bot_count,
-            "playerCount": full.player_count,
+            "totalEntities": total_entities,
+            "botCount": bot_count,
+            "playerCount": player_count,
             "eventOrder": event_order,
             "appliedTicks": applied_ticks,
             "appliedTick": tick.applied_tick,
@@ -830,10 +891,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     scenarios.insert(
         "3".to_owned(),
         json!({
-            "ok": browser_ok && full.total == 101 && full.bot_count == 100 && full.player_count == 1 && playwright_ran && browser_room_observed,
-            "total": full.total,
-            "botCount": full.bot_count,
-            "playerCount": full.player_count,
+            "ok": browser_ok && total_entities == 101 && bot_count == 100 && player_count == 1 && playwright_ran && browser_room_observed,
+            "total": total_entities,
+            "botCount": bot_count,
+            "playerCount": player_count,
             "playwrightRan": playwright_ran,
             "loginAccepted": browser_login.accepted,
             "loginError": browser_login.error_code,
@@ -1116,6 +1177,32 @@ fn empty_login() -> super::AccountLoginResult {
         admission_credential: None,
         error_code: Some("transport".to_owned()),
     }
+}
+
+fn observed_admit(
+    connection_id: &str,
+    login_name: &str,
+    result: &RoomAdmitResult,
+) -> Option<AdmitTrace> {
+    let binding = result.binding.as_ref()?;
+    Some(AdmitTrace {
+        connection_id: connection_id.to_owned(),
+        session_id: binding.session_id.clone(),
+        net_entity_id: binding.net_entity_id.clone(),
+        entity_type: binding.entity_type,
+        account_id: binding.account_id.clone(),
+        login_name: login_name.to_owned(),
+    })
+}
+
+fn runtime_resolved_count(host: &EntityChatHost, room_id: &str, admits: &[AdmitTrace]) -> usize {
+    admits
+        .iter()
+        .filter(|row| {
+            host.try_resolve_by_net_entity_id(room_id.to_owned(), row.net_entity_id.clone())
+                .is_ok_and(|resolved| resolved.is_some())
+        })
+        .count()
 }
 
 fn census_payload(admits: &[AdmitTrace]) -> Value {

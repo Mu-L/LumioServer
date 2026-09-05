@@ -69,17 +69,6 @@ impl ConnectionBinding {
     }
 }
 
-/// One live admit row for host-audit / census.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AdmitTrace {
-    pub connection_id: String,
-    pub session_id: String,
-    pub net_entity_id: String,
-    pub entity_type: BoundEntityKind,
-    pub account_id: String,
-    pub login_name: String,
-}
-
 /// Server resolution of a live entity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityResolution {
@@ -121,16 +110,6 @@ impl RoomAdmitResult {
     }
 }
 
-/// Live Bot + Player census for one room.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoomCensus {
-    pub bot_count: usize,
-    pub player_count: usize,
-    pub total: usize,
-    pub net_entity_ids: Vec<String>,
-    pub entity_types: Vec<BoundEntityKind>,
-}
-
 /// Attribute query request forwarded to Runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeQueryRequest {
@@ -142,10 +121,8 @@ pub struct AttributeQueryRequest {
 }
 
 struct Session {
-    connection_id: String,
     session_id: String,
     account_id: String,
-    login_name: String,
     room_id: String,
     net_entity_id: String,
     entity_type: BoundEntityKind,
@@ -442,18 +419,6 @@ impl EntityChatHost {
         self.on_owner(move |inner| inner.runtime.restore(&room_id, &snapshot.bytes))
     }
 
-    /// Live entity census from Runtime ListBindings.
-    #[must_use]
-    pub fn census(&self, room_id: String) -> RoomCensus {
-        self.on_owner(move |inner| inner.census(&room_id))
-    }
-
-    /// Live admit rows for host-audit census.
-    #[must_use]
-    pub fn list_admits(&self, room_id: String) -> Vec<AdmitTrace> {
-        self.on_owner(move |inner| inner.list_admits(&room_id))
-    }
-
     /// Owner thread id (tests).
     #[must_use]
     pub fn owner_thread_id(&self) -> ThreadId {
@@ -610,10 +575,8 @@ impl Inner {
             .remove(connection_id)
             .unwrap_or_default();
         let session = Session {
-            connection_id: connection_id.to_owned(),
             session_id: session_id.clone(),
             account_id: payload.account_id.clone(),
-            login_name: payload.login_name.clone(),
             room_id: runtime_binding.room_id.clone(),
             net_entity_id: runtime_binding.net_entity_id.clone(),
             entity_type: runtime_binding.entity_type,
@@ -1037,59 +1000,5 @@ impl Inner {
                 }
             }
         }
-    }
-
-    fn census(&mut self, room_id: &str) -> RoomCensus {
-        let mut rows: Vec<ConnectionBinding> = self
-            .sessions
-            .values()
-            .filter(|session| session.room_id == room_id)
-            .map(|session| ConnectionBinding {
-                account_id: session.account_id.clone(),
-                room_id: session.room_id.clone(),
-                net_entity_id: session.net_entity_id.clone(),
-                entity_type: session.entity_type,
-                connection_generation: session.generation,
-                session_id: session.session_id.clone(),
-            })
-            .collect();
-        rows.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
-        let mut bots = 0;
-        let mut players = 0;
-        let mut ids = Vec::new();
-        let mut kinds = Vec::new();
-        for row in rows {
-            ids.push(row.net_entity_id);
-            kinds.push(row.entity_type);
-            match row.entity_type {
-                BoundEntityKind::Bot => bots += 1,
-                BoundEntityKind::Player => players += 1,
-            }
-        }
-        RoomCensus {
-            bot_count: bots,
-            player_count: players,
-            total: bots + players,
-            net_entity_ids: ids,
-            entity_types: kinds,
-        }
-    }
-
-    fn list_admits(&mut self, room_id: &str) -> Vec<AdmitTrace> {
-        let mut rows: Vec<AdmitTrace> = self
-            .sessions
-            .values()
-            .filter(|session| session.room_id == room_id)
-            .map(|session| AdmitTrace {
-                connection_id: session.connection_id.clone(),
-                session_id: session.session_id.clone(),
-                net_entity_id: session.net_entity_id.clone(),
-                entity_type: session.entity_type,
-                account_id: session.account_id.clone(),
-                login_name: session.login_name.clone(),
-            })
-            .collect();
-        rows.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
-        rows
     }
 }

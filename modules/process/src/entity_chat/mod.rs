@@ -42,11 +42,10 @@ pub use bots::{
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
 pub use host::{
-    AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
-    RoomAdmitResult, RoomCensus, WireInputObserver, DISPATCH_EXPIRE, DISPATCH_TICK,
-    MAX_DEFERRED_FRAMES_PER_CONNECTION, MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION,
-    MAX_DEFERRED_FRAME_CONNECTIONS, MAX_PENDING_EGRESS_CONNECTIONS,
-    MAX_PENDING_EGRESS_PER_CONNECTION,
+    AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution, RoomAdmitResult,
+    WireInputObserver, DISPATCH_EXPIRE, DISPATCH_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
+    MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION, MAX_DEFERRED_FRAME_CONNECTIONS,
+    MAX_PENDING_EGRESS_CONNECTIONS, MAX_PENDING_EGRESS_PER_CONNECTION,
 };
 pub use runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,
