@@ -10,6 +10,7 @@ use lumio_server_process::entity_chat::{
     ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
     MAX_PENDING_ADMISSIONS, MAX_PENDING_QUERIES, RECONNECT_WINDOW_MS,
 };
+use std::sync::Arc;
 
 fn host_with(
     runtime: SharedRuntime,
@@ -103,6 +104,123 @@ fn reconnect_within_window_rebinds_entity_a() {
     host.clock().advance_ms(RECONNECT_WINDOW_MS + 1);
     assert!(host.drive_kernel());
     assert!(runtime.lock().expire_calls().is_empty());
+}
+
+#[test]
+fn reconnect_missing_welcome_rearms_retained_entity_expiry() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let entity_a = host.must_self("c-bot01").net_entity_id;
+    assert!(host.disconnect("c-bot01".to_owned()).expect("disconnect"));
+
+    runtime.lock().suppress_rebind_welcome();
+    let pending = host.admit(
+        "room-main".to_owned(),
+        "c-bot01-reconnected".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(pending.accepted && pending.reconnected);
+    host.clock().advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.drive_kernel());
+    assert!(runtime.lock().expire_calls().is_empty());
+
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    assert!(host
+        .try_self_lookup("c-bot01-reconnected".to_owned())
+        .is_none());
+
+    host.clock().advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.drive_kernel());
+    assert!(runtime
+        .lock()
+        .expire_calls()
+        .iter()
+        .any(|id| id == &entity_a));
+}
+
+#[test]
+fn reconnect_error_rearms_retained_entity_expiry() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let entity_a = host.must_self("c-bot01").net_entity_id;
+    assert!(host.disconnect("c-bot01".to_owned()).expect("disconnect"));
+
+    host.clock().advance_ms(RECONNECT_WINDOW_MS - 1);
+    let rejected = host.admit(
+        "room-other".to_owned(),
+        "c-bot01-wrong-room".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.error_code.as_deref(), Some("cross_room_reference"));
+
+    host.clock().advance_ms(2);
+    assert!(host.drive_kernel());
+    assert!(runtime.lock().expire_calls().is_empty());
+    host.clock().advance_ms(RECONNECT_WINDOW_MS);
+    assert!(host.drive_kernel());
+    assert!(runtime
+        .lock()
+        .expire_calls()
+        .iter()
+        .any(|id| id == &entity_a));
+}
+
+#[test]
+fn production_cadence_is_not_starved_and_drives_pending_expiry_rooms() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let clock = SharedClock::system();
+    let keys = generate_keys();
+    let host = Arc::new(EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        clock.clone(),
+        Box::new(runtime.clone()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    ));
+    assert!(
+        host.admit(
+            "room-expiry-only".to_owned(),
+            "c-expiry-only".to_owned(),
+            credential(&keys, "ExpiryOnlyBot", true),
+        )
+        .accepted
+    );
+    assert!(host
+        .disconnect("c-expiry-only".to_owned())
+        .expect("disconnect"));
+    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+
+    let flood = host.clone();
+    let worker = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
+        while std::time::Instant::now() < deadline {
+            let _ = flood.try_self_lookup("missing".to_owned());
+        }
+    });
+    worker.join().expect("owner flood worker");
+
+    assert!(!runtime.lock().expire_calls().is_empty());
+    assert_eq!(host.drain_runtime_queries().len(), 1);
 }
 
 #[test]

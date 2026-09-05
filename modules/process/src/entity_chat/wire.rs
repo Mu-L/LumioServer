@@ -69,6 +69,20 @@ impl WireSender {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_sender_pair(
+    capacity: usize,
+) -> (WireSender, lumio_host_runtime::Receiver<WireOut>) {
+    let (inner, receiver) = bounded_channel(capacity);
+    (
+        WireSender {
+            inner,
+            cancel: CancelToken::new(),
+        },
+        receiver,
+    )
+}
+
 fn map_send_error(error: SendError<WireOut>) -> WireSendError {
     match error {
         SendError::Full(_) => WireSendError::Full,

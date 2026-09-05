@@ -640,6 +640,9 @@ impl RuntimeSurface for ScriptedRuntime {
             message_type: Some("Welcome".to_owned()),
             code: None,
         });
+        if self.suppress_rebind_welcome {
+            result.frames.clear();
+        }
         result
     }
 
