@@ -308,11 +308,34 @@ public static class HostEntry
     private static (int, byte[]) Restore(JsonElement root)
     {
         if (!TryString(root, "bytesBase64", out string? encoded)) return (EntrySuccess, Fail("invalid_request"));
+        string roomId = OptionalString(root, "roomId") ?? string.Empty;
+        var previousConnections = SnapshotConnections();
         object restored = ManagerType!.GetMethod("CreateFromSnapshot", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { new ReadOnlyMemory<byte>(Convert.FromBase64String(encoded!)) })!;
         Manager = restored;
         ManagerType.GetMethod("Start")!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
+        if (!string.IsNullOrEmpty(roomId))
+        {
+            BindingType.GetMethod("RestoreRoomBindings", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Bindings, new object?[] { roomId });
+            MethodInfo restoreConnection = BindingType.GetMethod("RestoreConnection", BindingFlags.Public | BindingFlags.Instance)!;
+            Type stateType = restoreConnection.GetParameters()[0].ParameterType;
+            foreach (object state in previousConnections)
+            {
+                object? converted = stateType.GetConstructor(new[] { typeof(string), state.GetType().GetProperty("Binding")!.PropertyType })?.Invoke(new[] { state.GetType().GetProperty("Connection")!.GetValue(state), state.GetType().GetProperty("Binding")!.GetValue(state) });
+                if (converted is not null) restoreConnection.Invoke(Bindings, new[] { converted });
+            }
+        }
         return (EntrySuccess, Ok());
+    }
+
+    private static List<object> SnapshotConnections()
+    {
+        var result = new List<object>();
+        if (Bindings is null || BindingType is null) return result;
+        MethodInfo? snapshot = BindingType.GetMethod("SnapshotConnections", BindingFlags.Public | BindingFlags.Instance);
+        if (snapshot?.Invoke(Bindings, null) is not IEnumerable rows) return result;
+        foreach (object row in rows) result.Add(row);
+        return result;
     }
 
     private static object NewMessage(string typeName, params object?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;

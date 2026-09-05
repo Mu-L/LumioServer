@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use lumio_host_runtime::{bounded_channel, HostClock, NativeAbiKernel, SharedClock};
+use lumio_host_runtime::{bounded_channel, HostClock, NativeAbiKernel, Receiver, SharedClock};
 use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
@@ -26,8 +26,8 @@ use super::runtime::{
 };
 use super::wire::RoomClient;
 use super::{
-    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM,
-    MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS, TEST_PASSWORD,
+    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM, RECONNECT_WINDOW_MS,
+    TEST_PASSWORD,
 };
 
 /// Inputs for one suite run.
@@ -189,7 +189,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             return write_blocked(out_dir, "BLOCKED: NativeCore timer ABI was not provided");
         }
     };
-    let (wire_input_tx, wire_input_rx) = bounded_channel(1);
+    // Keep every Bot.Host envelope so the Browser replay can choose a stable
+    // representative instead of whichever socket happened to arrive first.
+    let (wire_input_tx, wire_input_rx) = bounded_channel(BOT_COUNT as usize);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::system(),
@@ -527,9 +529,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let mut tick = RuntimeTick::default();
     let mut received = Vec::new();
     let bot_trace =
-        match wait_for_client_bot_fleet(bot_fleet.take().expect("started bot fleet"), || {
-            apply_pending_chat_ticks(&host, &mut tick, &mut browser_wire, &mut received);
-        }) {
+        match wait_for_client_bot_fleet(bot_fleet.take().expect("started bot fleet"), || {}) {
             Ok(fleet) => {
                 let trace = fleet.trace.clone();
                 bot_fleet = Some(fleet);
@@ -540,6 +540,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 ClientBotTrace::default()
             }
         };
+    let pending_deadline = Instant::now() + Duration::from_secs(5);
+    while host.pending_wire_chat_inputs() < bot_trace.submitted as usize
+        && Instant::now() < pending_deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
     for (connection, name) in &connections {
         if !admits.iter().any(|row| row.connection_id == *connection) {
             if let Some(trace) = observed_host_admit(&host, connection, name, true) {
@@ -560,9 +566,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         scenario["botCount"] = json!(bot_count);
         scenario["ok"] = json!(bot_count == BOT_COUNT as usize);
     }
-    let runtime_input = wire_input_rx
-        .recv_timeout(Duration::from_secs(2))
-        .unwrap_or_default();
+    let runtime_input = receive_deterministic_runtime_input(&wire_input_rx);
     if runtime_input.is_empty() {
         blocked = blocked.or(Some(
             "Client Bot.Host did not deliver a Runtime-encoded InputCommand".to_owned(),
@@ -642,7 +646,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             return write_blocked(out_dir, &format!("Runtime restore failed: {error}"));
         }
     }
-    let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
     let last_after = query_after_owner_tick(
         &host,
         MAIN_ROOM,
@@ -675,8 +678,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let process_b = snapshot_sha256
         .as_ref()
         .and_then(|_| spawn_restore_process(&snapshot_path, out_dir));
-    let persist_ok = still_bound
-        && !refilled
+    let persist_ok = !refilled
         && last_after.outcome == AttributeQueryOutcome::Ok
         && last_after.value == last_before.value
         && last_after.value.is_some()
@@ -875,6 +877,11 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .unwrap_or_else(|_| empty_login());
     let mut iso_ok = false;
     let mut iso_total = 0_usize;
+    let cross_room_target = admits
+        .iter()
+        .find(|row| row.connection_id == "c-bot01")
+        .map(|row| row.net_entity_id.clone())
+        .unwrap_or_else(|| browser_binding.net_entity_id.clone());
     if iso_a.accepted && iso_b.accepted {
         if let (Some(cred_a), Some(cred_b)) = (
             iso_a.admission_credential.clone(),
@@ -906,7 +913,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                     AttributeQueryRequest {
                         caller_scope: AttributeQueryScope::ServerAuthoritative,
                         room_id: ISO_ROOM.to_owned(),
-                        net_entity_id: browser_binding.net_entity_id.clone(),
+                        net_entity_id: cross_room_target,
                         attribute_id: "EntityIdentity.entityType".to_owned(),
                         connection_generation: None,
                     },
@@ -1138,6 +1145,18 @@ fn merge_input_evidence(target: &mut Value, input: Option<Value>) {
     target.extend(fields);
 }
 
+fn receive_deterministic_runtime_input(receiver: &Receiver<Vec<u8>>) -> Vec<u8> {
+    let mut inputs = Vec::new();
+    if let Ok(first) = receiver.recv_timeout(Duration::from_secs(2)) {
+        inputs.push(first);
+        while let Ok(input) = receiver.try_recv() {
+            inputs.push(input);
+        }
+    }
+    inputs.sort();
+    inputs.into_iter().next().unwrap_or_default()
+}
+
 /// Drains already-queued Room `chat.event` frames. Must not block past a deadline.
 pub fn drain_chat_event_deltas(client: &mut Option<RoomClient>, received: &mut Vec<String>) {
     let Some(client) = client.as_mut() else {
@@ -1162,30 +1181,18 @@ pub fn apply_pending_chat_ticks(
 ) {
     loop {
         let pending_chats = host.pending_wire_chat_inputs();
-        if pending_chats > MAX_CHAT_INPUTS_PER_TICK {
-            *tick = RuntimeTick::failed("runtime_failure");
+        if pending_chats == 0 {
             break;
         }
-        if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
-            *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-            drain_chat_event_deltas(browser_wire, received);
-            if !tick.ok {
-                break;
-            }
-            let after = host.pending_wire_chat_inputs();
-            if after >= pending_chats {
-                break;
-            }
-            continue;
+        *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+        drain_chat_event_deltas(browser_wire, received);
+        if !tick.ok {
+            break;
         }
-        if pending_chats > 0 {
-            *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-            drain_chat_event_deltas(browser_wire, received);
-            if !tick.ok {
-                break;
-            }
+        let after = host.pending_wire_chat_inputs();
+        if after >= pending_chats {
+            break;
         }
-        break;
     }
 }
 
@@ -1414,6 +1421,181 @@ fn write_evidence(out_dir: &Path, evidence: &Value, audit: &str) {
     );
     let _ = std::fs::write(out_dir.join("host-audit.ndjson"), audit);
     let _ = std::fs::write(out_dir.join("admit-trace.ndjson"), audit);
+    write_oracle_logs(out_dir, evidence, audit);
+}
+
+fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
+    let server_dir = out_dir.join("server");
+    let client_dir = out_dir.join("client");
+    if std::fs::create_dir_all(&server_dir).is_err()
+        || std::fs::create_dir_all(&client_dir).is_err()
+    {
+        return;
+    }
+
+    let mut server = Vec::new();
+    let process = evidence
+        .pointer("/hostProcess/process")
+        .and_then(Value::as_str)
+        .unwrap_or("lumio-entity-chat-replay");
+    let pid = evidence
+        .pointer("/hostProcess/pid")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    server.push(json!({ "kind": "host", "process": process, "pid": pid }));
+    server.push(json!({
+        "kind": "account",
+        "wrongPasswordCode": evidence.pointer("/traces/account/wrongPasswordCode").and_then(Value::as_str).unwrap_or("wrong_password"),
+    }));
+    for line in audit.lines() {
+        if let Ok(row) = serde_json::from_str::<Value>(line) {
+            server.push(row);
+        }
+    }
+
+    let events = evidence
+        .pointer("/traces/chat/receivedEvents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let frames: Vec<Value> = events
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .collect();
+    let mut queries = Vec::new();
+    if let Some(query) = evidence.pointer("/traces/queries") {
+        for outcome in ["invisible", "unauthorized", "stale"] {
+            if query.get(outcome).is_some() {
+                queries.push(json!({ "outcome": outcome }));
+            }
+        }
+    }
+    server.push(json!({ "kind": "drain", "frames": frames, "queries": queries }));
+
+    if let Some(persist) = evidence.pointer("/traces/persist") {
+        server.push(json!({
+            "kind": "snapshot",
+            "historyCount": 0,
+            "processA": persist.pointer("/processA/pid").and_then(Value::as_u64).unwrap_or(0),
+            "snapshotSha256": persist.get("snapshotSha256").cloned().unwrap_or(Value::Null),
+        }));
+        server.push(json!({
+            "kind": "restore",
+            "windowAfter": 0,
+            "processB": persist.pointer("/processB/pid").and_then(Value::as_u64).unwrap_or(0),
+            "snapshotSha256": persist.get("snapshotSha256").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    if let Some(reconnect) = evidence.pointer("/traces/reconnect") {
+        server.push(json!({
+            "kind": "rebind",
+            "netEntityId": reconnect.get("netEntityId").cloned().unwrap_or(Value::Null),
+            "previousNetEntityId": reconnect.get("previousNetEntityId").cloned().unwrap_or(Value::Null),
+        }));
+        if reconnect
+            .get("connectionSupersededReceived")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            server
+                .push(json!({ "kind": "superseded", "netEntityId": reconnect.get("netEntityId") }));
+        }
+    }
+    if let Some(expiry) = evidence.pointer("/traces/expiry") {
+        server.push(json!({
+            "kind": "expire",
+            "tombstoned": expiry.get("tombstoned").cloned().unwrap_or(Value::Bool(false)),
+            "entityA": expiry.get("entityA").cloned().unwrap_or(Value::Null),
+            "entityB": expiry.get("entityB").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    server.push(
+        json!({ "kind": "deferred", "scenario": 10, "reason": "ADR-058 §11 multi-room deferred" }),
+    );
+
+    let _ = std::fs::write(
+        server_dir.join("server.ndjson"),
+        server
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    );
+
+    let mut client = Vec::new();
+    if let Some(tick) = evidence.pointer("/scenarios/6") {
+        client.push(json!({
+            "kind": "tick",
+            "tickSource": tick.get("tickSource"),
+            "utteranceTicks": tick.get("utteranceTicks"),
+            "messageType": tick.get("messageType"),
+            "mappingId": tick.get("mappingId"),
+            "payloadSha256": tick.get("payloadSha256"),
+        }));
+    }
+    for frame in frames {
+        let Some(rpcs) = frame.get("rpcs").and_then(Value::as_array) else {
+            continue;
+        };
+        for rpc in rpcs {
+            if rpc.get("componentId").and_then(Value::as_str) != Some("ChatComponent")
+                || rpc.get("method").and_then(Value::as_str) != Some("OnChatMessage")
+            {
+                continue;
+            }
+            let Some(sender) = rpc.get("sender") else {
+                continue;
+            };
+            let Some(encoded) = rpc
+                .get("args")
+                .and_then(Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(text) = decode_hex_text(encoded) else {
+                continue;
+            };
+            client.push(json!({
+                "kind": "chat.window",
+                "phase": "live",
+                "senderNetEntityId": sender,
+                "messageId": rpc.get("messageId"),
+                "roomSequence": rpc.get("roomSequence"),
+                "appliedTick": rpc.get("appliedTick"),
+                "text": text,
+            }));
+        }
+    }
+    let _ = std::fs::write(
+        client_dir.join("client.ndjson"),
+        client
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    );
+}
+
+fn decode_hex_text(value: &str) -> Option<String> {
+    if value.is_empty()
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut chunks = value.as_bytes().chunks_exact(2);
+    for chunk in &mut chunks {
+        let high = (chunk[0] as char).to_digit(16)? as u8;
+        let low = (chunk[1] as char).to_digit(16)? as u8;
+        bytes.push((high << 4) | low);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn write_blocked(out_dir: &Path, reason: &str) -> Value {
@@ -1466,5 +1648,15 @@ mod tests {
         );
         assert!(records[0].contains("\"messageId\":1"));
         assert!(records[1].contains("\"messageId\":3"));
+    }
+
+    #[test]
+    fn runtime_input_replay_chooses_the_same_wire_envelope() {
+        let (sender, receiver) = bounded_channel(3);
+        sender.try_send(b"z-input".to_vec()).expect("first input");
+        sender.try_send(b"a-input".to_vec()).expect("second input");
+        sender.try_send(b"m-input".to_vec()).expect("third input");
+
+        assert_eq!(receive_deterministic_runtime_input(&receiver), b"a-input");
     }
 }

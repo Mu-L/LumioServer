@@ -932,6 +932,58 @@ fn host_wire_ingress_ticks_at_max_chat_inputs() {
 }
 
 #[test]
+fn wire_ingress_bounds_each_connection_before_a_shared_tick() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-a".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-b".to_owned(),
+            credential(&keys, "Bot02", true),
+        )
+        .accepted
+    );
+    let mut a = lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-a")
+        .expect("connect a");
+    let mut b = lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-b")
+        .expect("connect b");
+    let _ = a.recv_text();
+    let _ = b.recv_text();
+
+    // Keep one other connection pending so c-a cannot trigger its automatic
+    // single-connection batch tick while the bound is exercised.
+    b.send_text(RUNTIME_WIRE_CHAT_INPUT).expect("input b");
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    for _ in 0..(MAX_CHAT_INPUTS_PER_TICK) {
+        a.send_text(RUNTIME_WIRE_CHAT_INPUT).expect("input a");
+    }
+    a.send_text(RUNTIME_WIRE_CHAT_INPUT)
+        .expect("overflow input a");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while host.try_self_lookup("c-a".to_owned()).is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        host.try_self_lookup("c-a".to_owned()).is_none(),
+        "overflow must retire only the noisy connection"
+    );
+    assert!(runtime
+        .lock()
+        .disconnect_calls()
+        .iter()
+        .any(|connection| connection == "c-a"));
+}
+
+#[test]
 fn deferred_overflow_retires_session_and_disconnects_runtime_binding() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
@@ -1072,13 +1124,14 @@ fn duplicate_pending_admission_is_rejected_before_runtime_enqueue() {
 fn active_account_selects_takeover_before_async_runtime_admission() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
-    assert!(host
-        .admit(
+    assert!(
+        host.admit(
             "room-main".to_owned(),
             "c-old".to_owned(),
             credential(&keys, "ActiveTakeoverBot", true),
         )
-        .accepted);
+        .accepted
+    );
 
     let takeover = host.admit(
         "room-main".to_owned(),

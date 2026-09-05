@@ -10,11 +10,11 @@ use lumio_host_runtime::{
 use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
 use super::runtime::BoundEntityKind;
 use super::runtime::{
-    AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
-    RuntimeBinding, RuntimeFrame, RuntimeQuery, RuntimeQueryRecord, RuntimeSurface, RuntimeTick,
+    AttributeQueryScope, ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeBinding,
+    RuntimeFrame, RuntimeQuery, RuntimeQueryRecord, RuntimeSurface, RuntimeTick,
 };
 use super::wire::{RoomListener, WireEvent, WireSendError, WireSender, MAX_WIRE_TEXT_BYTES};
-use super::MAX_CHAT_INPUTS_PER_TICK;
+use super::{INGRESS_QUEUE_PER_CONNECTION, MAX_CHAT_INPUTS_PER_TICK};
 
 /// Maximum number of sockets waiting for admission before new sockets are closed.
 pub const MAX_PENDING_EGRESS_CONNECTIONS: usize = 1_024;
@@ -142,6 +142,12 @@ struct Session {
     egresses: Vec<WireSender>,
 }
 
+struct PendingWireInput {
+    room_id: String,
+    connection_id: String,
+    envelope_bytes: Vec<u8>,
+}
+
 struct PendingAdmission {
     room_id: String,
     payload: AdmissionPayload,
@@ -194,6 +200,7 @@ struct Inner {
     retired_connections: HashSet<String>,
     tick_id: u64,
     wire_chat_pending: u64,
+    pending_wire_inputs: Vec<PendingWireInput>,
     wire_input_observer: Option<WireInputObserver>,
 }
 
@@ -299,6 +306,7 @@ impl EntityChatHost {
                 retired_connections: HashSet::new(),
                 tick_id: 0,
                 wire_chat_pending: 0,
+                pending_wire_inputs: Vec::new(),
                 wire_input_observer: None,
             };
             if inner
@@ -1087,6 +1095,7 @@ impl Inner {
     }
 
     fn disconnect(&mut self, connection_id: &str) -> Result<bool, String> {
+        self.clear_pending_wire_inputs(connection_id);
         if let Some(pending) = self.pending_admissions.get(connection_id) {
             let room_id = pending.room_id.clone();
             let runtime_result = self.runtime.disconnect_pending(connection_id);
@@ -1224,18 +1233,60 @@ impl Inner {
         )
     }
 
-    fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
-        if self.wire_chat_pending > MAX_CHAT_INPUTS_PER_TICK as u64 {
-            self.wire_chat_pending = 0;
-            return RuntimeTick::failed("runtime_failure");
+    fn flush_pending_wire_inputs(&mut self, room_id: &str) {
+        let mut ordered: Vec<(String, usize)> = self
+            .pending_wire_inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.room_id == room_id)
+            .map(|(index, pending)| {
+                let sender = self
+                    .sessions
+                    .get(&pending.connection_id)
+                    .map(|session| session.net_entity_id.clone())
+                    .unwrap_or_default();
+                (sender, index)
+            })
+            .collect();
+        ordered.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        ordered.truncate(MAX_CHAT_INPUTS_PER_TICK);
+
+        let mut removal: Vec<usize> = ordered.iter().map(|(_, index)| *index).collect();
+        removal.sort_unstable_by(|left, right| right.cmp(left));
+        let mut selected = Vec::with_capacity(removal.len());
+        for index in removal {
+            selected.push(self.pending_wire_inputs.remove(index));
         }
+        selected.sort_by(|left, right| {
+            let left_sender = self
+                .sessions
+                .get(&left.connection_id)
+                .map(|session| session.net_entity_id.as_str())
+                .unwrap_or_default();
+            let right_sender = self
+                .sessions
+                .get(&right.connection_id)
+                .map(|session| session.net_entity_id.as_str())
+                .unwrap_or_default();
+            left_sender
+                .cmp(right_sender)
+                .then(left.connection_id.cmp(&right.connection_id))
+        });
+        for pending in selected {
+            let _ = self.admit_input_command(&pending.connection_id, &pending.envelope_bytes);
+        }
+        self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
+    }
+
+    fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
+        self.flush_pending_wire_inputs(room_id);
         self.tick_id = self.tick_id.saturating_add(1);
         let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
-            self.wire_chat_pending = 0;
+            self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
             return RuntimeTick::failed("runtime_failure");
         };
         if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
-            self.wire_chat_pending = 0;
+            self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
             return RuntimeTick::failed("runtime_failure");
         }
         let expected_queries = self.pending_request_ids_for_tick();
@@ -1256,7 +1307,7 @@ impl Inner {
         self.route_pending_frames(&tick.frames);
         self.retire_failed_admissions(&tick.frames);
         self.retire_unresolved_admissions(room_id);
-        self.wire_chat_pending = 0;
+        self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
         if !tick.ok {
             if let Some(code) = self.query_failures.first().cloned() {
                 let mut failed = tick;
@@ -1390,6 +1441,7 @@ impl Inner {
     }
 
     fn fail_connection(&mut self, connection: &str) -> Result<(), String> {
+        self.clear_pending_wire_inputs(connection);
         let Some(session) = self.sessions.get(connection) else {
             self.pending_egress
                 .remove(connection)
@@ -1424,6 +1476,12 @@ impl Inner {
         }
         self.schedule_expire(&session.room_id, &session.net_entity_id)?;
         Ok(())
+    }
+
+    fn clear_pending_wire_inputs(&mut self, connection_id: &str) {
+        self.pending_wire_inputs
+            .retain(|pending| pending.connection_id != connection_id);
+        self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
     }
 
     fn on_wire(&mut self, event: WireEvent) {
@@ -1473,22 +1531,42 @@ impl Inner {
                     let _ = self.fail_connection(&connection_id);
                     return;
                 }
-                let room_id = self
+                let Some(room_id) = self
                     .sessions
                     .get(&connection_id)
-                    .map(|session| session.room_id.clone());
+                    .map(|session| session.room_id.clone())
+                else {
+                    return;
+                };
+                if self
+                    .pending_wire_inputs
+                    .iter()
+                    .filter(|pending| pending.connection_id == connection_id)
+                    .count()
+                    >= INGRESS_QUEUE_PER_CONNECTION
+                {
+                    let _ = self.fail_connection(&connection_id);
+                    return;
+                }
                 let envelope_bytes = text.into_bytes();
-                let admitted = self.admit_input_command(&connection_id, &envelope_bytes);
-                if admitted.kind == ChatOpKind::Admitted {
-                    if let Some(observer) = &self.wire_input_observer {
-                        let _ = observer.try_send(envelope_bytes);
-                    }
-                    self.wire_chat_pending = self.wire_chat_pending.saturating_add(1);
-                    if self.wire_chat_pending >= MAX_CHAT_INPUTS_PER_TICK as u64 {
-                        if let Some(room_id) = room_id {
-                            let _ = self.run_tick(&room_id);
-                        }
-                    }
+                if let Some(observer) = &self.wire_input_observer {
+                    let _ = observer.try_send(envelope_bytes.clone());
+                }
+                self.pending_wire_inputs.push(PendingWireInput {
+                    room_id: room_id.clone(),
+                    connection_id: connection_id.clone(),
+                    envelope_bytes,
+                });
+                self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
+                // Preserve the bounded-ingress behavior for a single noisy
+                // connection. Multi-connection traffic is held for the next
+                // owner tick so it can be sorted deterministically.
+                if self.pending_wire_inputs.len() >= MAX_CHAT_INPUTS_PER_TICK
+                    && self.pending_wire_inputs.iter().all(|pending| {
+                        pending.room_id == room_id && pending.connection_id == connection_id
+                    })
+                {
+                    let _ = self.run_tick(&room_id);
                 }
             }
             WireEvent::Closed { connection_id } => {
