@@ -546,6 +546,15 @@ fn host_pending_wire_storage_has_explicit_bounds_and_overflow_close() {
 }
 
 #[test]
+fn host_correlation_maps_are_fixed_capacity_and_probes_are_not_public() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    assert!(host.contains("MAX_PENDING_QUERIES"));
+    assert!(!host.contains("pub fn pending_wire_chat_inputs"));
+    assert!(!host.contains("pub fn wire_observer_count"));
+    assert!(!host.contains("pub fn owner_thread_id"));
+}
+
+#[test]
 fn runtime_frame_and_input_ownership_stays_at_runtime_boundary() {
     let clr = fs::read_to_string(process_root().join("src/entity_chat/clr.rs")).expect("clr.rs");
     let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");

@@ -93,8 +93,9 @@ fn room_client_chat_input_over_wire_then_tick_sends_chat_event_delta() {
 }
 
 #[test]
-fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
+fn wire_input_observer_confirms_room_ingress_before_tick() {
     let keys = generate_keys();
+    let (observer_tx, observer_rx) = bounded_channel(4);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::test(),
@@ -104,6 +105,7 @@ fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
         keys.public.to_vec(),
         1_000,
     );
+    host.attach_wire_input_observer(observer_tx);
     let admit = host.admit(
         "room-main".to_owned(),
         "c-bot01".to_owned(),
@@ -115,18 +117,11 @@ fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
     client
         .send_text(RUNTIME_WIRE_CHAT_INPUT)
         .expect("wire chat.input");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert_eq!(
-        host.pending_wire_chat_inputs(),
-        1,
-        "Room WS chat.input must be observed as pending before tick"
-    );
+    observer_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("Room WS chat.input must be observed before tick");
     let tick = host.run_tick("room-main".to_owned());
     assert!(tick.ok, "kernel tickFrame must run, got {tick:?}");
-    assert_eq!(host.pending_wire_chat_inputs(), 0);
 }
 
 #[test]
@@ -286,11 +281,6 @@ fn takeover_pending_tick_without_welcome_keeps_superseded_frame_and_cleans_new_s
     runtime.lock().plant_raw_delta(Vec::new());
     let mut old = RoomClient::connect(&host.listen_uri(), "runtime-old").expect("old connect");
     let mut new = RoomClient::connect(&host.listen_uri(), "c-new").expect("new connect");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while host.wire_observer_count("c-new".to_owned()) == 0 && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
     let takeover = host.admit(
         "room-main".to_owned(),
         "c-new".to_owned(),
@@ -357,12 +347,6 @@ fn pre_admission_socket_receives_runtime_rejection_frame() {
         1_000,
     );
     let mut client = RoomClient::connect(&host.listen_uri(), "c-rejected").expect("connect");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while host.wire_observer_count("c-rejected".to_owned()) == 0
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
     let result = host.admit(
         "room-main".to_owned(),
         "c-rejected".to_owned(),
@@ -441,11 +425,8 @@ fn wire_ingress_auto_ticks_before_runtime_budget_overflow() {
     }
     let counts = runtime.lock().run_tick_input_counts().to_vec();
     assert!(
-        !counts.is_empty()
-            && host.pending_wire_chat_inputs() < MAX_CHAT_INPUTS_PER_TICK
-            && counts.iter().sum::<usize>() == MAX_CHAT_INPUTS_PER_TICK,
-        "wire ingress must commit a batch at the limit, pending={}, counts={counts:?}",
-        host.pending_wire_chat_inputs()
+        !counts.is_empty() && counts.iter().sum::<usize>() == MAX_CHAT_INPUTS_PER_TICK,
+        "wire ingress must commit a batch at the limit, counts={counts:?}"
     );
     assert!(
         counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),

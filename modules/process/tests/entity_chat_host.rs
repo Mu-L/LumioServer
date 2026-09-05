@@ -3,12 +3,12 @@
 mod common;
 
 use common::{runtime_wire_chat_input, SharedRuntime, TestKernel, RUNTIME_WIRE_CHAT_INPUT};
-use lumio_host_runtime::{HostClock, SharedClock};
+use lumio_host_runtime::{bounded_channel, HostClock, SharedClock};
 use lumio_server_process::entity_chat::{
     generate_keys, issue_admission_credential, AttributeQueryOutcome, AttributeQueryRequest,
     AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, QueryResult,
     ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
-    MAX_PENDING_ADMISSIONS, RECONNECT_WINDOW_MS,
+    MAX_PENDING_ADMISSIONS, MAX_PENDING_QUERIES, RECONNECT_WINDOW_MS,
 };
 
 fn host_with(
@@ -392,6 +392,123 @@ fn async_runtime_query_error_is_correlated_after_owner_tick() {
 }
 
 #[test]
+fn unique_async_queries_are_bounded_and_capacity_releases_after_consume() {
+    const EXPECTED_CAPACITY: usize = MAX_PENDING_QUERIES;
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let (host, keys) = host_with(runtime.clone());
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-query-capacity".to_owned(),
+        credential(&keys, "QueryCapacityBot", true),
+    );
+    let binding = host.must_self("c-query-capacity");
+
+    let requests: Vec<_> = (0..=EXPECTED_CAPACITY)
+        .map(|index| AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: "room-main".to_owned(),
+            net_entity_id: binding.net_entity_id.clone(),
+            attribute_id: format!("EntityIdentity.attr-{index}"),
+            connection_generation: None,
+        })
+        .collect();
+    for request in requests.iter().take(EXPECTED_CAPACITY) {
+        assert_eq!(
+            host.query_attribute(request.clone()).error_code.as_deref(),
+            Some("runtime_query_pending")
+        );
+    }
+    assert_eq!(
+        host.query_attribute(requests[EXPECTED_CAPACITY].clone())
+            .error_code
+            .as_deref(),
+        Some("runtime_query_capacity")
+    );
+    assert_eq!(
+        runtime.lock().query_calls().len(),
+        EXPECTED_CAPACITY,
+        "capacity rejection must happen before Runtime enqueue"
+    );
+
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    let completed = host.query_attribute(requests[0].clone());
+    assert_eq!(completed.outcome, AttributeQueryOutcome::Ok);
+    assert_eq!(
+        host.query_attribute(AttributeQueryRequest {
+            attribute_id: "EntityIdentity.reused".to_owned(),
+            ..requests[EXPECTED_CAPACITY].clone()
+        })
+        .error_code
+        .as_deref(),
+        Some("runtime_query_pending"),
+        "consuming one completion must release exactly one correlation slot"
+    );
+}
+
+#[test]
+fn unique_failed_async_queries_are_bounded_without_orphaning_pending_callers() {
+    const EXPECTED_CAPACITY: usize = MAX_PENDING_QUERIES;
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let (host, keys) = host_with(runtime.clone());
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-failure-capacity".to_owned(),
+        credential(&keys, "FailureCapacityBot", true),
+    );
+    let binding = host.must_self("c-failure-capacity");
+
+    for index in 0..EXPECTED_CAPACITY {
+        runtime.lock().suppress_next_async_query_result();
+        let request = AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: "room-main".to_owned(),
+            net_entity_id: binding.net_entity_id.clone(),
+            attribute_id: format!("EntityIdentity.failure-{index}"),
+            connection_generation: None,
+        };
+        assert_eq!(
+            host.query_attribute(request).error_code.as_deref(),
+            Some("runtime_query_pending")
+        );
+        assert!(!host.run_tick("room-main".to_owned()).ok);
+    }
+
+    let rejected = host.query_attribute(AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id.clone(),
+        attribute_id: "EntityIdentity.failure-overflow".to_owned(),
+        connection_generation: None,
+    });
+    assert_eq!(
+        rejected.error_code.as_deref(),
+        Some("runtime_query_capacity")
+    );
+
+    let first_failure = AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id.clone(),
+        attribute_id: "EntityIdentity.failure-0".to_owned(),
+        connection_generation: None,
+    };
+    assert_eq!(
+        host.query_attribute(first_failure.clone())
+            .error_code
+            .as_deref(),
+        Some("runtime_failure"),
+        "failed correlation is a one-shot terminal result"
+    );
+    assert_eq!(
+        host.query_attribute(first_failure).error_code.as_deref(),
+        Some("runtime_query_pending"),
+        "consuming a failed result must release its correlation slot"
+    );
+}
+
+#[test]
 fn restore_does_not_create_active_sessions() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
@@ -448,6 +565,8 @@ fn runtime_disconnect_failure_preserves_session_and_does_not_schedule_expiry() {
 fn failed_tick_releases_pending_wire_batch_for_the_next_tick() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
+    let (observer_tx, observer_rx) = bounded_channel(4);
+    host.attach_wire_input_observer(observer_tx);
     assert!(
         host.admit(
             "room-main".to_owned(),
@@ -463,23 +582,20 @@ fn failed_tick_releases_pending_wire_batch_for_the_next_tick() {
     client
         .send_text(RUNTIME_WIRE_CHAT_INPUT)
         .expect("first input");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    observer_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("Room wire input must be observed before ticking");
     runtime.lock().fail_next_tick("tick_failed");
 
     let failed = host.run_tick("room-main".to_owned());
     assert!(!failed.ok);
-    assert_eq!(host.pending_wire_chat_inputs(), 0);
 
     client
         .send_text(RUNTIME_WIRE_CHAT_INPUT)
         .expect("second input");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    observer_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("second Room wire input must be observed after failed tick");
     assert!(host.run_tick("room-main".to_owned()).ok);
 }
 
@@ -522,7 +638,10 @@ fn takeover_rejection_does_not_stage_cross_room_pending_admission() {
     );
     assert!(!takeover.accepted);
     assert_eq!(takeover.error_code.as_deref(), Some("cross_room_reference"));
-    assert_eq!(host.wire_observer_count("c-new".to_owned()), 0);
+    assert!(
+        !host.disconnect("c-new".to_owned()).expect("disconnect"),
+        "rejected takeover must not leave a pending admission"
+    );
 }
 
 #[test]
@@ -545,7 +664,10 @@ fn takeover_pending_without_next_tick_identity_is_retired() {
     assert!(host.try_self_lookup("c-new".to_owned()).is_none());
     assert!(host.run_tick("room-main".to_owned()).ok);
     assert!(host.try_self_lookup("c-new".to_owned()).is_none());
-    assert_eq!(host.wire_observer_count("c-new".to_owned()), 0);
+    assert!(
+        !host.disconnect("c-new".to_owned()).expect("disconnect"),
+        "no-Welcome retirement must clear pending admission state"
+    );
 }
 
 #[test]
@@ -700,7 +822,6 @@ fn host_wire_ingress_ticks_at_max_chat_inputs() {
     }
     let counts = runtime.lock().run_tick_input_counts().to_vec();
     assert_eq!(counts.first().copied(), Some(MAX_CHAT_INPUTS_PER_TICK));
-    assert!(host.pending_wire_chat_inputs() < MAX_CHAT_INPUTS_PER_TICK);
     assert!(
         counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),
         "host must not forward more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs to Runtime RunTick, got {counts:?}"
@@ -729,7 +850,12 @@ fn deferred_overflow_retires_session_and_disconnects_runtime_binding() {
         host.try_self_lookup("c-overflow".to_owned()).is_none(),
         "overflow must remove the logical session"
     );
-    assert_eq!(host.wire_observer_count("c-overflow".to_owned()), 0);
+    assert!(
+        !host
+            .disconnect("c-overflow".to_owned())
+            .expect("disconnect"),
+        "overflow retirement must clear the host connection state"
+    );
     assert!(
         runtime
             .lock()
@@ -941,9 +1067,11 @@ fn pending_disconnect_enqueues_runtime_intent_and_clears_state() {
     assert!(host
         .try_self_lookup("c-pending-disconnect".to_owned())
         .is_none());
-    assert_eq!(
-        host.wire_observer_count("c-pending-disconnect".to_owned()),
-        0
+    assert!(
+        !host
+            .disconnect("c-pending-disconnect".to_owned())
+            .expect("second disconnect"),
+        "pending disconnect must clear all host admission state"
     );
     assert!(runtime
         .lock()

@@ -1,8 +1,6 @@
 //! Consume-only Room host: session table + Runtime forward + NativeCore timers + wire.
 
 use std::collections::{HashMap, HashSet};
-use std::thread;
-use std::thread::ThreadId;
 
 use lumio_host_runtime::{
     bounded_channel, spawn_supervised, HostClock, KernelHandle, KernelTimer, Sender, SharedClock,
@@ -30,6 +28,12 @@ pub const MAX_DEFERRED_FRAME_CONNECTIONS: usize = 1_024;
 pub const MAX_DEFERRED_FRAMES_PER_CONNECTION: usize = 64;
 /// Maximum bytes retained by one deferred Runtime frame queue.
 pub const MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION: usize = 1_048_576;
+/// Maximum transient Runtime request correlations retained by the host.
+///
+/// A completed record is attached to its still-pending key and therefore does
+/// not consume a second correlation slot. Failed records consume a slot until
+/// the caller retries the exact request and consumes the terminal result.
+pub const MAX_PENDING_QUERIES: usize = 1_024;
 
 /// Bounded sink for exact Runtime-admitted input bytes used by external evidence consumers.
 pub type WireInputObserver = Sender<Vec<u8>>;
@@ -242,7 +246,6 @@ pub struct EntityChatHost {
     _listener: RoomListener,
     _forward: SupervisedTask,
     _owner: SupervisedTask,
-    owner_id: ThreadId,
     listen_uri: String,
     clock: SharedClock,
 }
@@ -261,7 +264,6 @@ impl EntityChatHost {
     ) -> Self {
         let (tx, rx) = bounded_channel(256);
         let (wire_tx, wire_rx) = bounded_channel(256);
-        let (id_tx, id_rx) = bounded_channel(1);
         let listener = RoomListener::bind(wire_tx).expect("room wire bind");
         let listen_uri = listener.uri();
         let forward_tx = tx.clone();
@@ -274,7 +276,6 @@ impl EntityChatHost {
         });
         let owner_clock = clock.clone();
         let owner = spawn_supervised("lumio-entity-chat-owner", move |_cancel| {
-            let _ = id_tx.send(thread::current().id());
             let mut inner = Inner {
                 clock: owner_clock,
                 reconnect_window_ms,
@@ -315,13 +316,11 @@ impl EntityChatHost {
                 }
             }
         });
-        let owner_id = id_rx.recv().expect("owner thread id");
         Self {
             tx,
             _listener: listener,
             _forward: forward,
             _owner: owner,
-            owner_id,
             listen_uri,
             clock,
         }
@@ -456,9 +455,9 @@ impl EntityChatHost {
         self.on_owner(move |inner| inner.resolve_by_net_entity_id(&room_id, &net_entity_id))
     }
 
-    /// Chat.input frames admitted from Room WS and not yet applied by a tick.
+    /// Crate-internal suite pacing state; not part of the public HostEntry API.
     #[must_use]
-    pub fn pending_wire_chat_inputs(&self) -> usize {
+    pub(crate) fn pending_wire_chat_inputs(&self) -> usize {
         self.on_owner(move |inner| usize::try_from(inner.wire_chat_pending).unwrap_or(usize::MAX))
     }
 
@@ -468,9 +467,9 @@ impl EntityChatHost {
         self.on_owner(|inner| std::mem::take(&mut inner.runtime_queries))
     }
 
-    /// Count live Room WS observers for a connection (harness wait).
+    /// Crate-internal suite synchronization; not part of the public HostEntry API.
     #[must_use]
-    pub fn wire_observer_count(&self, connection_id: String) -> usize {
+    pub(crate) fn wire_observer_count(&self, connection_id: String) -> usize {
         self.on_owner(move |inner| {
             inner
                 .sessions
@@ -505,15 +504,26 @@ impl EntityChatHost {
     ) -> Result<(), String> {
         self.on_owner(move |inner| inner.runtime.restore(&room_id, &snapshot.bytes))
     }
-
-    /// Owner thread id (tests).
-    #[must_use]
-    pub fn owner_thread_id(&self) -> ThreadId {
-        self.owner_id
-    }
 }
 
 impl Inner {
+    fn record_query_failure(&mut self, reason: impl Into<String>) {
+        if self.query_failures.len() < MAX_PENDING_QUERIES {
+            self.query_failures.push(reason.into());
+        }
+    }
+
+    fn correlation_slots_used(&self) -> usize {
+        self.pending_queries
+            .len()
+            .saturating_add(self.failed_queries.len())
+            .saturating_add(self.pending_expiries.len())
+    }
+
+    fn correlation_capacity_available(&self) -> bool {
+        self.correlation_slots_used() < MAX_PENDING_QUERIES
+    }
+
     fn next_query_id(&mut self, kind: &str) -> String {
         let id = format!("server-a2-{kind}-{}", self.next_query_id);
         self.next_query_id = self.next_query_id.saturating_add(1);
@@ -549,7 +559,7 @@ impl Inner {
 
     fn fail_pending_expiry(&mut self, request_id: &str, reason: &str) {
         if self.pending_expiries.remove(request_id).is_some() {
-            self.query_failures.push(reason.to_owned());
+            self.record_query_failure(reason);
         }
     }
 
@@ -567,17 +577,17 @@ impl Inner {
             let expiry = self.pending_expiries.get(&request_id).cloned();
             if keys.is_empty() && expiry.is_none() {
                 unknown_request = true;
-                self.query_failures.push("runtime_failure".to_owned());
+                self.record_query_failure("runtime_failure");
                 continue;
             }
             if !seen.insert(request_id.clone()) {
-                self.query_failures.push("runtime_failure".to_owned());
+                self.record_query_failure("runtime_failure");
                 self.fail_pending_request(&request_id, "runtime_failure");
                 valid.remove(&request_id);
                 continue;
             }
             if !Self::query_record_is_valid(&record, &keys, expiry.as_ref()) {
-                self.query_failures.push("runtime_failure".to_owned());
+                self.record_query_failure("runtime_failure");
                 if expiry.is_some() {
                     self.fail_pending_expiry(&request_id, "runtime_failure");
                 } else {
@@ -589,7 +599,7 @@ impl Inner {
             if expiry.is_some() {
                 self.pending_expiries.remove(&request_id);
                 if record.outcome == "request_error" {
-                    self.query_failures.push(
+                    self.record_query_failure(
                         record
                             .code
                             .clone()
@@ -597,6 +607,13 @@ impl Inner {
                     );
                 }
             } else {
+                if self.completed_queries.len() >= MAX_PENDING_QUERIES
+                    && !self.completed_queries.contains_key(&request_id)
+                {
+                    self.fail_pending_request(&request_id, "runtime_failure");
+                    self.record_query_failure("runtime_failure");
+                    continue;
+                }
                 self.completed_queries.insert(request_id, record.clone());
             }
             self.runtime_queries.push(record);
@@ -1127,13 +1144,18 @@ impl Inner {
             }
             if let Some(target) = self.expire_watch.remove(&event.handle) {
                 let request_id = self.next_query_id("expire");
+                if !self.correlation_capacity_available() {
+                    self.record_query_failure("runtime_query_capacity");
+                    succeeded = false;
+                    continue;
+                }
                 match self
                     .runtime
                     .expire_with_request_id(&request_id, &target.net_entity_id)
                 {
                     Ok(result) if self.route_frames(&target.room_id, &result.frames) => {}
                     Ok(_) => {
-                        self.query_failures.push("runtime_failure".to_owned());
+                        self.record_query_failure("runtime_failure");
                         succeeded = false;
                     }
                     Err(error) => {
@@ -1143,7 +1165,7 @@ impl Inner {
                         {
                             self.pending_expiries.insert(request_id, target);
                         } else {
-                            self.query_failures.push(if error.message.is_empty() {
+                            self.record_query_failure(if error.message.is_empty() {
                                 "runtime_failure".to_owned()
                             } else {
                                 error.message
@@ -1201,7 +1223,7 @@ impl Inner {
                 || self.pending_expiries.contains_key(&request_id);
             if still_pending && !completed.contains(&request_id) {
                 self.fail_pending_request(&request_id, "runtime_failure");
-                self.query_failures.push("runtime_failure".to_owned());
+                self.record_query_failure("runtime_failure");
             }
         }
         let routed = self.route_frames(room_id, &tick.frames);
@@ -1487,6 +1509,9 @@ impl Inner {
         if self.pending_queries.contains_key(&key) {
             return Err("runtime_query_pending".to_owned());
         }
+        if !self.correlation_capacity_available() {
+            return Err("runtime_query_capacity".to_owned());
+        }
         let request_id = self.next_query_id("resolve");
         self.pending_queries.insert(key.clone(), request_id.clone());
         let result = match self.runtime.resolve_by_net_entity_id_with_request_id(
@@ -1538,6 +1563,9 @@ impl Inner {
         if self.pending_queries.contains_key(&key) {
             let request_id = self.pending_queries.get(&key).expect("pending query");
             return QueryResult::pending(request_id);
+        }
+        if !self.correlation_capacity_available() {
+            return QueryResult::request_error("runtime_query_capacity");
         }
         let request_id = self.next_query_id("attribute");
         self.pending_queries.insert(key.clone(), request_id.clone());

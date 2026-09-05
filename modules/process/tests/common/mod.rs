@@ -165,6 +165,7 @@ pub struct ScriptedRuntime {
     async_admissions: bool,
     queued_admissions: Vec<(String, RuntimeBinding)>,
     queued_queries: Vec<RuntimeQueryRecord>,
+    query_calls: Vec<String>,
     async_query_error: Option<String>,
     suppress_next_async_query_result: bool,
     malformed_next_async_query_result: bool,
@@ -206,6 +207,7 @@ impl ScriptedRuntime {
             async_admissions: false,
             queued_admissions: Vec::new(),
             queued_queries: Vec::new(),
+            query_calls: Vec::new(),
             async_query_error: None,
             suppress_next_async_query_result: false,
             malformed_next_async_query_result: false,
@@ -339,6 +341,11 @@ impl ScriptedRuntime {
     #[must_use]
     pub fn admit_calls(&self) -> &[String] {
         &self.admit_calls
+    }
+
+    #[must_use]
+    pub fn query_calls(&self) -> &[String] {
+        &self.query_calls
     }
 
     #[must_use]
@@ -695,6 +702,7 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
+        self.query_calls.push(request_id.to_owned());
         if !self.async_queries {
             return self.resolve_by_net_entity_id(room_id, net_entity_id);
         }
@@ -795,6 +803,7 @@ impl RuntimeSurface for ScriptedRuntime {
         request_id: &str,
         request: &RuntimeQuery,
     ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
+        self.query_calls.push(request_id.to_owned());
         if !self.async_queries {
             return self.query_attribute(request);
         }
