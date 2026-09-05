@@ -283,15 +283,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             Ok(_) => {
                 let admit = host.admit(MAIN_ROOM.to_owned(), "c-browser".to_owned(), credential);
                 browser_ok = admit.accepted;
-                if browser_ok {
-                    if let Some(trace) =
-                        observed_host_admit(&host, "c-browser", BROWSER_NAME, admit.accepted)
-                    {
-                        admits.push(trace);
-                    } else {
-                        browser_ok = false;
-                    }
-                }
                 browser_admit_code = admit.error_code;
             }
             Err(code) => browser_verify = Some(code),
@@ -353,15 +344,24 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             blocked = Some(format!("bot admit failed: {name}"));
             break;
         }
-        if let Some(trace) = observed_host_admit(&host, connection, name, admit.accepted) {
-            admits.push(trace);
-        }
         connections.push((connection.clone(), name.clone()));
         thread::sleep(Duration::from_millis(10));
     }
     // Admission is an intent; the owner tick publishes Runtime Welcome
     // identities before any census or query evidence is collected.
     let _ = host.run_tick(MAIN_ROOM.to_owned());
+    if browser_ok {
+        if let Some(trace) = observed_host_admit(&host, "c-browser", BROWSER_NAME, true) {
+            admits.push(trace);
+        } else {
+            browser_ok = false;
+        }
+    }
+    for (connection, name) in &connections {
+        if let Some(trace) = observed_host_admit(&host, connection, name, true) {
+            admits.push(trace);
+        }
+    }
     let bot_count = admits
         .iter()
         .filter(|row| row.entity_type == BoundEntityKind::Bot)

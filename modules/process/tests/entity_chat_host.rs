@@ -8,7 +8,7 @@ use lumio_server_process::entity_chat::{
     generate_keys, issue_admission_credential, AttributeQueryOutcome, AttributeQueryRequest,
     AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, QueryResult,
     ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
-    RECONNECT_WINDOW_MS,
+    MAX_PENDING_ADMISSIONS, RECONNECT_WINDOW_MS,
 };
 
 fn host_with(
@@ -798,6 +798,228 @@ fn oversized_direct_input_is_rejected_before_runtime() {
     assert_eq!(result.kind, ChatOpKind::Rejected);
     assert_eq!(result.error_code.as_deref(), Some("bad_envelope"));
     assert!(runtime.lock().run_tick_input_counts().is_empty());
+}
+
+#[test]
+fn async_admission_is_pending_until_owner_tick_welcome() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_admissions();
+    let (host, keys) = host_with(runtime);
+    let admitted = host.admit(
+        "room-main".to_owned(),
+        "c-delayed".to_owned(),
+        credential(&keys, "DelayedBot", true),
+    );
+    assert!(admitted.accepted);
+    assert!(host.try_self_lookup("c-delayed".to_owned()).is_none());
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    assert!(host.try_self_lookup("c-delayed".to_owned()).is_some());
+}
+
+#[test]
+fn duplicate_pending_admission_is_rejected_before_runtime_enqueue() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_admissions();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-duplicate".to_owned(),
+            credential(&keys, "DuplicateBot", true),
+        )
+        .accepted
+    );
+    let duplicate = host.admit(
+        "room-main".to_owned(),
+        "c-duplicate".to_owned(),
+        credential(&keys, "DuplicateBot", true),
+    );
+    assert!(!duplicate.accepted);
+    assert_eq!(duplicate.error_code.as_deref(), Some("admission_pending"));
+    assert_eq!(runtime.lock().admit_calls().len(), 1);
+}
+
+#[test]
+fn takeover_cleans_a_superseded_pending_admission() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_admissions();
+    let (host, keys) = host_with(runtime);
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-pending-old".to_owned(),
+            credential(&keys, "PendingTakeoverBot", true),
+        )
+        .accepted
+    );
+    let takeover = host.admit(
+        "room-main".to_owned(),
+        "c-takeover".to_owned(),
+        credential(&keys, "PendingTakeoverBot", true),
+    );
+    assert!(takeover.accepted && takeover.takeover);
+    assert!(host.try_self_lookup("c-pending-old".to_owned()).is_none());
+    assert!(host.try_self_lookup("c-takeover".to_owned()).is_some());
+}
+
+#[test]
+fn missing_async_query_result_fails_and_releases_correlation() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let (host, keys) = host_with(runtime.clone());
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-missing-query".to_owned(),
+        credential(&keys, "MissingQueryBot", true),
+    );
+    let binding = host.must_self("c-missing-query");
+    let request = AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id,
+        attribute_id: "EntityIdentity.entityType".to_owned(),
+        connection_generation: None,
+    };
+    runtime.lock().suppress_next_async_query_result();
+    assert_eq!(
+        host.query_attribute(request.clone()).error_code.as_deref(),
+        Some("runtime_query_pending")
+    );
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(!tick.ok);
+    let failed = host.query_attribute(request);
+    assert_eq!(failed.outcome, AttributeQueryOutcome::RequestError);
+    assert_eq!(failed.error_code.as_deref(), Some("runtime_failure"));
+}
+
+#[test]
+fn malformed_async_query_result_fails_and_releases_correlation() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let (host, keys) = host_with(runtime.clone());
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-malformed-query".to_owned(),
+        credential(&keys, "MalformedQueryBot", true),
+    );
+    let binding = host.must_self("c-malformed-query");
+    let request = AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id,
+        attribute_id: "EntityIdentity.entityType".to_owned(),
+        connection_generation: None,
+    };
+    runtime.lock().malform_next_async_query_result();
+    assert_eq!(
+        host.query_attribute(request.clone()).error_code.as_deref(),
+        Some("runtime_query_pending")
+    );
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(!tick.ok);
+    let failed = host.query_attribute(request);
+    assert_eq!(failed.outcome, AttributeQueryOutcome::RequestError);
+    assert_eq!(failed.error_code.as_deref(), Some("runtime_failure"));
+}
+
+#[test]
+fn pending_disconnect_enqueues_runtime_intent_and_clears_state() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_admissions();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-pending-disconnect".to_owned(),
+            credential(&keys, "PendingDisconnectBot", true),
+        )
+        .accepted
+    );
+    assert!(host
+        .disconnect("c-pending-disconnect".to_owned())
+        .expect("disconnect"));
+    assert!(host
+        .try_self_lookup("c-pending-disconnect".to_owned())
+        .is_none());
+    assert_eq!(
+        host.wire_observer_count("c-pending-disconnect".to_owned()),
+        0
+    );
+    assert!(runtime
+        .lock()
+        .disconnect_calls()
+        .iter()
+        .any(|connection| connection == "c-pending-disconnect"));
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    assert!(host
+        .try_self_lookup("c-pending-disconnect".to_owned())
+        .is_none());
+}
+
+#[test]
+fn pending_admission_capacity_rejects_at_boundary_and_reuses_after_disconnect() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_admissions();
+    let (host, keys) = host_with(runtime.clone());
+    for i in 0..MAX_PENDING_ADMISSIONS {
+        let result = host.admit(
+            "room-main".to_owned(),
+            format!("c-capacity-{i}"),
+            credential(&keys, &format!("CapacityBot{i}"), true),
+        );
+        assert!(result.accepted, "pending admission {i} must fit");
+    }
+    let rejected = host.admit(
+        "room-main".to_owned(),
+        "c-capacity-over".to_owned(),
+        credential(&keys, "CapacityOverflowBot", true),
+    );
+    assert!(!rejected.accepted);
+    assert_eq!(rejected.error_code.as_deref(), Some("admission_capacity"));
+    assert_eq!(runtime.lock().admit_calls().len(), MAX_PENDING_ADMISSIONS);
+    assert!(host
+        .disconnect("c-capacity-0".to_owned())
+        .expect("disconnect"));
+    let reused = host.admit(
+        "room-main".to_owned(),
+        "c-capacity-reused".to_owned(),
+        credential(&keys, "CapacityReusedBot", true),
+    );
+    assert!(reused.accepted);
+}
+
+#[test]
+fn repeated_expiry_results_release_runtime_correlations() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let clock = SharedClock::test();
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        clock.clone(),
+        Box::new(runtime.clone()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    for i in 0..8 {
+        let connection = format!("c-expiry-{i}");
+        let name = format!("ExpiryBot{i}");
+        assert!(
+            host.admit(
+                "room-main".to_owned(),
+                connection.clone(),
+                credential(&keys, &name, true)
+            )
+            .accepted
+        );
+        assert!(host.disconnect(connection).expect("disconnect"));
+        clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+        assert!(host.drive_kernel());
+        assert!(host.run_tick("room-main".to_owned()).ok);
+        assert_eq!(host.drain_runtime_queries().len(), 1);
+    }
 }
 
 #[test]

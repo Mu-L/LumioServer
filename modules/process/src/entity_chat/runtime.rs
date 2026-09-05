@@ -361,6 +361,12 @@ pub trait RuntimeSurface: Send {
         binding: &RuntimeBinding,
     ) -> Result<RuntimeDisconnect, String>;
 
+    /// Enqueues a disconnect intent for a connection whose admission has not
+    /// produced a Runtime binding yet.
+    fn disconnect_pending(&mut self, _connection: &str) -> Result<Vec<RuntimeFrame>, String> {
+        Err("binding_not_found".to_owned())
+    }
+
     fn rebind(
         &mut self,
         connection: &str,

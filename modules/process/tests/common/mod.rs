@@ -149,6 +149,7 @@ pub struct ScriptedRuntime {
     revision: u64,
     expire_calls: Vec<String>,
     disconnect_calls: Vec<String>,
+    admit_calls: Vec<String>,
     restore_calls: usize,
     pending_chats: Vec<(String, String)>,
     events_by_tick: HashMap<u64, Vec<(String, String)>>,
@@ -161,8 +162,12 @@ pub struct ScriptedRuntime {
     persist_error: Option<String>,
     restore_error: Option<String>,
     async_queries: bool,
+    async_admissions: bool,
+    queued_admissions: Vec<(String, RuntimeBinding)>,
     queued_queries: Vec<RuntimeQueryRecord>,
     async_query_error: Option<String>,
+    suppress_next_async_query_result: bool,
+    malformed_next_async_query_result: bool,
     suppress_rebind_frames: bool,
     suppress_rebind_welcome: bool,
 }
@@ -185,6 +190,7 @@ impl ScriptedRuntime {
             revision: 0,
             expire_calls: Vec::new(),
             disconnect_calls: Vec::new(),
+            admit_calls: Vec::new(),
             restore_calls: 0,
             pending_chats: Vec::new(),
             events_by_tick: HashMap::new(),
@@ -197,8 +203,12 @@ impl ScriptedRuntime {
             persist_error: None,
             restore_error: None,
             async_queries: false,
+            async_admissions: false,
+            queued_admissions: Vec::new(),
             queued_queries: Vec::new(),
             async_query_error: None,
+            suppress_next_async_query_result: false,
+            malformed_next_async_query_result: false,
             suppress_rebind_frames: false,
             suppress_rebind_welcome: false,
         }
@@ -264,6 +274,20 @@ impl ScriptedRuntime {
         self.async_queries = true;
     }
 
+    pub fn enable_async_admissions(&mut self) {
+        self.async_admissions = true;
+    }
+
+    pub fn suppress_next_async_query_result(&mut self) {
+        self.async_queries = true;
+        self.suppress_next_async_query_result = true;
+    }
+
+    pub fn malform_next_async_query_result(&mut self) {
+        self.async_queries = true;
+        self.malformed_next_async_query_result = true;
+    }
+
     pub fn fail_next_async_query(&mut self, message: &str) {
         self.async_queries = true;
         self.async_query_error = Some(message.to_owned());
@@ -310,6 +334,11 @@ impl ScriptedRuntime {
     #[must_use]
     pub fn disconnect_calls(&self) -> &[String] {
         &self.disconnect_calls
+    }
+
+    #[must_use]
+    pub fn admit_calls(&self) -> &[String] {
+        &self.admit_calls
     }
 
     #[must_use]
@@ -394,6 +423,7 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         entity_type: BoundEntityKind,
     ) -> RuntimeAdmit {
+        self.admit_calls.push(connection.to_owned());
         if let Some(code) = self.reject_next_admit.take() {
             return RuntimeAdmit {
                 accepted: false,
@@ -448,6 +478,11 @@ impl RuntimeSurface for ScriptedRuntime {
                 live_connection: Some(connection.to_owned()),
             },
         );
+        if self.async_admissions {
+            self.queued_admissions
+                .push((connection.to_owned(), binding.clone()));
+            return RuntimeAdmit::ok(binding);
+        }
         let mut result = RuntimeAdmit::ok(binding.clone());
         if !self.snapshot_failed {
             result.frames.push(RuntimeFrame {
@@ -493,6 +528,22 @@ impl RuntimeSurface for ScriptedRuntime {
             binding,
             frames: Vec::new(),
         })
+    }
+
+    fn disconnect_pending(&mut self, connection: &str) -> Result<Vec<RuntimeFrame>, String> {
+        self.queued_admissions
+            .retain(|(queued, _)| queued != connection);
+        self.disconnect(
+            connection,
+            &RuntimeBinding {
+                account_id: String::new(),
+                room_id: String::new(),
+                net_entity_id: String::new(),
+                entity_type: BoundEntityKind::Player,
+                connection_generation: 0,
+            },
+        )
+        .map(|result| result.frames)
     }
 
     fn rebind(
@@ -649,11 +700,13 @@ impl RuntimeSurface for ScriptedRuntime {
         }
         if self.async_query_error.is_some() {
             self.queue_async_error("ResolveBindingResult", request_id);
+        } else if self.suppress_next_async_query_result {
+            self.suppress_next_async_query_result = false;
         } else {
             let binding = self.entities.get(net_entity_id).and_then(|occupancy| {
                 (occupancy.binding.room_id == room_id).then(|| occupancy.binding.clone())
             });
-            self.queued_queries.push(RuntimeQueryRecord {
+            let mut record = RuntimeQueryRecord {
                 request_id: request_id.to_owned(),
                 result_type: "ResolveBindingResult".to_owned(),
                 outcome: binding.as_ref().map_or("non_existent", |_| "ok").to_owned(),
@@ -666,7 +719,12 @@ impl RuntimeSurface for ScriptedRuntime {
                 detail: None,
                 observed_revision: Some(self.revision),
                 observed_tick: None,
-            });
+            };
+            if self.malformed_next_async_query_result {
+                self.malformed_next_async_query_result = false;
+                record.binding = None;
+            }
+            self.queued_queries.push(record);
         }
         Err(RuntimeControlError::pending(request_id))
     }
@@ -742,6 +800,8 @@ impl RuntimeSurface for ScriptedRuntime {
         }
         if self.async_query_error.is_some() {
             self.queue_async_error("AttributeQueryResult", request_id);
+        } else if self.suppress_next_async_query_result {
+            self.suppress_next_async_query_result = false;
         } else {
             let result = self.query_attribute(request)?;
             let mut record = Self::async_outcome("AttributeQueryResult", request_id, result.value);
@@ -749,6 +809,10 @@ impl RuntimeSurface for ScriptedRuntime {
                 record.net_entity_id = Some(request.net_entity_id.clone());
                 record.room_id = Some(request.room_id.clone());
                 record.attribute_id = Some(request.attribute_id.clone());
+            }
+            if self.malformed_next_async_query_result {
+                self.malformed_next_async_query_result = false;
+                record.value = None;
             }
             self.queued_queries.push(record);
         }
@@ -779,6 +843,7 @@ impl RuntimeSurface for ScriptedRuntime {
     fn run_tick(&mut self, _room_id: &str, tick_id: u64) -> RuntimeTick {
         self.tick = tick_id;
         self.revision += 1;
+        let admissions = std::mem::take(&mut self.queued_admissions);
         let pending = std::mem::take(&mut self.pending_chats);
         self.run_tick_input_counts.push(pending.len());
         if let Some(error) = self.tick_error.take() {
@@ -797,6 +862,16 @@ impl RuntimeSurface for ScriptedRuntime {
         let event_count = pending.len() as u64;
         self.events_by_tick.insert(tick_id, pending);
         let mut result = RuntimeTick::committed(self.tick, self.revision, event_count);
+        for (connection, binding) in admissions {
+            result.frames.push(RuntimeFrame {
+                connection: Some(connection),
+                bytes: default_snapshot().into_bytes(),
+                observer_net_entity_id: Some(binding.net_entity_id),
+                connection_generation: Some(binding.connection_generation),
+                message_type: Some("Welcome".to_owned()),
+                code: None,
+            });
+        }
         if !self.planted_delta.is_empty() {
             result.frames = self
                 .planted_delta
@@ -878,6 +953,10 @@ impl RuntimeSurface for SharedRuntime {
         binding: &RuntimeBinding,
     ) -> Result<RuntimeDisconnect, String> {
         self.lock().disconnect(connection, binding)
+    }
+
+    fn disconnect_pending(&mut self, connection: &str) -> Result<Vec<RuntimeFrame>, String> {
+        self.lock().disconnect_pending(connection)
     }
 
     fn rebind(

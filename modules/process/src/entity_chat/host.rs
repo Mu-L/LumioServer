@@ -20,6 +20,8 @@ use super::MAX_CHAT_INPUTS_PER_TICK;
 
 /// Maximum number of sockets waiting for admission before new sockets are closed.
 pub const MAX_PENDING_EGRESS_CONNECTIONS: usize = 1_024;
+/// Maximum connections whose Runtime admission intent may await an owner tick.
+pub const MAX_PENDING_ADMISSIONS: usize = MAX_PENDING_EGRESS_CONNECTIONS;
 /// Maximum observers retained for one connection while admission is pending/active.
 pub const MAX_PENDING_EGRESS_PER_CONNECTION: usize = 8;
 /// Maximum number of connection queues retaining frames without an attached socket.
@@ -144,6 +146,7 @@ struct PendingAdmission {
     staged_tick: u64,
 }
 
+#[derive(Clone)]
 struct ExpireTarget {
     room_id: String,
     net_entity_id: String,
@@ -176,6 +179,7 @@ struct Inner {
     pending_admissions: HashMap<String, PendingAdmission>,
     runtime_queries: Vec<RuntimeQueryRecord>,
     completed_queries: HashMap<String, RuntimeQueryRecord>,
+    failed_queries: HashMap<PendingQueryKey, String>,
     pending_queries: HashMap<PendingQueryKey, String>,
     pending_expiries: HashMap<String, ExpireTarget>,
     next_query_id: u64,
@@ -183,6 +187,7 @@ struct Inner {
     expire_watch: HashMap<KernelHandle, ExpireTarget>,
     pending_egress: HashMap<String, Vec<WireSender>>,
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
+    retired_connections: HashSet<String>,
     tick_id: u64,
     wire_chat_pending: u64,
     wire_input_observer: Option<WireInputObserver>,
@@ -282,6 +287,7 @@ impl EntityChatHost {
                 pending_admissions: HashMap::new(),
                 runtime_queries: Vec::new(),
                 completed_queries: HashMap::new(),
+                failed_queries: HashMap::new(),
                 pending_queries: HashMap::new(),
                 pending_expiries: HashMap::new(),
                 next_query_id: 1,
@@ -289,6 +295,7 @@ impl EntityChatHost {
                 expire_watch: HashMap::new(),
                 pending_egress: HashMap::new(),
                 deferred_frames: HashMap::new(),
+                retired_connections: HashSet::new(),
                 tick_id: 0,
                 wire_chat_pending: 0,
                 wire_input_observer: None,
@@ -513,45 +520,164 @@ impl Inner {
         id
     }
 
-    fn absorb_runtime_queries(&mut self) {
+    fn pending_request_ids_for_tick(&self) -> HashSet<String> {
+        self.pending_queries
+            .iter()
+            .filter(|(_, request_id)| !self.completed_queries.contains_key(*request_id))
+            .map(|(_, request_id)| request_id.clone())
+            .chain(self.pending_expiries.keys().cloned())
+            .collect()
+    }
+
+    fn pending_keys_for_request(&self, request_id: &str) -> Vec<PendingQueryKey> {
+        self.pending_queries
+            .iter()
+            .filter(|(_, pending_id)| pending_id.as_str() == request_id)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    fn fail_pending_request(&mut self, request_id: &str, reason: &str) {
+        let keys = self.pending_keys_for_request(request_id);
+        for key in keys {
+            self.pending_queries.remove(&key);
+            self.failed_queries.insert(key, reason.to_owned());
+        }
+        self.pending_expiries.remove(request_id);
+        self.completed_queries.remove(request_id);
+    }
+
+    fn fail_pending_expiry(&mut self, request_id: &str, reason: &str) {
+        if self.pending_expiries.remove(request_id).is_some() {
+            self.query_failures.push(reason.to_owned());
+        }
+    }
+
+    fn take_query_failure(&mut self, key: &PendingQueryKey) -> Option<String> {
+        self.failed_queries.remove(key)
+    }
+
+    fn absorb_runtime_queries(&mut self) -> HashSet<String> {
         let mut seen = HashSet::new();
+        let mut valid = HashSet::new();
         let mut unknown_request = false;
         for record in self.runtime.drain_queries() {
-            let known = self
-                .pending_queries
-                .values()
-                .any(|request_id| request_id == &record.request_id)
-                || self.pending_expiries.contains_key(&record.request_id);
-            if !known {
+            let request_id = record.request_id.clone();
+            let keys = self.pending_keys_for_request(&request_id);
+            let expiry = self.pending_expiries.get(&request_id).cloned();
+            if keys.is_empty() && expiry.is_none() {
                 unknown_request = true;
-                self.query_failures
-                    .push("runtime query result requestId mismatch".to_owned());
-            }
-            if !seen.insert(record.request_id.clone()) {
-                self.query_failures
-                    .push("runtime query result has duplicate requestId".to_owned());
-                self.fail_pending_request(&record.request_id);
+                self.query_failures.push("runtime_failure".to_owned());
                 continue;
             }
-            if record.result_type == "ExpireEntityResult"
-                && self.pending_expiries.remove(&record.request_id).is_some()
-                && record.outcome == "request_error"
-            {
-                self.query_failures.push(
-                    record
-                        .code
-                        .clone()
-                        .unwrap_or_else(|| "runtime_failure".to_owned()),
-                );
+            if !seen.insert(request_id.clone()) {
+                self.query_failures.push("runtime_failure".to_owned());
+                self.fail_pending_request(&request_id, "runtime_failure");
+                valid.remove(&request_id);
+                continue;
             }
-            self.completed_queries
-                .insert(record.request_id.clone(), record.clone());
+            if !Self::query_record_is_valid(&record, &keys, expiry.as_ref()) {
+                self.query_failures.push("runtime_failure".to_owned());
+                if expiry.is_some() {
+                    self.fail_pending_expiry(&request_id, "runtime_failure");
+                } else {
+                    self.fail_pending_request(&request_id, "runtime_failure");
+                }
+                continue;
+            }
+            valid.insert(request_id.clone());
+            if expiry.is_some() {
+                self.pending_expiries.remove(&request_id);
+                if record.outcome == "request_error" {
+                    self.query_failures.push(
+                        record
+                            .code
+                            .clone()
+                            .unwrap_or_else(|| "runtime_failure".to_owned()),
+                    );
+                }
+            } else {
+                self.completed_queries.insert(request_id, record.clone());
+            }
             self.runtime_queries.push(record);
         }
         if unknown_request {
-            self.pending_queries.clear();
-            self.pending_expiries.clear();
-            self.completed_queries.clear();
+            let pending_ids: HashSet<String> = self
+                .pending_queries
+                .values()
+                .cloned()
+                .chain(self.pending_expiries.keys().cloned())
+                .collect();
+            for request_id in pending_ids {
+                self.fail_pending_request(&request_id, "runtime_failure");
+                self.fail_pending_expiry(&request_id, "runtime_failure");
+            }
+        }
+        valid
+    }
+
+    fn query_record_is_valid(
+        record: &RuntimeQueryRecord,
+        keys: &[PendingQueryKey],
+        expiry: Option<&ExpireTarget>,
+    ) -> bool {
+        if record.outcome == "request_error" && (record.code.is_none() || record.detail.is_none()) {
+            return false;
+        }
+        if let Some(_target) = expiry {
+            return record.result_type == "ExpireEntityResult"
+                && matches!(
+                    record.outcome.as_str(),
+                    "accepted" | "tombstoned" | "non_existent" | "request_error"
+                );
+        }
+        if keys.len() != 1 {
+            return false;
+        }
+        match &keys[0] {
+            PendingQueryKey::Resolve {
+                room_id,
+                net_entity_id,
+            } => {
+                if record.result_type != "ResolveBindingResult" {
+                    return false;
+                }
+                match record.outcome.as_str() {
+                    "ok" => {
+                        record.observed_revision.is_some()
+                            && record.binding.as_ref().is_some_and(|binding| {
+                                binding.room_id == *room_id
+                                    && binding.net_entity_id == *net_entity_id
+                            })
+                    }
+                    "request_error" | "non_existent" | "stale_generation" | "invisible"
+                    | "unauthorized" | "tombstoned" => true,
+                    _ => false,
+                }
+            }
+            PendingQueryKey::Attribute {
+                room_id,
+                net_entity_id,
+                attribute_id,
+                ..
+            } => {
+                if record.result_type != "AttributeQueryResult" {
+                    return false;
+                }
+                match record.outcome.as_str() {
+                    "ok" => {
+                        record.net_entity_id.as_deref() == Some(net_entity_id.as_str())
+                            && record.room_id.as_deref() == Some(room_id.as_str())
+                            && record.attribute_id.as_deref() == Some(attribute_id.as_str())
+                            && record.value.is_some()
+                            && record.observed_tick.is_some()
+                            && record.observed_revision.is_some()
+                    }
+                    "request_error" | "non_existent" | "stale_generation" | "invisible"
+                    | "unauthorized" | "tombstoned" => true,
+                    _ => false,
+                }
+            }
         }
     }
 
@@ -560,13 +686,6 @@ impl Inner {
             .get(key)
             .and_then(|id| self.completed_queries.get(id))
             .cloned()
-    }
-
-    fn fail_pending_request(&mut self, request_id: &str) {
-        self.pending_queries
-            .retain(|_, pending_id| pending_id != request_id);
-        self.pending_expiries.remove(request_id);
-        self.completed_queries.remove(request_id);
     }
 
     fn clear_query(&mut self, key: &PendingQueryKey) {
@@ -687,6 +806,14 @@ impl Inner {
         if self.sessions.contains_key(connection_id) {
             return RoomAdmitResult::reject("invalid_request");
         }
+        if self.pending_admissions.contains_key(connection_id) {
+            return RoomAdmitResult::reject("admission_pending");
+        }
+        if self.pending_admissions.len() >= MAX_PENDING_ADMISSIONS {
+            self.clear_pending_admission(connection_id);
+            return RoomAdmitResult::reject("admission_capacity");
+        }
+        self.retired_connections.remove(connection_id);
         let kind = super::runtime::entity_type_of(&payload.login_name, payload.bot_tool_context);
         let admitted = self
             .runtime
@@ -788,6 +915,22 @@ impl Inner {
         RoomAdmitResult::pending(reconnected, takeover)
     }
 
+    fn clear_pending_admission(&mut self, connection_id: &str) {
+        self.pending_admissions.remove(connection_id);
+        self.deferred_frames.remove(connection_id);
+        self.pending_egress
+            .remove(connection_id)
+            .into_iter()
+            .flatten()
+            .for_each(|egress| egress.abort());
+        if self.retired_connections.len() >= MAX_PENDING_ADMISSIONS {
+            if let Some(evicted) = self.retired_connections.iter().next().cloned() {
+                self.retired_connections.remove(&evicted);
+            }
+        }
+        self.retired_connections.insert(connection_id.to_owned());
+    }
+
     fn complete_pending_admission(
         &mut self,
         connection_id: &str,
@@ -845,6 +988,7 @@ impl Inner {
             .filter(|connection| connection != connection_id)
             .collect();
         for old_id in superseded_connections {
+            self.clear_pending_admission(&old_id);
             if let Some(old) = self.sessions.remove(&old_id) {
                 for egress in &old.egresses {
                     let _ = egress.try_close();
@@ -898,13 +1042,7 @@ impl Inner {
             .cloned()
             .collect();
         for connection_id in failed {
-            self.pending_admissions.remove(&connection_id);
-            self.deferred_frames.remove(&connection_id);
-            self.pending_egress
-                .remove(&connection_id)
-                .into_iter()
-                .flatten()
-                .for_each(|egress| egress.abort());
+            self.clear_pending_admission(&connection_id);
         }
     }
 
@@ -916,17 +1054,29 @@ impl Inner {
             .map(|(connection_id, _)| connection_id.clone())
             .collect();
         for connection_id in unresolved {
-            self.pending_admissions.remove(&connection_id);
-            self.deferred_frames.remove(&connection_id);
-            self.pending_egress
-                .remove(&connection_id)
-                .into_iter()
-                .flatten()
-                .for_each(|egress| egress.abort());
+            self.clear_pending_admission(&connection_id);
         }
     }
 
     fn disconnect(&mut self, connection_id: &str) -> Result<bool, String> {
+        if let Some(pending) = self.pending_admissions.get(connection_id) {
+            let room_id = pending.room_id.clone();
+            let runtime_result = self.runtime.disconnect_pending(connection_id);
+            let (frames, runtime_error) = match runtime_result {
+                Ok(frames) => (frames, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
+            let routed = self.route_frames(&room_id, &frames);
+            self.clear_pending_admission(connection_id);
+            if let Some(error) = runtime_error {
+                return Err(error);
+            }
+            return if routed {
+                Ok(true)
+            } else {
+                Err("runtime_failure".to_owned())
+            };
+        }
         let Some(session) = self.sessions.get(connection_id) else {
             return Ok(false);
         };
@@ -982,7 +1132,10 @@ impl Inner {
                     .expire_with_request_id(&request_id, &target.net_entity_id)
                 {
                     Ok(result) if self.route_frames(&target.room_id, &result.frames) => {}
-                    Ok(_) => succeeded = false,
+                    Ok(_) => {
+                        self.query_failures.push("runtime_failure".to_owned());
+                        succeeded = false;
+                    }
                     Err(error) => {
                         let _ = self.route_frames(&target.room_id, &error.frames);
                         if error.request_id.as_deref() == Some(request_id.as_str())
@@ -990,6 +1143,11 @@ impl Inner {
                         {
                             self.pending_expiries.insert(request_id, target);
                         } else {
+                            self.query_failures.push(if error.message.is_empty() {
+                                "runtime_failure".to_owned()
+                            } else {
+                                error.message
+                            });
                             succeeded = false;
                         }
                     }
@@ -1032,15 +1190,32 @@ impl Inner {
             self.wire_chat_pending = 0;
             return RuntimeTick::failed("runtime_failure");
         }
+        let expected_queries = self.pending_request_ids_for_tick();
         let tick = self.runtime.run_tick(room_id, self.tick_id);
-        self.absorb_runtime_queries();
+        let completed = self.absorb_runtime_queries();
+        for request_id in expected_queries {
+            let still_pending = self
+                .pending_queries
+                .values()
+                .any(|pending_id| pending_id == &request_id)
+                || self.pending_expiries.contains_key(&request_id);
+            if still_pending && !completed.contains(&request_id) {
+                self.fail_pending_request(&request_id, "runtime_failure");
+                self.query_failures.push("runtime_failure".to_owned());
+            }
+        }
         let routed = self.route_frames(room_id, &tick.frames);
         self.route_pending_frames(&tick.frames);
         self.retire_failed_admissions(&tick.frames);
         self.retire_unresolved_admissions(room_id);
         self.wire_chat_pending = 0;
         if !tick.ok {
-            self.query_failures.clear();
+            if let Some(code) = self.query_failures.first().cloned() {
+                let mut failed = tick;
+                failed.code = Some(code);
+                self.query_failures.clear();
+                return failed;
+            }
             return tick;
         }
         if !self.query_failures.is_empty() {
@@ -1078,6 +1253,9 @@ impl Inner {
     }
 
     fn route_frame_to_connection(&mut self, connection: &str, bytes: &[u8]) -> bool {
+        if self.retired_connections.contains(connection) {
+            return true;
+        }
         match self.deliver_to_connection(connection, bytes) {
             Delivery::Delivered => true,
             Delivery::Invalid => {
@@ -1300,6 +1478,9 @@ impl Inner {
             room_id: room_id.to_owned(),
             net_entity_id: net_entity_id.to_owned(),
         };
+        if let Some(error) = self.take_query_failure(&key) {
+            return Err(error);
+        }
         if let Some(record) = self.pending_record(&key) {
             return self.resolve_completed(&key, room_id, net_entity_id, record);
         }
@@ -1348,6 +1529,9 @@ impl Inner {
             attribute_id: request.attribute_id.clone(),
             connection_generation: request.connection_generation,
         };
+        if let Some(error) = self.take_query_failure(&key) {
+            return QueryResult::request_error(&error);
+        }
         if let Some(record) = self.pending_record(&key) {
             return self.attribute_completed(&key, request, record);
         }

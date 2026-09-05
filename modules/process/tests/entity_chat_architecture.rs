@@ -446,6 +446,7 @@ fn clr_lifecycle_controls_enqueue_without_implicit_runtime_ticks() {
     for marker in [
         "fn admit(\n        &mut self",
         "fn disconnect(\n        &mut self",
+        "fn disconnect_pending(&mut self",
         "fn rebind(\n        &mut self",
         "fn expire(\n        &mut self",
         "fn resolve_by_net_entity_id(\n        &mut self",
@@ -665,6 +666,20 @@ fn suite_starts_bot_sockets_before_runtime_admission() {
         "Bot sockets must exist before Runtime admission projects Welcome"
     );
     assert!(suite.contains("wait_for_client_bot_fleet("));
+}
+
+#[test]
+fn suite_observes_admissions_only_after_owner_tick() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(
+        !suite.contains("observed_host_admit(&host, \"c-browser\", BROWSER_NAME, admit.accepted)"),
+        "suite must not self-lookup immediately after a pending Runtime admit"
+    );
+    assert!(
+        suite.contains("let _ = host.run_tick(MAIN_ROOM.to_owned());\n    if browser_ok"),
+        "suite admission observations must follow an explicit owner tick"
+    );
 }
 
 #[test]

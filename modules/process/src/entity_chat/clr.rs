@@ -706,6 +706,15 @@ impl RuntimeSurface for ClrGameplay {
         })
     }
 
+    fn disconnect_pending(&mut self, connection: &str) -> Result<Vec<RuntimeFrame>, String> {
+        self.enqueue(json!({
+            "op": "enqueue",
+            "messageType": "DisconnectConnectionMessage",
+            "connection": connection,
+        }))?;
+        Ok(Vec::new())
+    }
+
     fn rebind(
         &mut self,
         connection: &str,
