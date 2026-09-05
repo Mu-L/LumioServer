@@ -25,7 +25,6 @@ mod browser;
 mod clr;
 mod crypto;
 mod discover;
-mod envelope;
 mod host;
 mod runtime;
 mod suite;
@@ -36,30 +35,31 @@ pub use admission::{
     generate_keys, issue_admission_credential, issue_bot_tool_credential, verify_admission,
     AdmissionPayload, Ed25519KeyPair,
 };
-pub use bots::{discover_bot_host, run_client_bot_fleet, ClientBotFleet, ClientBotTrace};
+pub use bots::{
+    discover_bot_host, run_client_bot_fleet, start_client_bot_fleet, wait_for_client_bot_fleet,
+    ClientBotFleet, ClientBotTrace, ClientInputEvidence,
+};
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
-pub use envelope::{
-    normalize_net_entity_id, CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE,
-};
 pub use host::{
-    AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
-    RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,
-    MAX_DEFERRED_FRAMES_PER_CONNECTION, MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION,
-    MAX_DEFERRED_FRAME_CONNECTIONS, MAX_PENDING_EGRESS_CONNECTIONS,
-    MAX_PENDING_EGRESS_PER_CONNECTION,
+    AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution, RoomAdmitResult,
+    WireInputObserver, DISPATCH_EXPIRE, DISPATCH_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
+    MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION, MAX_DEFERRED_FRAME_CONNECTIONS,
+    MAX_PENDING_ADMISSIONS, MAX_PENDING_EGRESS_CONNECTIONS, MAX_PENDING_EGRESS_PER_CONNECTION,
+    MAX_PENDING_QUERIES, MAX_PENDING_WIRE_INPUTS, MAX_PENDING_WIRE_INPUT_BYTES,
+    MAX_RUNTIME_QUERY_HISTORY,
 };
 pub use runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,
     PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeControlError,
-    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface,
-    RuntimeTick,
+    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeQueryRecord,
+    RuntimeSurface, RuntimeTick,
 };
 pub use suite::{
     apply_pending_chat_ticks, drain_chat_event_deltas, run_round, run_round_blocking,
     run_two_rounds, SuiteOptions, SuiteReport,
 };
-pub use wire::{RoomClient, RoomListener};
+pub use wire::{RoomClient, RoomListener, MAX_WIRE_TEXT_BYTES};
 
 pub const MAIN_ROOM: &str = "room-main";
 pub const ISO_ROOM: &str = "room-iso";

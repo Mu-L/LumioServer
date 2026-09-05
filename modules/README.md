@@ -1,7 +1,6 @@
 # LumioServer 系统架构（模块总入口）
 
-> **架构基线**：`LGE-V1.4-2026-08-27`
-> **唯一架构源**：`LumioGameEngineArchitecture` 固定提交 `d3252a8886b4bfd56fbb08490c3db0e6fc8c9550`（本仓只保存只读镜像 [docs/architecture/LumioGameEngine_Architecture_v1.4.md](../docs/architecture/LumioGameEngine_Architecture_v1.4.md)）
+> **公共契约来源**：`LumioGameEngine` 的 ABI 与 wire 契约；本仓不复制架构版本或镜像。
 > **本文定位**：LumioServer 源码模块骨架的架构总入口。公共语义一律引用架构源，本文只定义本仓内部的模块划分、依赖方向、线程/队列拓扑和运维流程编排；与架构源冲突时以架构源为准。
 
 ## 1. 设计目标、范围与非目标
@@ -360,7 +359,7 @@ Server 相关 Preset（公共 Schema：架构源 `schemas/host-capability.schema
 
 以下契约**只在架构源维护**，本仓只消费。**拼写规则（硬性）**：凡引用 Schema 字段一律使用 Schema 的 camelCase 权威拼写（`protocolVersion`、`gameReleaseId`、`graceDeadlineSeconds`）；PascalCase 仅用于类型名、状态机状态名与 ID Registry 命名空间值（`WorldSlotHost`、`Draining`、`SessionLocalProven`）；C ABI 符号随架构源生成物用 snake_case。散文不得引入第三种拼写，"叙述惯例"不构成豁免。
 
-| 契约 | 架构源位置（`LumioGameEngineArchitecture` 仓内） | 正/反 Fixture | 主要消费模块 |
+| 契约 | 架构源位置（`LumioGameEngine` 的 `engine/abi` / `engine/wire`） | 正/反 Fixture | 主要消费模块 |
 | --- | --- | --- | --- |
 | Wire Envelope | `schemas/replication-envelope.schema.json` | `replication-full-snapshot.json`、`replication-delta.json` / `replication-gap-without-resync.json` | transport、session |
 | ReleaseManifest | `schemas/release-manifest.schema.json` | `release-manifest-a-1.1.json`、`release-manifest-boe-2.1.json` / `release-manifest-mismatch.json` | release-agent、coreclr-host |

@@ -167,7 +167,8 @@ fn suite_attaches_c_browser_room_ws_before_chat_burst() {
         .or_else(|| text.find("RoomClient::connect(&host.listen_uri(), \"c-browser\")"))
         .expect("suite must attach c-browser as a RoomClient");
     let burst = text
-        .find("run_client_bot_fleet(")
+        .find("wait_for_client_bot_fleet(")
+        .or_else(|| text.find("run_client_bot_fleet("))
         .or_else(|| text.find("spawn_client_bot_host("))
         .expect("chat burst must spawn Client Bot.Host, not a host-admit loop");
     assert!(
@@ -406,6 +407,26 @@ fn host_session_occupancy_has_no_account_index() {
 }
 
 #[test]
+fn suite_evidence_does_not_treat_host_sessions_as_runtime_census_or_invent_history() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(!host.contains("fn census("));
+    assert!(!host.contains("fn list_admits("));
+    assert!(!suite.contains("host.census("));
+    assert!(!suite.contains("host.list_admits("));
+    assert!(!suite.contains("historyCountMax"));
+    assert!(!suite.contains("let history_max = 0"));
+    assert!(!suite.contains("let expired = 1_usize"));
+    assert!(!suite.contains("\"snapshotEntities\": snapshot.bytes.len()"));
+    assert!(suite.contains("\"historyCount\": restored_window"));
+    assert!(
+        suite.contains("let stale_a_rejected = host")
+            && suite.contains(".admit_input_command(\"c-bot99\"")
+    );
+}
+
+#[test]
 fn clr_runtime_input_stays_opaque_until_runtime_wire_codec() {
     let path = process_root().join("src/entity_chat/clr.rs");
     let text = fs::read_to_string(&path).expect("clr.rs");
@@ -416,6 +437,48 @@ fn clr_runtime_input_stays_opaque_until_runtime_wire_codec() {
             && !text.contains("mappingId\"].and_then")
             && !text.contains("from_slice::<Value>(envelope_bytes)"),
         "Rust CLR bridge must not parse C-1 command payloads"
+    );
+}
+
+#[test]
+fn clr_lifecycle_controls_enqueue_without_implicit_runtime_ticks() {
+    let clr = fs::read_to_string(process_root().join("src/entity_chat/clr.rs")).expect("clr.rs");
+    for marker in [
+        "fn admit(\n        &mut self",
+        "fn disconnect(\n        &mut self",
+        "fn disconnect_pending(&mut self",
+        "fn rebind(\n        &mut self",
+        "fn expire(\n        &mut self",
+        "fn resolve_by_net_entity_id(\n        &mut self",
+        "fn query_attribute(\n        &mut self",
+    ] {
+        let body = rust_fn_src(&clr, marker);
+        assert!(
+            !body.contains("tick_and_drain"),
+            "{marker} must enqueue an intent; only run_tick may advance Runtime"
+        );
+    }
+    let tick = rust_fn_src(&clr, "fn run_tick(");
+    assert!(
+        tick.contains("tick_and_drain"),
+        "run_tick is the sole Runtime tick owner"
+    );
+}
+
+#[test]
+fn host_admit_result_does_not_expose_runtime_binding_identity() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    let start = host
+        .find("pub struct RoomAdmitResult")
+        .expect("RoomAdmitResult");
+    let body = &host[start
+        ..host[start..]
+            .find("}\n\nimpl RoomAdmitResult")
+            .expect("result body")
+            + start];
+    assert!(
+        !body.contains("binding"),
+        "admission only reports accepted/rejected state"
     );
 }
 
@@ -444,7 +507,7 @@ fn clr_runtime_state_is_only_connection_route_state() {
 }
 
 #[test]
-fn host_entry_attaches_binding_adapter_after_boot_and_restore_bindings() {
+fn host_entry_relies_on_binding_factory_as_the_single_adapter_attach_owner() {
     let path = process_root()
         .parent()
         .expect("modules")
@@ -452,46 +515,13 @@ fn host_entry_attaches_binding_adapter_after_boot_and_restore_bindings() {
         .expect("repo")
         .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
     let text = fs::read_to_string(&path).expect("HostEntry.cs");
-    assert!(
-        text.contains("AttachControlAdapter"),
-        "HostEntry must attach EntityBindingQuery to WorldManager lifecycle controls"
-    );
-    assert!(
-        text.contains("attach.Invoke(Manager, new[] { Bindings })"),
-        "HostEntry must invoke the Runtime WorldManager adapter API"
-    );
-    for marker in [
-        "Bindings = BindingType!.GetMethod(\"Create\"",
-        "AttachControlAdapter",
-    ] {
-        assert!(text.contains(marker), "HostEntry must contain {marker}");
-    }
-    let boot_bindings = text
-        .find("Bindings = BindingType!.GetMethod(\"Create\"")
-        .expect("boot bindings");
-    let boot_adapter = text[boot_bindings..]
-        .find("AttachBindingAdapter();")
-        .expect("boot adapter")
-        + boot_bindings;
+    assert!(text.contains("Bindings = BindingType.GetMethod(\"Create\""));
+    assert!(!text.contains("AttachControlAdapter"));
+    assert!(!text.contains("AttachBindingAdapter"));
     let restore_start = text
         .find("private static (int, byte[]) Restore")
         .expect("restore");
-    let restore_bindings = text[restore_start..]
-        .find("Bindings = BindingType!.GetMethod(\"Create\"")
-        .expect("restore bindings")
-        + restore_start;
-    let restore_adapter = text[restore_bindings..]
-        .find("AttachBindingAdapter();")
-        .expect("restore adapter")
-        + restore_bindings;
-    assert!(
-        boot_bindings < boot_adapter,
-        "Boot must attach immediately after creating Bindings"
-    );
-    assert!(
-        restore_bindings < restore_adapter,
-        "Restore must attach immediately after creating Bindings"
-    );
+    assert!(text[restore_start..].contains("Bindings = BindingType!.GetMethod(\"Create\""));
 }
 
 #[test]
@@ -516,6 +546,15 @@ fn host_pending_wire_storage_has_explicit_bounds_and_overflow_close() {
 }
 
 #[test]
+fn host_correlation_maps_are_fixed_capacity_and_probes_are_not_public() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    assert!(host.contains("MAX_PENDING_QUERIES"));
+    assert!(!host.contains("pub fn pending_wire_chat_inputs"));
+    assert!(!host.contains("pub fn wire_observer_count"));
+    assert!(!host.contains("pub fn owner_thread_id"));
+}
+
+#[test]
 fn runtime_frame_and_input_ownership_stays_at_runtime_boundary() {
     let clr = fs::read_to_string(process_root().join("src/entity_chat/clr.rs")).expect("clr.rs");
     let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
@@ -534,6 +573,121 @@ fn runtime_frame_and_input_ownership_stays_at_runtime_boundary() {
     assert!(
         !clr.contains("try_decode_chat_text"),
         "CLR bridge must not decode chat payloads"
+    );
+}
+
+#[test]
+fn server_has_no_second_c1_input_encoder() {
+    let envelope = process_root().join("src/entity_chat/envelope.rs");
+    assert!(
+        !envelope.exists(),
+        "Server must consume Runtime-produced InputCommand bytes, not own envelope.rs"
+    );
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(!suite.contains("from_chat_text"));
+    assert!(!suite.contains("payloadSha256"));
+}
+
+#[test]
+fn host_entry_does_not_swallow_duplicate_control_adapter_attachment() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(path).expect("HostEntry.cs");
+    assert!(!text.contains("duplicate.Message.Contains"));
+    assert!(!text.contains("AttachBindingAdapter();"));
+}
+
+#[test]
+fn host_entry_accepts_only_exact_frozen_world_message_names() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(path).expect("HostEntry.cs");
+    assert!(!text.contains("messageType.EndsWith(\"Message\""));
+    assert!(!text.contains("messageType + \"Message\""));
+    for message_type in [
+        "AdmitConnectionMessage",
+        "DisconnectConnectionMessage",
+        "RebindConnectionMessage",
+        "ExpireEntityMessage",
+        "ResolveBindingMessage",
+        "AttributeQueryMessage",
+        "InputCommandMessage",
+    ] {
+        assert!(
+            text.contains(&format!("type == \"{message_type}\"")),
+            "HostEntry must accept the exact frozen name {message_type}"
+        );
+    }
+}
+
+#[test]
+fn clr_admit_and_rebind_rejections_preserve_drained_frames() {
+    let clr = fs::read_to_string(process_root().join("src/entity_chat/clr.rs")).expect("clr.rs");
+    let admit = rust_fn_src(&clr, "fn admit(\n        &mut self");
+    let rebind = rust_fn_src(&clr, "fn rebind(\n        &mut self");
+    assert!(admit.contains("RuntimeAdmit::reject_with_frames"));
+    assert!(rebind.contains("RuntimeAdmit::reject_with_frames"));
+}
+
+#[test]
+fn clr_boot_supplies_the_generated_gameplay_registry_assembly() {
+    let clr = fs::read_to_string(process_root().join("src/entity_chat/clr.rs")).expect("clr.rs");
+    let discover = fs::read_to_string(process_root().join("src/entity_chat/discover.rs"))
+        .expect("discover.rs");
+    assert!(clr.contains("registry_assembly"));
+    assert!(clr.contains("\"registryAssembly\": self.registry_assembly"));
+    assert!(discover.contains("Lumio.GameRuntime.Samples.Username.Server.dll"));
+}
+
+#[test]
+fn suite_releases_bot_fleet_after_all_scenarios_and_avoids_must_self() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let release = suite.rfind("fleet.release()").expect("fleet release");
+    let scenario_11 = suite.find("\"11\".to_owned()").expect("scenario 11");
+    assert!(
+        release > scenario_11,
+        "fleet must remain alive through scenario 11"
+    );
+    assert!(
+        !suite.contains("host.must_self("),
+        "acceptance must report missing bindings without panic"
+    );
+}
+
+#[test]
+fn suite_starts_bot_sockets_before_runtime_admission() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    let start = suite.find("start_client_bot_fleet(").expect("fleet start");
+    let admit = suite.find("host.admit(MAIN_ROOM").expect("bot admission");
+    assert!(
+        start < admit,
+        "Bot sockets must exist before Runtime admission projects Welcome"
+    );
+    assert!(suite.contains("wait_for_client_bot_fleet("));
+}
+
+#[test]
+fn suite_observes_admissions_only_after_owner_tick() {
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(
+        !suite.contains("observed_host_admit(&host, \"c-browser\", BROWSER_NAME, admit.accepted)"),
+        "suite must not self-lookup immediately after a pending Runtime admit"
+    );
+    assert!(
+        suite.contains("let _ = host.run_tick(MAIN_ROOM.to_owned());\n    if browser_ok"),
+        "suite admission observations must follow an explicit owner tick"
     );
 }
 

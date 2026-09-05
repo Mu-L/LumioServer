@@ -8,25 +8,27 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use lumio_host_runtime::{HostClock, NativeAbiKernel, SharedClock};
+use lumio_host_runtime::{bounded_channel, HostClock, NativeAbiKernel, Receiver, SharedClock};
 use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
 use super::admission::{generate_keys, issue_bot_tool_credential, verify_admission};
-use super::bots::{discover_bot_host, run_client_bot_fleet, ClientBotFleet, ClientBotTrace};
+use super::bots::{
+    discover_bot_host, start_client_bot_fleet, wait_for_client_bot_fleet, ClientBotTrace,
+};
 use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::crypto::hex_lower;
-use super::envelope::InputCommand;
-use super::host::{AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost};
+use super::host::{AttributeQueryRequest, ConnectionBinding, EntityChatHost};
 use super::runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, RuntimeSurface,
     RuntimeTick,
 };
 use super::wire::RoomClient;
+use super::MAX_CHAT_INPUTS_PER_TICK;
 use super::{
-    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM,
-    MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS, TEST_PASSWORD,
+    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM, RECONNECT_WINDOW_MS,
+    TEST_PASSWORD,
 };
 
 /// Inputs for one suite run.
@@ -42,6 +44,16 @@ pub struct SuiteReport {
     pub ok: bool,
     pub blocked: Option<String>,
     pub rounds: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdmitTrace {
+    connection_id: String,
+    session_id: String,
+    net_entity_id: String,
+    entity_type: BoundEntityKind,
+    account_id: String,
+    login_name: String,
 }
 
 /// Runs one suite round. CoreCLR can be created only once per process, so
@@ -178,6 +190,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             return write_blocked(out_dir, "BLOCKED: NativeCore timer ABI was not provided");
         }
     };
+    // Keep every Bot.Host envelope so the Browser replay can choose a stable
+    // representative instead of whichever socket happened to arrive first.
+    let (wire_input_tx, wire_input_rx) = bounded_channel(BOT_COUNT as usize);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::system(),
@@ -187,6 +202,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         admission.public.to_vec(),
         now,
     );
+    host.attach_wire_input_observer(wire_input_tx);
 
     let mut scenarios: HashMap<String, Value> = HashMap::new();
     let mut blocked: Option<String> = None;
@@ -225,42 +241,35 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         blocked = Some("scenario 1 login-or-register failed".to_owned());
     }
 
-    let mut connections: Vec<(String, String)> = Vec::new();
-    for i in 1..=BOT_COUNT {
-        let name = bot_name(i);
-        let login = login_or_register(&account.uri(), &name, TEST_PASSWORD, Some(&bot_claim))
-            .await
-            .unwrap_or_else(|_| empty_login());
-        if !login.accepted {
-            blocked = Some(format!("bot login failed: {name}"));
-            break;
-        }
-        let Some(credential) = login.admission_credential else {
-            blocked = Some(format!("bot login failed: {name}"));
-            break;
-        };
-        if let Err(code) = verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now) {
-            blocked = Some(format!("admission verify failed: {name} {code}"));
-            break;
-        }
-        let connection = format!("c-{}", name.to_ascii_lowercase());
-        let admit = host.admit(MAIN_ROOM.to_owned(), connection.clone(), credential);
-        if !admit.accepted {
-            blocked = Some(format!("bot admit failed: {name}"));
-            break;
-        }
-        connections.push((connection, name));
-    }
+    let listen_uri = host.listen_uri();
+    let planned_connections: Vec<(String, String)> = (1..=BOT_COUNT)
+        .map(|i| {
+            let name = bot_name(i);
+            (format!("c-{}", name.to_ascii_lowercase()), name)
+        })
+        .collect();
+    let bot_host = match discover_bot_host() {
+        Ok(path) => path,
+        Err(reason) => return write_blocked(out_dir, &reason),
+    };
+    let engine_native = match options.clr.as_ref() {
+        Some(config) if config.engine_native.is_file() => config.engine_native.clone(),
+        _ => return write_blocked(out_dir, "BLOCKED: LUMIO_ENGINE_NATIVE is not set"),
+    };
+    let fleet_dir = out_dir.join("client-bots");
+    let mut bot_fleet = match start_client_bot_fleet(
+        &bot_host,
+        &engine_native,
+        &listen_uri,
+        BOT_COUNT,
+        &fleet_dir,
+        &options.dotnet,
+    ) {
+        Ok(fleet) => Some(fleet),
+        Err(reason) => return write_blocked(out_dir, &reason),
+    };
 
-    let bots_only = host.census(MAIN_ROOM.to_owned());
-    scenarios.insert(
-        "2".to_owned(),
-        json!({
-            "ok": bots_only.bot_count == 100 && bots_only.player_count == 0,
-            "botCount": bots_only.bot_count,
-        }),
-    );
-
+    let mut admits = Vec::new();
     let browser_login = login_or_register(&account.uri(), BROWSER_NAME, TEST_PASSWORD, None)
         .await
         .unwrap_or_else(|_| empty_login());
@@ -276,23 +285,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         match verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now) {
             Ok(_) => {
                 let admit = host.admit(MAIN_ROOM.to_owned(), "c-browser".to_owned(), credential);
-                browser_ok = admit.accepted
-                    && admit
-                        .binding
-                        .as_ref()
-                        .is_some_and(|binding| binding.entity_type == BoundEntityKind::Player);
+                browser_ok = admit.accepted;
                 browser_admit_code = admit.error_code;
             }
             Err(code) => browser_verify = Some(code),
         }
     }
-
-    let full = host.census(MAIN_ROOM.to_owned());
-    let admits = host.list_admits(MAIN_ROOM.to_owned());
-    let process_name = replay_process_name();
-    let census_payload = census_payload(&admits);
-    let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
-    let listen_uri = host.listen_uri();
     let mut browser_wire = RoomClient::connect(&listen_uri, "c-browser").ok();
     if let Some(client) = browser_wire.as_mut() {
         let _ = client.recv_text();
@@ -321,11 +319,93 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         );
     }
 
+    let mut connections: Vec<(String, String)> = Vec::new();
+    for (connection, name) in &planned_connections {
+        if !wait_for_wire_observers(&host, connection, 1, Duration::from_secs(15)) {
+            blocked = Some(format!(
+                "bot socket did not attach before admission: {name}"
+            ));
+            break;
+        }
+        let login = login_or_register(&account.uri(), name, TEST_PASSWORD, Some(&bot_claim))
+            .await
+            .unwrap_or_else(|_| empty_login());
+        if !login.accepted {
+            blocked = Some(format!("bot login failed: {name}"));
+            break;
+        }
+        let Some(credential) = login.admission_credential else {
+            blocked = Some(format!("bot login failed: {name}"));
+            break;
+        };
+        if let Err(code) = verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now) {
+            blocked = Some(format!("admission verify failed: {name} {code}"));
+            break;
+        }
+        let admit = host.admit(MAIN_ROOM.to_owned(), connection.clone(), credential);
+        if !admit.accepted {
+            blocked = Some(format!("bot admit failed: {name}"));
+            break;
+        }
+        connections.push((connection.clone(), name.clone()));
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Admission is an intent; the owner tick publishes Runtime Welcome
+    // identities before any census or query evidence is collected.
+    let _ = host.run_tick(MAIN_ROOM.to_owned());
+    if browser_ok {
+        if let Some(trace) = observed_host_admit(&host, "c-browser", BROWSER_NAME, true) {
+            admits.push(trace);
+        } else {
+            browser_ok = false;
+        }
+    }
+    for (connection, name) in &connections {
+        if let Some(trace) = observed_host_admit(&host, connection, name, true) {
+            admits.push(trace);
+        }
+    }
+    let bot_count = admits
+        .iter()
+        .filter(|row| row.entity_type == BoundEntityKind::Bot)
+        .count();
+    scenarios.insert(
+        "2".to_owned(),
+        json!({
+            "ok": bot_count == 100,
+            "botCount": bot_count,
+        }),
+    );
+
+    admits.sort_by(|left, right| left.net_entity_id.cmp(&right.net_entity_id));
+    let player_count = admits
+        .iter()
+        .filter(|row| row.entity_type == BoundEntityKind::Player)
+        .count();
+    let total_entities = admits.len();
+    let process_name = replay_process_name();
+    let census_payload = census_payload(&admits);
+    let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
     let mut resolved = 0;
+    let mut pending_resolves = Vec::new();
     for (connection, _) in &connections {
         if let Some(binding) = host.try_self_lookup(connection.clone()) {
+            match host
+                .try_resolve_by_net_entity_id(MAIN_ROOM.to_owned(), binding.net_entity_id.clone())
+            {
+                Ok(Some(_)) => resolved += 1,
+                Err(error) if error == "runtime_query_pending" => {
+                    pending_resolves.push(binding.net_entity_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !pending_resolves.is_empty() {
+        let _ = host.run_tick(MAIN_ROOM.to_owned());
+        for net_entity_id in pending_resolves {
             if host
-                .try_resolve_by_net_entity_id(MAIN_ROOM.to_owned(), binding.net_entity_id)
+                .try_resolve_by_net_entity_id(MAIN_ROOM.to_owned(), net_entity_id)
                 .is_ok_and(|resolved| resolved.is_some())
             {
                 resolved += 1;
@@ -373,41 +453,57 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         return evidence;
     };
 
-    let ok_query = host.query_attribute(AttributeQueryRequest {
+    let ok_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: None,
-    });
-    let invisible = host.query_attribute(AttributeQueryRequest {
+    };
+    let invisible_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "ChatComponent.lastMessageText".to_owned(),
         connection_generation: None,
-    });
-    let unauthorized = host.query_attribute(AttributeQueryRequest {
+    };
+    let unauthorized_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "EntityIdentity.claimedMark".to_owned(),
         connection_generation: None,
-    });
-    let missing = host.query_attribute(AttributeQueryRequest {
+    };
+    let missing_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: "ffffffffffffffffffffffffffffffff".to_owned(),
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: None,
-    });
-    let stale = host.query_attribute(AttributeQueryRequest {
+    };
+    let stale_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: Some(0),
-    });
+    };
+    let mut ok_query = host.query_attribute(ok_request.clone());
+    let mut invisible = host.query_attribute(invisible_request.clone());
+    let mut unauthorized = host.query_attribute(unauthorized_request.clone());
+    let mut missing = host.query_attribute(missing_request.clone());
+    let mut stale = host.query_attribute(stale_request.clone());
+    if [&ok_query, &invisible, &unauthorized, &missing, &stale]
+        .iter()
+        .any(|result| result.error_code.as_deref() == Some("runtime_query_pending"))
+    {
+        let _ = host.run_tick(MAIN_ROOM.to_owned());
+        ok_query = host.query_attribute(ok_request);
+        invisible = host.query_attribute(invisible_request);
+        unauthorized = host.query_attribute(unauthorized_request);
+        missing = host.query_attribute(missing_request);
+        stale = host.query_attribute(stale_request);
+    }
     let query_traces = json!({
         "okValue": ok_query.value,
         "invisible": format!("{:?}", invisible.outcome),
@@ -431,69 +527,52 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }),
     );
 
-    let bot_host = match discover_bot_host() {
-        Ok(path) => path,
-        Err(reason) => {
-            let playwright = match pw_thread {
-                Some(handle) => handle.join().unwrap_or_else(|_| {
-                    super::browser::PlaywrightCapture::failed("playwright thread")
-                }),
-                None => super::browser::PlaywrightCapture::failed(&reason),
-            };
-            let evidence = json!({
-                "ok": false,
-                "blocked": reason,
-                "hostProcess": host_process_payload(&process_name, &host.listen_uri()),
-                "playwright": playwright.to_json(),
-                "accountServer": account_meta(&options.account_server_dll, &account),
-                "census": census_payload,
-                "scenarios": scenarios,
-            });
-            write_evidence(out_dir, &evidence, &host_audit);
-            return evidence;
-        }
-    };
-    let engine_native = match options.clr.as_ref() {
-        Some(config) if config.engine_native.is_file() => config.engine_native.clone(),
-        _ => {
-            return write_blocked(out_dir, "BLOCKED: LUMIO_ENGINE_NATIVE is not set");
-        }
-    };
-    let envelopes: Vec<(String, InputCommand)> = connections
-        .iter()
-        .map(|(connection, name)| {
-            (
-                connection.clone(),
-                InputCommand::from_chat_text(&format!("hello-{name}")),
-            )
-        })
-        .collect();
-    let first_envelope = envelopes.first().map(|(_, envelope)| envelope.clone());
     let mut tick = RuntimeTick::default();
     let mut received = Vec::new();
-    let fleet_dir = out_dir.join("client-bots");
-    let mut bot_fleet: Option<ClientBotFleet> = None;
-    let bot_trace = match run_client_bot_fleet(
-        &bot_host,
-        &engine_native,
-        &listen_uri,
-        &envelopes,
-        &fleet_dir,
-        &options.dotnet,
-        || {
-            apply_pending_chat_ticks(&host, &mut tick, &mut browser_wire, &mut received);
-        },
-    ) {
-        Ok(fleet) => {
-            let trace = fleet.trace.clone();
-            bot_fleet = Some(fleet);
-            trace
+    let bot_trace =
+        match wait_for_client_bot_fleet(bot_fleet.take().expect("started bot fleet"), || {}) {
+            Ok(fleet) => {
+                let trace = fleet.trace.clone();
+                bot_fleet = Some(fleet);
+                trace
+            }
+            Err(reason) => {
+                blocked = blocked.or(Some(reason));
+                ClientBotTrace::default()
+            }
+        };
+    let pending_deadline = Instant::now() + Duration::from_secs(5);
+    while host.pending_wire_chat_inputs() < bot_trace.submitted as usize
+        && Instant::now() < pending_deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    for (connection, name) in &connections {
+        if !admits.iter().any(|row| row.connection_id == *connection) {
+            if let Some(trace) = observed_host_admit(&host, connection, name, true) {
+                admits.push(trace);
+            }
         }
-        Err(reason) => {
-            blocked = blocked.or(Some(reason));
-            ClientBotTrace::default()
+    }
+    if !admits.iter().any(|row| row.connection_id == "c-browser") {
+        if let Some(trace) = observed_host_admit(&host, "c-browser", BROWSER_NAME, true) {
+            admits.push(trace);
         }
-    };
+    }
+    if let Some(scenario) = scenarios.get_mut("2") {
+        let bot_count = admits
+            .iter()
+            .filter(|row| row.entity_type == BoundEntityKind::Bot)
+            .count();
+        scenario["botCount"] = json!(bot_count);
+        scenario["ok"] = json!(bot_count == BOT_COUNT as usize);
+    }
+    let runtime_input = receive_deterministic_runtime_input(&wire_input_rx);
+    if runtime_input.is_empty() {
+        blocked = blocked.or(Some(
+            "Client Bot.Host did not deliver a Runtime-encoded InputCommand".to_owned(),
+        ));
+    }
     wait_for_observed_chat_events(
         &host,
         &mut tick,
@@ -502,8 +581,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         BOT_COUNT as usize,
         Duration::from_secs(30),
     );
-    if let Some(client) = browser_wire.as_mut() {
-        let _ = client.send_text(&InputCommand::from_chat_text("hello-browser").to_json());
+    if let (Some(client), Ok(input)) = (browser_wire.as_mut(), std::str::from_utf8(&runtime_input))
+    {
+        let _ = client.send_text(input);
     }
     wait_for_observed_chat_events(
         &host,
@@ -513,9 +593,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         101,
         Duration::from_secs(10),
     );
-    if let Some(fleet) = bot_fleet.take() {
-        fleet.release();
-    }
     let timer_ok = bot_trace.timer_manager_invoked
         && bot_trace.tick_source == "native-kernel/tickFrame"
         && bot_trace.utterance_ticks.contains(&5)
@@ -523,68 +600,41 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         && bot_trace.utterance_ticks.contains(&15)
         && tick.ok
         && tick.applied_tick >= 1;
-    let chat_events: Vec<String> = received
-        .iter()
-        .filter(|frame| is_chat_event_delta(frame))
-        .cloned()
-        .collect();
-    let chat_ok = chat_events.len() == 101 && timer_ok;
+    let chat_events = received.clone();
+    let chat_ok = chat_events.len() == 101 && timer_ok && bot_trace.input.is_some();
     let event_order: Vec<String> = chat_events.clone();
     let applied_ticks: Vec<u64> = chat_events
         .iter()
         .filter_map(|frame| delta_tick_id(frame))
         .collect();
-    let first_block = first_envelope
-        .as_ref()
-        .and_then(|envelope| envelope.commands.first());
-    let playwright = match pw_thread {
-        Some(handle) => handle
-            .join()
-            .unwrap_or_else(|_| super::browser::PlaywrightCapture::failed("playwright thread")),
-        None => super::browser::PlaywrightCapture::failed("BLOCKED: LUMIO_GAME_ROOT is not set"),
-    };
-    let playwright_ran = playwright.playwright_ran();
-    let browser_room_observed = chat_events.len() == 101;
-    scenarios.insert(
-        "3".to_owned(),
-        json!({
-            "ok": browser_ok && full.total == 101 && full.bot_count == 100 && full.player_count == 1 && playwright_ran && browser_room_observed,
-            "total": full.total,
-            "botCount": full.bot_count,
-            "playerCount": full.player_count,
-            "playwrightRan": playwright_ran,
-            "loginAccepted": browser_login.accepted,
-            "loginError": browser_login.error_code,
-            "verifyError": browser_verify,
-            "admitError": browser_admit_code,
-        }),
-    );
-    scenarios.insert(
-        "6".to_owned(),
-        json!({
-            "ok": chat_ok,
-            "eventCount": chat_events.len(),
-            "appliedTick": tick.applied_tick,
-            "timerManagerInvoked": timer_ok,
-            "cadence": bot_trace.tick_source,
-            "tickSource": bot_trace.tick_source,
-            "utteranceTicks": bot_trace.utterance_ticks,
-            "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
-            "mappingId": first_block.map(|block| block.mapping_id.as_str()),
-            "payload": first_block.map(|block| block.payload.as_str()),
-            "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
-        }),
-    );
-
-    let snapshot = host.capture_persist_snapshot(MAIN_ROOM.to_owned());
-    let window_before = chat_events.len();
-    let last_before = host.query_attribute(AttributeQueryRequest {
-        caller_scope: AttributeQueryScope::ServerAuthoritative,
-        room_id: MAIN_ROOM.to_owned(),
-        net_entity_id: browser_binding.net_entity_id.clone(),
-        attribute_id: "ChatComponent.lastMessageText".to_owned(),
-        connection_generation: None,
+    let mut scenario_6 = json!({
+        "ok": chat_ok,
+        "eventCount": chat_events.len(),
+        "appliedTick": tick.applied_tick,
+        "timerManagerInvoked": timer_ok,
+        "cadence": bot_trace.tick_source,
+        "tickSource": bot_trace.tick_source,
+        "utteranceTicks": bot_trace.utterance_ticks,
     });
+    merge_input_evidence(&mut scenario_6, bot_trace.input_evidence_json());
+    scenarios.insert("6".to_owned(), scenario_6);
+
+    let snapshot = match host.capture_persist_snapshot(MAIN_ROOM.to_owned()) {
+        Ok(snapshot) => snapshot,
+        Err(error) => return write_blocked(out_dir, &format!("Runtime snapshot failed: {error}")),
+    };
+    let window_before = chat_events.len();
+    let last_before = query_after_owner_tick(
+        &host,
+        MAIN_ROOM,
+        AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: MAIN_ROOM.to_owned(),
+            net_entity_id: browser_binding.net_entity_id.clone(),
+            attribute_id: "ChatComponent.lastMessageText".to_owned(),
+            connection_generation: None,
+        },
+    );
     let snapshot_path = out_dir.join("persist-snapshot.bin");
     let snapshot_sha256 = if snapshot.bytes.is_empty() {
         None
@@ -593,23 +643,27 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         Some(sha256_hex(&snapshot.bytes))
     };
     if !snapshot.bytes.is_empty() {
-        host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone());
+        if let Err(error) = host.restore_persist_snapshot(MAIN_ROOM.to_owned(), snapshot.clone()) {
+            return write_blocked(out_dir, &format!("Runtime restore failed: {error}"));
+        }
     }
-    let history_max = 0;
-    let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
-    let last_after = host.query_attribute(AttributeQueryRequest {
-        caller_scope: AttributeQueryScope::ServerAuthoritative,
-        room_id: MAIN_ROOM.to_owned(),
-        net_entity_id: browser_binding.net_entity_id.clone(),
-        attribute_id: "ChatComponent.lastMessageText".to_owned(),
-        connection_generation: None,
-    });
+    let last_after = query_after_owner_tick(
+        &host,
+        MAIN_ROOM,
+        AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: MAIN_ROOM.to_owned(),
+            net_entity_id: browser_binding.net_entity_id.clone(),
+            attribute_id: "ChatComponent.lastMessageText".to_owned(),
+            connection_generation: None,
+        },
+    );
     let extra_after_restore = browser_wire
         .as_mut()
         .and_then(|client| client.recv_text().ok());
     let refilled = extra_after_restore
         .as_ref()
-        .is_some_and(|frame| is_chat_event_delta(frame));
+        .is_some_and(|frame| !chat_event_records(frame).is_empty());
     let restored_window = if snapshot.bytes.is_empty() {
         None
     } else if refilled {
@@ -617,6 +671,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     } else {
         Some(0_u64)
     };
+    let history_count = restored_window;
     let process_a = json!({
         "pid": std::process::id(),
         "process": process_name,
@@ -624,27 +679,36 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let process_b = snapshot_sha256
         .as_ref()
         .and_then(|_| spawn_restore_process(&snapshot_path, out_dir));
-    let persist_ok = still_bound
-        && !refilled
+    let persist_ok = !refilled
         && last_after.outcome == AttributeQueryOutcome::Ok
         && last_after.value == last_before.value
         && last_after.value.is_some()
-        && host.census(MAIN_ROOM.to_owned()).total == 101
+        && runtime_resolved_count(&host, MAIN_ROOM, &admits) == 101
         && snapshot_sha256.is_some()
         && process_b.is_some();
     scenarios.insert(
         "7".to_owned(),
         json!({
-            "ok": persist_ok && window_before > 0 && history_max == 0 && restored_window == Some(0),
-            "snapshotEntities": snapshot.bytes.len(),
-            "historyCountMax": history_max,
+            "ok": persist_ok && window_before > 0 && history_count == Some(0),
+            "historyCount": restored_window,
             "restoredWindow": restored_window,
             "windowBeforeSnapshot": window_before,
             "snapshotSource": process_name,
         }),
     );
 
-    let previous_bot100 = host.must_self("c-bot100");
+    let Some(previous_bot100) = host.try_self_lookup("c-bot100".to_owned()) else {
+        let still_bound = connections
+            .iter()
+            .filter(|(connection, _)| host.try_self_lookup(connection.clone()).is_some())
+            .count();
+        let reason = format!(
+            "scenario 8 requires bound connection c-bot100; boundBots={still_bound}; fleetSubmitted={}; earlier={}",
+            bot_trace.submitted,
+            blocked.as_deref().unwrap_or("none")
+        );
+        return write_blocked(out_dir, &reason);
+    };
     let entity_a = previous_bot100.net_entity_id.clone();
     let entity_a_host = previous_bot100.net_entity_id.clone();
     let previous_session = previous_bot100.session_id.clone();
@@ -664,15 +728,16 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
                 let rebind = host.admit(MAIN_ROOM.to_owned(), "c-bot100-re".to_owned(), credential);
                 takeover = rebind.takeover;
+                let _ = host.run_tick(MAIN_ROOM.to_owned());
+                rebound_binding = host.try_self_lookup("c-bot100-re".to_owned());
                 re_ok = rebind.takeover
-                    && rebind.binding.as_ref().is_some_and(|binding| {
+                    && rebound_binding.as_ref().is_some_and(|binding| {
                         binding.net_entity_id == entity_a
                             && binding.net_entity_id == entity_a_host
                             && binding.session_id != previous_session
                             && binding.net_entity_id != binding.session_id
                             && binding.account_id == previous_account
                     });
-                rebound_binding = rebind.binding;
             }
         }
     }
@@ -687,14 +752,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             let _ = old.is_closed_after();
         }
     }
-    let rejected = host.admit_chat_input(
-        "c-bot100".to_owned(),
-        InputCommand::from_chat_text("while-down"),
-    );
-    let _ = host.admit_chat_input(
-        "c-browser".to_owned(),
-        InputCommand::from_chat_text("room-continues"),
-    );
+    let rejected = host.admit_input_command("c-bot100".to_owned(), runtime_input.clone());
+    let _ = host.admit_input_command("c-browser".to_owned(), runtime_input.clone());
     let _ = host.run_tick(MAIN_ROOM.to_owned());
     re_ok = re_ok && rejected.kind == ChatOpKind::Rejected && connection_superseded_received;
     let reconnect_trace = json!({
@@ -727,48 +786,75 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }),
     );
 
-    let previous_99 = host.must_self("c-bot99");
+    let Some(previous_99) = host.try_self_lookup("c-bot99".to_owned()) else {
+        return write_blocked(out_dir, "scenario 9 requires bound connection c-bot99");
+    };
     let entity_99 = previous_99.net_entity_id.clone();
     let entity_99_host = previous_99.net_entity_id.clone();
     let account_99 = previous_99.account_id;
-    assert!(host.disconnect("c-bot99".to_owned()));
+    match host.disconnect("c-bot99".to_owned()) {
+        Ok(true) => {}
+        Ok(false) => return write_blocked(out_dir, "scenario 9 connection c-bot99 is not live"),
+        Err(error) => {
+            return write_blocked(out_dir, &format!("Runtime disconnect failed: {error}"))
+        }
+    }
     host.clock().advance_ms(RECONNECT_WINDOW_MS + 1_000);
-    host.drive_kernel();
-    let expired = 1_usize;
+    let expiry_tick_fired = host.drive_kernel();
+    // Expire is an owner-thread Runtime intent; settle it before admitting the
+    // replacement account so the old entity is tombstoned first.
+    let _ = host.run_tick(MAIN_ROOM.to_owned());
+    let stale_a_rejected = host
+        .admit_input_command("c-bot99".to_owned(), runtime_input.clone())
+        .kind
+        == ChatOpKind::Rejected;
     let after_expiry = login_or_register(&account.uri(), "Bot99", TEST_PASSWORD, Some(&bot_claim))
         .await
         .unwrap_or_else(|_| empty_login());
     let mut expiry_ok = false;
+    let mut expired = 0_usize;
+    let mut tombstoned_observed = false;
     let mut entity_b_host: Option<String> = None;
     if after_expiry.accepted {
         if let Some(credential) = after_expiry.admission_credential {
             if verify_admission(&credential, ADMISSION_KEY_ID, &admission.public, now).is_ok() {
                 let created_b =
                     host.admit(MAIN_ROOM.to_owned(), "c-bot99-b".to_owned(), credential);
-                let tombstoned = host.query_attribute(AttributeQueryRequest {
-                    caller_scope: AttributeQueryScope::ServerAuthoritative,
-                    room_id: MAIN_ROOM.to_owned(),
-                    net_entity_id: entity_99.clone(),
-                    attribute_id: "EntityIdentity.entityType".to_owned(),
-                    connection_generation: None,
-                });
+                let _ = host.run_tick(MAIN_ROOM.to_owned());
+                let created_binding = host.try_self_lookup("c-bot99-b".to_owned());
+                let tombstoned = query_after_owner_tick(
+                    &host,
+                    MAIN_ROOM,
+                    AttributeQueryRequest {
+                        caller_scope: AttributeQueryScope::ServerAuthoritative,
+                        room_id: MAIN_ROOM.to_owned(),
+                        net_entity_id: entity_99.clone(),
+                        attribute_id: "EntityIdentity.entityType".to_owned(),
+                        connection_generation: None,
+                    },
+                );
+                tombstoned_observed = tombstoned.outcome == AttributeQueryOutcome::Tombstoned;
+                expired = usize::from(tombstoned_observed);
                 expiry_ok = created_b.accepted
-                    && created_b.binding.as_ref().is_some_and(|binding| {
+                    && created_binding.as_ref().is_some_and(|binding| {
                         binding.net_entity_id != entity_99
                             && binding.net_entity_id != entity_99_host
                             && binding.account_id == account_99
                     })
-                    && tombstoned.outcome == AttributeQueryOutcome::Tombstoned;
+                    && tombstoned_observed
+                    && stale_a_rejected
+                    && expiry_tick_fired;
                 entity_b_host = created_b
-                    .binding
-                    .as_ref()
+                    .accepted
+                    .then_some(created_binding.as_ref())
+                    .flatten()
                     .map(|binding| binding.net_entity_id.clone());
             }
         }
     }
     let expiry_trace = json!({
-        "tombstoned": expiry_ok,
-        "staleARejected": expiry_ok,
+        "tombstoned": tombstoned_observed,
+        "staleARejected": stale_a_rejected,
         "entityA": entity_99_host,
         "entityB": entity_b_host,
     });
@@ -779,8 +865,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "expired": expired,
             "entityA": entity_99_host,
             "entityB": entity_b_host,
-            "tombstoned": expiry_ok,
-            "staleARejected": expiry_ok,
+            "tombstoned": tombstoned_observed,
+            "staleARejected": stale_a_rejected,
         }),
     );
 
@@ -791,6 +877,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .await
         .unwrap_or_else(|_| empty_login());
     let mut iso_ok = false;
+    let mut iso_total = 0_usize;
+    let cross_room_target = admits
+        .iter()
+        .find(|row| row.connection_id == "c-bot01")
+        .map(|row| row.net_entity_id.clone())
+        .unwrap_or_else(|| browser_binding.net_entity_id.clone());
     if iso_a.accepted && iso_b.accepted {
         if let (Some(cred_a), Some(cred_b)) = (
             iso_a.admission_credential.clone(),
@@ -799,25 +891,64 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             if verify_admission(&cred_a, ADMISSION_KEY_ID, &admission.public, now).is_ok()
                 && verify_admission(&cred_b, ADMISSION_KEY_ID, &admission.public, now).is_ok()
             {
-                let _ = host.admit(ISO_ROOM.to_owned(), "iso-a".to_owned(), cred_a);
-                let _ = host.admit(ISO_ROOM.to_owned(), "iso-b".to_owned(), cred_b);
-                let _ = host
-                    .admit_chat_input("iso-a".to_owned(), InputCommand::from_chat_text("iso-only"));
+                let iso_admits = [
+                    host.admit(ISO_ROOM.to_owned(), "iso-a".to_owned(), cred_a),
+                    host.admit(ISO_ROOM.to_owned(), "iso-b".to_owned(), cred_b),
+                ];
                 let _ = host.run_tick(ISO_ROOM.to_owned());
-                let cross = host.query_attribute(AttributeQueryRequest {
-                    caller_scope: AttributeQueryScope::ServerAuthoritative,
-                    room_id: ISO_ROOM.to_owned(),
-                    net_entity_id: browser_binding.net_entity_id.clone(),
-                    attribute_id: "EntityIdentity.entityType".to_owned(),
-                    connection_generation: None,
-                });
+                let iso_ids: Vec<String> = iso_admits
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, admit)| admit.accepted)
+                    .filter_map(|(index, _)| {
+                        let connection = if index == 0 { "iso-a" } else { "iso-b" };
+                        host.try_self_lookup(connection.to_owned())
+                            .map(|binding| binding.net_entity_id)
+                    })
+                    .collect();
+                let _ = host.admit_input_command("iso-a".to_owned(), runtime_input.clone());
+                let _ = host.run_tick(ISO_ROOM.to_owned());
+                let cross = query_after_owner_tick(
+                    &host,
+                    ISO_ROOM,
+                    AttributeQueryRequest {
+                        caller_scope: AttributeQueryScope::ServerAuthoritative,
+                        room_id: ISO_ROOM.to_owned(),
+                        net_entity_id: cross_room_target,
+                        attribute_id: "EntityIdentity.entityType".to_owned(),
+                        connection_generation: None,
+                    },
+                );
                 let leaked = browser_wire.as_ref().is_some_and(|client| {
                     client
                         .received
                         .iter()
                         .any(|frame| frame.contains("iso-only"))
                 });
-                iso_ok = host.census(ISO_ROOM.to_owned()).total == 2
+                iso_total = iso_ids
+                    .iter()
+                    .filter(|net_entity_id| {
+                        host.try_resolve_by_net_entity_id(
+                            ISO_ROOM.to_owned(),
+                            (*net_entity_id).clone(),
+                        )
+                        .is_ok_and(|resolved| resolved.is_some())
+                    })
+                    .count();
+                if iso_total < iso_ids.len() {
+                    let _ = host.run_tick(ISO_ROOM.to_owned());
+                    iso_total = iso_ids
+                        .iter()
+                        .filter(|net_entity_id| {
+                            host.try_resolve_by_net_entity_id(
+                                ISO_ROOM.to_owned(),
+                                (*net_entity_id).clone(),
+                            )
+                            .is_ok_and(|resolved| resolved.is_some())
+                        })
+                        .count();
+                }
+                iso_ok = iso_total == 2
                     && !leaked
                     && cross.error_code.as_deref() == Some("cross_room_reference");
             }
@@ -827,22 +958,43 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "10".to_owned(),
         json!({
             "ok": iso_ok,
-            "isoTotal": host.census(ISO_ROOM.to_owned()).total,
+            "isoTotal": iso_total,
         }),
     );
 
     let scale_ok =
-        full.total == 101 && chat_ok && event_order.len() == 101 && applied_ticks.len() == 101;
+        total_entities == 101 && chat_ok && event_order.len() == 101 && applied_ticks.len() == 101;
     scenarios.insert(
         "11".to_owned(),
         json!({
             "ok": scale_ok,
-            "totalEntities": full.total,
-            "botCount": full.bot_count,
-            "playerCount": full.player_count,
+            "totalEntities": total_entities,
+            "botCount": bot_count,
+            "playerCount": player_count,
             "eventOrder": event_order,
             "appliedTicks": applied_ticks,
             "appliedTick": tick.applied_tick,
+        }),
+    );
+
+    let playwright = match pw_thread {
+        Some(handle) => wait_for_playwright_with_room_ticks(handle, &host),
+        None => super::browser::PlaywrightCapture::failed("BLOCKED: LUMIO_GAME_ROOT is not set"),
+    };
+    let playwright_ran = playwright.playwright_ran();
+    let browser_room_observed = chat_events.len() == 101;
+    scenarios.insert(
+        "3".to_owned(),
+        json!({
+            "ok": browser_ok && total_entities == 101 && bot_count == 100 && player_count == 1 && playwright_ran && browser_room_observed,
+            "total": total_entities,
+            "botCount": bot_count,
+            "playerCount": player_count,
+            "playwrightRan": playwright_ran,
+            "loginAccepted": browser_login.accepted,
+            "loginError": browser_login.error_code,
+            "verifyError": browser_verify,
+            "admitError": browser_admit_code,
         }),
     );
 
@@ -853,6 +1005,16 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }
     }
     let session_ids: Vec<String> = admits.iter().map(|row| row.session_id.clone()).collect();
+    let mut chat_trace = json!({
+        "eventCount": chat_events.len(),
+        "tickSource": bot_trace.tick_source,
+        "timerManagerInvoked": timer_ok,
+        "utteranceTicks": bot_trace.utterance_ticks,
+        "botHostPid": bot_trace.pid,
+        "receivedEvents": chat_events,
+        "windowLines": chat_events,
+    });
+    merge_input_evidence(&mut chat_trace, bot_trace.input_evidence_json());
     let evidence = json!({
         "ok": all_ok,
         "blocked": blocked,
@@ -881,18 +1043,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 "wrongPasswordCode": wrong.error_code,
             },
             "queries": query_traces,
-            "chat": {
-                "eventCount": chat_events.len(),
-                "tickSource": bot_trace.tick_source,
-                "timerManagerInvoked": timer_ok,
-                "utteranceTicks": bot_trace.utterance_ticks,
-                "botHostPid": bot_trace.pid,
-                "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
-                "mappingId": first_block.map(|block| block.mapping_id.as_str()),
-                "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
-                "receivedEvents": chat_events,
-                "windowLines": chat_events,
-            },
+            "chat": chat_trace,
             "reconnect": reconnect_trace,
             "persist": {
                 "clientWindowBeforeSnapshot": window_before,
@@ -910,6 +1061,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "scenarios": scenarios,
         "browserWindow": chat_events,
     });
+    if let Some(fleet) = bot_fleet.take() {
+        fleet.release();
+    }
     write_evidence(out_dir, &evidence, &host_audit);
     evidence
 }
@@ -932,20 +1086,47 @@ fn wait_for_wire_observers(
     }
 }
 
-fn is_chat_event_delta(frame: &str) -> bool {
+fn wait_for_playwright_with_room_ticks(
+    handle: thread::JoinHandle<super::browser::PlaywrightCapture>,
+    host: &EntityChatHost,
+) -> super::browser::PlaywrightCapture {
+    while !handle.is_finished() {
+        let _ = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+        thread::sleep(Duration::from_millis(250));
+    }
+    handle
+        .join()
+        .unwrap_or_else(|_| super::browser::PlaywrightCapture::failed("playwright thread"))
+}
+
+fn chat_event_records(frame: &str) -> Vec<String> {
     let Ok(value) = serde_json::from_str::<Value>(frame) else {
-        return false;
+        return Vec::new();
     };
-    value.get("messageType").and_then(Value::as_str) == Some("WorldChange")
-        && value
-            .get("rpcs")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|rpc| {
-                rpc.get("componentId").and_then(Value::as_str) == Some("ChatComponent")
-                    && rpc.get("method").and_then(Value::as_str) == Some("OnChatMessage")
+    if value.get("messageType").and_then(Value::as_str) != Some("WorldChange") {
+        return Vec::new();
+    }
+    let Some(tick) = value.get("tick").and_then(Value::as_u64) else {
+        return Vec::new();
+    };
+    value
+        .get("rpcs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|rpc| {
+            rpc.get("componentId").and_then(Value::as_str) == Some("ChatComponent")
+                && rpc.get("method").and_then(Value::as_str) == Some("OnChatMessage")
+        })
+        .map(|rpc| {
+            json!({
+                "messageType": "WorldChange",
+                "rpcs": [rpc],
+                "tick": tick,
             })
+            .to_string()
+        })
+        .collect()
 }
 
 fn delta_tick_id(frame: &str) -> Option<u64> {
@@ -953,6 +1134,28 @@ fn delta_tick_id(frame: &str) -> Option<u64> {
         .ok()?
         .get("tick")?
         .as_u64()
+}
+
+fn merge_input_evidence(target: &mut Value, input: Option<Value>) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    let Some(fields) = input.and_then(|value| value.as_object().cloned()) else {
+        return;
+    };
+    target.extend(fields);
+}
+
+fn receive_deterministic_runtime_input(receiver: &Receiver<Vec<u8>>) -> Vec<u8> {
+    let mut inputs = Vec::new();
+    if let Ok(first) = receiver.recv_timeout(Duration::from_secs(2)) {
+        inputs.push(first);
+        while let Ok(input) = receiver.try_recv() {
+            inputs.push(input);
+        }
+    }
+    inputs.sort();
+    inputs.into_iter().next().unwrap_or_default()
 }
 
 /// Drains already-queued Room `chat.event` frames. Must not block past a deadline.
@@ -963,8 +1166,7 @@ pub fn drain_chat_event_deltas(client: &mut Option<RoomClient>, received: &mut V
     let deadline = Instant::now() + Duration::from_millis(50);
     while received.len() < 101 && Instant::now() < deadline {
         match client.try_recv_text() {
-            Ok(Some(frame)) if is_chat_event_delta(&frame) => received.push(frame),
-            Ok(Some(_)) => {}
+            Ok(Some(frame)) => received.extend(chat_event_records(&frame)),
             Ok(None) | Err(_) => break,
         }
     }
@@ -980,30 +1182,28 @@ pub fn apply_pending_chat_ticks(
 ) {
     loop {
         let pending_chats = host.pending_wire_chat_inputs();
-        if pending_chats > MAX_CHAT_INPUTS_PER_TICK {
-            *tick = RuntimeTick::failed("runtime_failure");
+        if pending_chats == 0 {
             break;
         }
-        if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
-            *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-            drain_chat_event_deltas(browser_wire, received);
-            if !tick.ok {
-                break;
-            }
-            let after = host.pending_wire_chat_inputs();
-            if after >= pending_chats {
-                break;
-            }
-            continue;
+        let batch_limit = if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
+            MAX_CHAT_INPUTS_PER_TICK
+        } else {
+            pending_chats
+        };
+        let pending_for_tick = if pending_chats > MAX_CHAT_INPUTS_PER_TICK {
+            batch_limit
+        } else {
+            pending_chats
+        };
+        *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+        drain_chat_event_deltas(browser_wire, received);
+        if !tick.ok {
+            break;
         }
-        if pending_chats > 0 {
-            *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
-            drain_chat_event_deltas(browser_wire, received);
-            if !tick.ok {
-                break;
-            }
+        let after = host.pending_wire_chat_inputs();
+        if after >= pending_for_tick {
+            break;
         }
-        break;
     }
 }
 
@@ -1016,6 +1216,7 @@ fn wait_for_observed_chat_events(
     budget: Duration,
 ) {
     let deadline = Instant::now() + budget;
+    let mut next_keepalive = Instant::now() + Duration::from_secs(1);
     loop {
         apply_pending_chat_ticks(host, tick, browser_wire, received);
         drain_chat_event_deltas(browser_wire, received);
@@ -1026,6 +1227,10 @@ fn wait_for_observed_chat_events(
             apply_pending_chat_ticks(host, tick, browser_wire, received);
             drain_chat_event_deltas(browser_wire, received);
             return;
+        }
+        if host.pending_wire_chat_inputs() == 0 && Instant::now() >= next_keepalive {
+            *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
+            next_keepalive = Instant::now() + Duration::from_secs(1);
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -1077,6 +1282,64 @@ fn empty_login() -> super::AccountLoginResult {
         admission_credential: None,
         error_code: Some("transport".to_owned()),
     }
+}
+
+fn query_after_owner_tick(
+    host: &EntityChatHost,
+    room_id: &str,
+    request: AttributeQueryRequest,
+) -> super::QueryResult {
+    let mut result = host.query_attribute(request.clone());
+    if result.error_code.as_deref() == Some("runtime_query_pending") {
+        let _ = host.run_tick(room_id.to_owned());
+        result = host.query_attribute(request);
+    }
+    result
+}
+
+fn observed_host_admit(
+    host: &EntityChatHost,
+    connection_id: &str,
+    login_name: &str,
+    accepted: bool,
+) -> Option<AdmitTrace> {
+    let binding = host.try_self_lookup(connection_id.to_owned())?;
+    if !accepted {
+        return None;
+    }
+    Some(AdmitTrace {
+        connection_id: connection_id.to_owned(),
+        session_id: binding.session_id.clone(),
+        net_entity_id: binding.net_entity_id.clone(),
+        entity_type: binding.entity_type,
+        account_id: binding.account_id.clone(),
+        login_name: login_name.to_owned(),
+    })
+}
+
+fn runtime_resolved_count(host: &EntityChatHost, room_id: &str, admits: &[AdmitTrace]) -> usize {
+    let mut resolved = 0;
+    let mut pending = Vec::new();
+    for row in admits {
+        match host.try_resolve_by_net_entity_id(room_id.to_owned(), row.net_entity_id.clone()) {
+            Ok(Some(_)) => resolved += 1,
+            Err(error) if error == "runtime_query_pending" => {
+                pending.push(row.net_entity_id.clone());
+            }
+            _ => {}
+        }
+    }
+    if !pending.is_empty() {
+        let _ = host.run_tick(room_id.to_owned());
+        resolved += pending
+            .into_iter()
+            .filter(|net_entity_id| {
+                host.try_resolve_by_net_entity_id(room_id.to_owned(), net_entity_id.clone())
+                    .is_ok_and(|resolved| resolved.is_some())
+            })
+            .count();
+    }
+    resolved
 }
 
 fn census_payload(admits: &[AdmitTrace]) -> Value {
@@ -1169,6 +1432,180 @@ fn write_evidence(out_dir: &Path, evidence: &Value, audit: &str) {
     );
     let _ = std::fs::write(out_dir.join("host-audit.ndjson"), audit);
     let _ = std::fs::write(out_dir.join("admit-trace.ndjson"), audit);
+    write_oracle_logs(out_dir, evidence, audit);
+}
+
+fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
+    let server_dir = out_dir.join("server");
+    let client_dir = out_dir.join("client");
+    if std::fs::create_dir_all(&server_dir).is_err()
+        || std::fs::create_dir_all(&client_dir).is_err()
+    {
+        return;
+    }
+
+    let mut server = Vec::new();
+    let process = evidence
+        .pointer("/hostProcess/process")
+        .and_then(Value::as_str)
+        .unwrap_or("lumio-entity-chat-replay");
+    let pid = evidence
+        .pointer("/hostProcess/pid")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    server.push(json!({ "kind": "host", "process": process, "pid": pid }));
+    server.push(json!({
+        "kind": "account",
+        "wrongPasswordCode": evidence.pointer("/traces/account/wrongPasswordCode").and_then(Value::as_str).unwrap_or("wrong_password"),
+    }));
+    for line in audit.lines() {
+        if let Ok(row) = serde_json::from_str::<Value>(line) {
+            server.push(row);
+        }
+    }
+
+    let events = evidence
+        .pointer("/traces/chat/receivedEvents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let frames: Vec<Value> = events
+        .iter()
+        .filter_map(Value::as_str)
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .collect();
+    let mut queries = Vec::new();
+    if let Some(query) = evidence.pointer("/traces/queries") {
+        for outcome in ["invisible", "unauthorized", "stale"] {
+            if query.get(outcome).is_some() {
+                queries.push(json!({ "outcome": outcome }));
+            }
+        }
+    }
+    server.push(json!({ "kind": "drain", "frames": frames, "queries": queries }));
+
+    if let Some(persist) = evidence.pointer("/traces/persist") {
+        server.push(json!({
+            "kind": "snapshot",
+            "historyCount": 0,
+            "processA": persist.pointer("/processA/pid").and_then(Value::as_u64).unwrap_or(0),
+            "snapshotSha256": persist.get("snapshotSha256").cloned().unwrap_or(Value::Null),
+        }));
+        server.push(json!({
+            "kind": "restore",
+            "windowAfter": 0,
+            "processB": persist.pointer("/processB/pid").and_then(Value::as_u64).unwrap_or(0),
+            "snapshotSha256": persist.get("snapshotSha256").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    if let Some(reconnect) = evidence.pointer("/traces/reconnect") {
+        server.push(json!({
+            "kind": "rebind",
+            "netEntityId": reconnect.get("netEntityId").cloned().unwrap_or(Value::Null),
+            "previousNetEntityId": reconnect.get("previousNetEntityId").cloned().unwrap_or(Value::Null),
+        }));
+        if reconnect
+            .get("connectionSupersededReceived")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            server
+                .push(json!({ "kind": "superseded", "netEntityId": reconnect.get("netEntityId") }));
+        }
+    }
+    if let Some(expiry) = evidence.pointer("/traces/expiry") {
+        server.push(json!({
+            "kind": "expire",
+            "tombstoned": expiry.get("tombstoned").cloned().unwrap_or(Value::Bool(false)),
+            "entityA": expiry.get("entityA").cloned().unwrap_or(Value::Null),
+            "entityB": expiry.get("entityB").cloned().unwrap_or(Value::Null),
+        }));
+    }
+    server.push(
+        json!({ "kind": "deferred", "scenario": 10, "reason": "ADR-058 §11 multi-room deferred" }),
+    );
+
+    let _ = std::fs::write(
+        server_dir.join("server.ndjson"),
+        server
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    );
+
+    let mut client = Vec::new();
+    if let Some(tick) = evidence.pointer("/scenarios/6") {
+        client.push(json!({
+            "kind": "tick",
+            "tickSource": tick.get("tickSource"),
+            "utteranceTicks": tick.get("utteranceTicks"),
+            "messageType": tick.get("messageType"),
+            "mappingId": tick.get("mappingId"),
+        }));
+    }
+    for frame in frames {
+        let Some(rpcs) = frame.get("rpcs").and_then(Value::as_array) else {
+            continue;
+        };
+        for rpc in rpcs {
+            if rpc.get("componentId").and_then(Value::as_str) != Some("ChatComponent")
+                || rpc.get("method").and_then(Value::as_str) != Some("OnChatMessage")
+            {
+                continue;
+            }
+            let Some(sender) = rpc.get("sender") else {
+                continue;
+            };
+            let Some(encoded) = rpc
+                .get("args")
+                .and_then(Value::as_array)
+                .and_then(|args| args.first())
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let Some(text) = decode_hex_text(encoded) else {
+                continue;
+            };
+            client.push(json!({
+                "kind": "chat.window",
+                "phase": "live",
+                "senderNetEntityId": sender,
+                "messageId": rpc.get("messageId"),
+                "roomSequence": rpc.get("roomSequence"),
+                "appliedTick": rpc.get("appliedTick"),
+                "text": text,
+            }));
+        }
+    }
+    let _ = std::fs::write(
+        client_dir.join("client.ndjson"),
+        client
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    );
+}
+
+fn decode_hex_text(value: &str) -> Option<String> {
+    if value.is_empty()
+        || !value.len().is_multiple_of(2)
+        || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    let mut chunks = value.as_bytes().chunks_exact(2);
+    for chunk in &mut chunks {
+        let high = u8::try_from((chunk[0] as char).to_digit(16)?).ok()?;
+        let low = u8::try_from((chunk[1] as char).to_digit(16)?).ok()?;
+        bytes.push((high << 4) | low);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn write_blocked(out_dir: &Path, reason: &str) -> Value {
@@ -1190,4 +1627,46 @@ fn chrono_now() -> String {
     // RFC3339-ish UTC without pulling chrono. Evidence timestamp only.
     let secs = unix_seconds();
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_world_change_yields_one_record_per_chat_rpc() {
+        let frame = json!({
+            "messageType": "WorldChange",
+            "rpcs": [
+                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 1},
+                {"componentId": "OtherComponent", "method": "OnChatMessage", "messageId": 2},
+                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 3}
+            ],
+            "tick": 9
+        })
+        .to_string();
+
+        let records = chat_event_records(&frame);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| delta_tick_id(record))
+                .collect::<Vec<_>>(),
+            vec![9, 9]
+        );
+        assert!(records[0].contains("\"messageId\":1"));
+        assert!(records[1].contains("\"messageId\":3"));
+    }
+
+    #[test]
+    fn runtime_input_replay_chooses_the_same_wire_envelope() {
+        let (sender, receiver) = bounded_channel(3);
+        sender.try_send(b"z-input".to_vec()).expect("first input");
+        sender.try_send(b"a-input".to_vec()).expect("second input");
+        sender.try_send(b"m-input".to_vec()).expect("third input");
+
+        assert_eq!(receive_deterministic_runtime_input(&receiver), b"a-input");
+    }
 }

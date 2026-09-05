@@ -1,36 +1,103 @@
 //! Loopback WebSocket Room wire. Bytes on the socket are Runtime/C-1 JSON.
 
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use lumio_host_runtime::{bounded_channel, spawn_supervised, CancelToken, Sender, SupervisedTask};
+use lumio_host_runtime::{
+    bounded_channel, spawn_supervised, CancelToken, RecvError, SendError, Sender, SupervisedTask,
+};
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+use tokio_tungstenite::tungstenite::http::header::SEC_WEBSOCKET_PROTOCOL;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::WebSocket;
 use tokio_tungstenite::tungstenite::stream::MaybeTlsStream;
-use tokio_tungstenite::tungstenite::{accept, client::connect as ws_connect, Message};
+use tokio_tungstenite::tungstenite::{accept_hdr, client::connect as ws_connect, Message};
+
+pub const MAX_WIRE_TEXT_BYTES: usize = 65_536;
 
 /// Egress to one accepted socket.
 #[derive(Clone)]
 pub struct WireSender {
     inner: Sender<WireOut>,
+    cancel: CancelToken,
+    observer_id: u64,
 }
 
 #[derive(Debug, Clone)]
 pub enum WireOut {
-    Text(String),
+    Text(Vec<u8>),
     Close,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireSendError {
+    Full,
+    Closed,
+    TooLarge,
+    InvalidUtf8,
+}
+
 impl WireSender {
-    #[must_use]
-    pub fn send_text(&self, text: String) -> bool {
-        self.inner.send(WireOut::Text(text)).is_ok()
+    pub fn try_send_text(&self, text: String) -> Result<(), WireSendError> {
+        self.try_send_bytes(text.as_bytes())
     }
 
-    #[must_use]
-    pub fn close(&self) -> bool {
-        self.inner.send(WireOut::Close).is_ok()
+    pub fn try_send_bytes(&self, bytes: &[u8]) -> Result<(), WireSendError> {
+        if bytes.len() > MAX_WIRE_TEXT_BYTES {
+            return Err(WireSendError::TooLarge);
+        }
+        std::str::from_utf8(bytes).map_err(|_| WireSendError::InvalidUtf8)?;
+        self.inner
+            .try_send(WireOut::Text(bytes.to_vec()))
+            .map_err(map_send_error)
+    }
+
+    pub fn try_close(&self) -> Result<(), WireSendError> {
+        match self.inner.try_send(WireOut::Close) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let error = map_send_error(error);
+                self.cancel.cancel();
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn try_close_ordered(&self) -> Result<(), WireSendError> {
+        self.inner.try_send(WireOut::Close).map_err(map_send_error)
+    }
+
+    pub(crate) fn observer_id(&self) -> u64 {
+        self.observer_id
+    }
+
+    pub(crate) fn abort(&self) {
+        self.cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_sender_pair(
+    capacity: usize,
+) -> (WireSender, lumio_host_runtime::Receiver<WireOut>) {
+    let (inner, receiver) = bounded_channel(capacity);
+    (
+        WireSender {
+            inner,
+            cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        },
+        receiver,
+    )
+}
+
+fn map_send_error(error: SendError<WireOut>) -> WireSendError {
+    match error {
+        SendError::Full(_) => WireSendError::Full,
+        SendError::Closed(_) => WireSendError::Closed,
     }
 }
 
@@ -46,8 +113,11 @@ pub enum WireEvent {
     },
     Closed {
         connection_id: String,
+        observer_id: u64,
     },
 }
+
+static NEXT_OBSERVER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Loopback listener. Handshake is blocking; frames are polled.
 pub struct RoomListener {
@@ -102,16 +172,30 @@ impl RoomListener {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelToken) {
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let mut ws = match accept(stream) {
+    let mut ws = match accept_hdr(stream, |request: &Request, mut response: Response| {
+        let offers_mvp = request
+            .headers()
+            .get(SEC_WEBSOCKET_PROTOCOL)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.split(',').any(|item| item.trim() == "lumio.mvp.v0"));
+        if offers_mvp {
+            response.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static("lumio.mvp.v0"),
+            );
+        }
+        Ok(response)
+    }) {
         Ok(ws) => ws,
         Err(_) => return,
     };
     let first = match ws.read() {
-        Ok(Message::Text(text)) => text,
+        Ok(Message::Text(text)) if is_wire_text_size_valid(&text) => text,
         _ => return,
     };
     let connection_id = match parse_connection_id(&first) {
@@ -119,7 +203,12 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         None => return,
     };
     let (out_tx, out_rx) = bounded_channel(64);
-    let egress = WireSender { inner: out_tx };
+    let egress = WireSender {
+        inner: out_tx,
+        cancel: cancel.clone(),
+        observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+    };
+    let observer_id = egress.observer_id();
     if event_tx
         .send(WireEvent::Attached {
             connection_id: connection_id.clone(),
@@ -137,7 +226,11 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
             break;
         }
         match out_rx.try_recv() {
-            Ok(WireOut::Text(text)) => {
+            Ok(WireOut::Text(bytes)) => {
+                let Ok(text) = String::from_utf8(bytes) else {
+                    let _ = ws.close(None);
+                    break;
+                };
                 if ws.send(Message::Text(text.into())).is_err() {
                     break;
                 }
@@ -146,10 +239,11 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
                 let _ = ws.close(None);
                 break;
             }
-            Err(_) => {}
+            Err(RecvError::Empty) => {}
+            Err(RecvError::Closed) => break,
         }
         match ws.read() {
-            Ok(Message::Text(text)) => {
+            Ok(Message::Text(text)) if is_wire_text_size_valid(&text) => {
                 if event_tx
                     .send(WireEvent::Input {
                         connection_id: connection_id.clone(),
@@ -159,6 +253,10 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
                 {
                     break;
                 }
+            }
+            Ok(Message::Text(_)) => {
+                let _ = ws.close(None);
+                break;
             }
             Ok(Message::Close(_)) => break,
             Ok(Message::Ping(payload)) => {
@@ -170,7 +268,10 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         }
         thread::sleep(Duration::from_millis(5));
     }
-    let _ = event_tx.send(WireEvent::Closed { connection_id });
+    let _ = event_tx.send(WireEvent::Closed {
+        connection_id,
+        observer_id,
+    });
 }
 
 fn is_would_block(error: &tokio_tungstenite::tungstenite::Error) -> bool {
@@ -188,6 +289,10 @@ fn parse_connection_id(text: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
+}
+
+fn is_wire_text_size_valid(text: &str) -> bool {
+    text.as_bytes().len() <= MAX_WIRE_TEXT_BYTES
 }
 
 /// Test/harness client that actually receives frames.
@@ -298,5 +403,140 @@ impl RoomClient {
     #[must_use]
     pub fn is_closed_after(&mut self) -> bool {
         matches!(self.ws.read(), Ok(Message::Close(_)) | Err(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_sender_reports_full_without_blocking() {
+        let (tx, _rx) = bounded_channel(1);
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        };
+        sender
+            .try_send_text("first".to_owned())
+            .expect("first slot");
+
+        assert_eq!(
+            sender.try_send_text("second".to_owned()),
+            Err(WireSendError::Full)
+        );
+    }
+
+    #[test]
+    fn wire_sender_reports_closed_receiver() {
+        let (tx, rx) = bounded_channel(1);
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        };
+        drop(rx);
+
+        assert_eq!(
+            sender.try_send_text("frame".to_owned()),
+            Err(WireSendError::Closed)
+        );
+    }
+
+    #[test]
+    fn wire_sender_close_reports_full_without_blocking() {
+        let (tx, _rx) = bounded_channel(1);
+        let cancel = CancelToken::new();
+        let sender = WireSender {
+            inner: tx,
+            cancel: cancel.clone(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        };
+        sender
+            .try_send_text("frame".to_owned())
+            .expect("first slot");
+
+        assert_eq!(sender.try_close(), Err(WireSendError::Full));
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn wire_sender_close_reports_closed_receiver() {
+        let (tx, rx) = bounded_channel(1);
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        };
+        drop(rx);
+
+        assert_eq!(sender.try_close(), Err(WireSendError::Closed));
+    }
+
+    #[test]
+    fn wire_sender_accepts_exact_text_byte_limit() {
+        let (tx, rx) = bounded_channel(1);
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        };
+
+        sender
+            .try_send_bytes(&vec![b'a'; MAX_WIRE_TEXT_BYTES])
+            .expect("exact limit");
+        assert!(matches!(rx.recv(), Ok(WireOut::Text(text)) if text.len() == MAX_WIRE_TEXT_BYTES));
+    }
+
+    #[test]
+    fn wire_sender_rejects_text_over_byte_limit() {
+        let (tx, _rx) = bounded_channel(1);
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        };
+
+        assert_eq!(
+            sender.try_send_bytes(&vec![b'a'; MAX_WIRE_TEXT_BYTES + 1]),
+            Err(WireSendError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn wire_sender_rejects_invalid_utf8() {
+        let (tx, _rx) = bounded_channel(1);
+        let sender = WireSender {
+            inner: tx,
+            cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
+        };
+
+        assert_eq!(
+            sender.try_send_bytes(&[0xff]),
+            Err(WireSendError::InvalidUtf8)
+        );
+    }
+
+    #[test]
+    fn inbound_wire_text_accepts_exact_byte_limit() {
+        assert!(is_wire_text_size_valid(&"a".repeat(MAX_WIRE_TEXT_BYTES)));
+    }
+
+    #[test]
+    fn inbound_wire_text_rejects_over_byte_limit() {
+        assert!(!is_wire_text_size_valid(
+            &"a".repeat(MAX_WIRE_TEXT_BYTES + 1)
+        ));
+    }
+
+    #[test]
+    fn inbound_wire_text_limit_counts_utf8_bytes() {
+        let exact = "é".repeat(MAX_WIRE_TEXT_BYTES / 2);
+        let over = format!("{exact}é");
+        assert_eq!(exact.as_bytes().len(), MAX_WIRE_TEXT_BYTES);
+        assert!(is_wire_text_size_valid(&exact));
+        assert!(!is_wire_text_size_valid(&over));
     }
 }

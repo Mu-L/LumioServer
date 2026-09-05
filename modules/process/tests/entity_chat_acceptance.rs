@@ -123,6 +123,11 @@ fn assert_identical_suite_stamps(evidence: &Value) {
         );
     }
 
+    assert_persist_evidence(evidence);
+}
+
+fn assert_persist_evidence(evidence: &Value) {
+    let empty = json!({});
     let s7 = evidence.pointer("/scenarios/7").unwrap_or(&empty);
     let source = s7
         .get("snapshotSource")
@@ -140,8 +145,12 @@ fn assert_identical_suite_stamps(evidence: &Value) {
             .unwrap_or(0)
             > 0
     );
-    assert_eq!(s7.get("historyCountMax").and_then(Value::as_i64), Some(0));
+    assert!(
+        s7.get("historyCountMax").is_none(),
+        "S7 must not publish a fabricated Runtime history maximum"
+    );
     if s7.get("ok") == Some(&Value::Bool(true)) {
+        assert_eq!(s7.get("historyCount").and_then(Value::as_u64), Some(0));
         assert_eq!(s7.get("restoredWindow").and_then(Value::as_u64), Some(0));
         let persist = evidence.pointer("/traces/persist").unwrap_or(&empty);
         let pid_a = persist
@@ -162,6 +171,28 @@ fn assert_identical_suite_stamps(evidence: &Value) {
             .unwrap_or("");
         assert_eq!(sha.len(), 64, "S7 ok requires snapshot file sha256");
     }
+}
+
+fn assert_input_evidence(value: &Value, label: &str) {
+    assert_eq!(
+        value.get("messageType").and_then(Value::as_str),
+        Some("InputCommand"),
+        "{label} messageType"
+    );
+    assert_eq!(
+        value.get("mappingId").and_then(Value::as_str),
+        Some("chat.input"),
+        "{label} mappingId"
+    );
+    let sha = value
+        .get("payloadSha256")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert_eq!(sha.len(), 64, "{label} payloadSha256");
+    assert!(
+        sha.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "{label} payloadSha256 must be lowercase hex"
+    );
 }
 
 fn is_launcher_loop_index(id: &str) -> bool {
@@ -275,21 +306,14 @@ fn assert_round_shape(round_dir: &Path, evidence: &Value) {
         assert!(s5_blob.contains(needed), "S5 missing {needed}");
     }
 
-    let s6 = evidence.pointer("/scenarios/6").unwrap_or(&empty);
-    assert_eq!(
-        s6.get("messageType").and_then(Value::as_str),
-        Some("InputCommand")
+    assert_input_evidence(
+        evidence.pointer("/scenarios/6").unwrap_or(&empty),
+        "scenario 6",
     );
-    assert_eq!(
-        s6.get("mappingId").and_then(Value::as_str),
-        Some("chat.input")
+    assert_input_evidence(
+        evidence.pointer("/traces/chat").unwrap_or(&empty),
+        "traces.chat",
     );
-    let sha = s6
-        .get("payloadSha256")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    assert_eq!(sha.len(), 64, "payloadSha256");
-    assert!(sha.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
 
     let s8 = evidence.pointer("/scenarios/8").cloned().unwrap_or(empty);
     let reconnect = evidence

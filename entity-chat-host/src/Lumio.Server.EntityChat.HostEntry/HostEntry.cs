@@ -27,6 +27,11 @@ public static class HostEntry
     private static Type? EcsRegistryType;
     private static object? Bindings;
     private static object? Manager;
+    // A BufferTooSmall response must be replayed without executing the operation
+    // again. DrainOutbox and CaptureSnapshot are destructive/read-once calls.
+    private static byte[]? PendingResponse;
+    private static byte[]? PendingRequest;
+    private static int PendingCode;
 
     [UnmanagedCallersOnly(EntryPoint = "lumio_entity_chat_entry")]
     public static unsafe int LumioEntityChatEntry(byte* input, int inputLength, byte* output, int outputCapacity, int* bytesWritten)
@@ -34,25 +39,62 @@ public static class HostEntry
         if (bytesWritten is null) return EntryInvalidInput;
         bytesWritten[0] = 0;
         if (inputLength < 0 || outputCapacity < 0 || (inputLength > 0 && input is null) || (outputCapacity > 0 && output is null)) return EntryInvalidInput;
-        int code;
-        byte[] response;
-        try { (code, response) = Execute(input, inputLength); }
-        catch (Exception) { code = EntryRuntimeFailure; response = Fail("runtime_failure"); }
-        if (response.Length > outputCapacity)
+        byte[] request = new ReadOnlySpan<byte>(input, inputLength).ToArray();
+        lock (Gate)
         {
+            int code;
+            byte[] response;
+            bool preservePending = false;
+            if (PendingResponse is not null && PendingRequest is not null)
+            {
+                if (PendingRequest.AsSpan().SequenceEqual(request))
+                {
+                    code = PendingCode;
+                    response = PendingResponse;
+                    PendingResponse = null;
+                    PendingRequest = null;
+                    PendingCode = EntrySuccess;
+                }
+                else
+                {
+                    // A different request must not consume a read-once
+                    // response. The caller can retry the exact request after
+                    // observing this boundary error.
+                    code = EntryInvalidInput;
+                    response = Fail("pending_response");
+                    preservePending = true;
+                }
+            }
+            else
+            {
+                try { (code, response) = Execute(request); }
+                catch (Exception) { code = EntryRuntimeFailure; response = Fail("runtime_failure"); }
+            }
+
+            if (response.Length > outputCapacity)
+            {
+                if (preservePending)
+                {
+                    bytesWritten[0] = response.Length;
+                    return EntryBufferTooSmall;
+                }
+                PendingResponse = response;
+                PendingRequest = request;
+                PendingCode = code;
+                bytesWritten[0] = response.Length;
+                return EntryBufferTooSmall;
+            }
+            response.AsSpan().CopyTo(new Span<byte>(output, response.Length));
             bytesWritten[0] = response.Length;
-            return EntryBufferTooSmall;
+            return code;
         }
-        response.AsSpan().CopyTo(new Span<byte>(output, response.Length));
-        bytesWritten[0] = response.Length;
-        return code;
     }
 
-    private static unsafe (int, byte[]) Execute(byte* input, int inputLength)
+    private static (int, byte[]) Execute(byte[] input)
     {
         try
         {
-            using JsonDocument document = JsonDocument.Parse(new ReadOnlySpan<byte>(input, inputLength).ToArray());
+            using JsonDocument document = JsonDocument.Parse(input);
             return Dispatch(document.RootElement);
         }
         catch (JsonException) { return (EntryInvalidInput, Fail("bad_envelope")); }
@@ -100,7 +142,6 @@ public static class HostEntry
         Manager = ManagerType.GetMethod("Create", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { registry, instanceId });
         ManagerType.GetMethod("Start", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
-        AttachBindingAdapter();
         return Manager is null || Bindings is null ? (EntrySuccess, Fail("boot_failed")) : (EntrySuccess, Ok());
     }
 
@@ -154,7 +195,7 @@ public static class HostEntry
 
     private static object CreateWorldMessage(string messageType, JsonElement root)
     {
-        string type = messageType.EndsWith("Message", StringComparison.Ordinal) ? messageType : messageType + "Message";
+        string type = messageType;
         if (type == "AdmitConnectionMessage")
         {
             return NewMessage(type,
@@ -280,31 +321,37 @@ public static class HostEntry
     private static (int, byte[]) Restore(JsonElement root)
     {
         if (!TryString(root, "bytesBase64", out string? encoded)) return (EntrySuccess, Fail("invalid_request"));
+        string roomId = OptionalString(root, "roomId") ?? string.Empty;
+        var previousConnections = SnapshotConnections();
         object restored = ManagerType!.GetMethod("CreateFromSnapshot", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { new ReadOnlyMemory<byte>(Convert.FromBase64String(encoded!)) })!;
         Manager = restored;
         ManagerType.GetMethod("Start")!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
         Bindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
-        AttachBindingAdapter();
+        if (!string.IsNullOrEmpty(roomId))
+        {
+            BindingType.GetMethod("RestoreRoomBindings", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Bindings, new object?[] { roomId });
+            MethodInfo restoreConnection = BindingType.GetMethod("RestoreConnection", BindingFlags.Public | BindingFlags.Instance)!;
+            Type stateType = restoreConnection.GetParameters()[0].ParameterType;
+            foreach (object state in previousConnections)
+            {
+                object? converted = stateType.GetConstructor(new[] { typeof(string), state.GetType().GetProperty("Binding")!.PropertyType })?.Invoke(new[] { state.GetType().GetProperty("Connection")!.GetValue(state), state.GetType().GetProperty("Binding")!.GetValue(state) });
+                if (converted is not null) restoreConnection.Invoke(Bindings, new[] { converted });
+            }
+        }
         return (EntrySuccess, Ok());
     }
 
-    private static object NewMessage(string typeName, params object?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;
-    private static void AttachBindingAdapter()
+    private static List<object> SnapshotConnections()
     {
-        MethodInfo attach = ManagerType!.GetMethod("AttachControlAdapter", BindingFlags.Public | BindingFlags.Instance)
-            ?? throw new MissingMethodException(ManagerType.FullName, "AttachControlAdapter");
-        try
-        {
-            attach.Invoke(Manager, new[] { Bindings });
-        }
-        catch (TargetInvocationException error)
-            when (error.InnerException is InvalidOperationException duplicate &&
-                duplicate.Message.Contains("already has a control adapter", StringComparison.Ordinal))
-        {
-            // EntityBindingQuery attaches itself on newer Runtime builds; keep the explicit
-            // HostEntry attachment for older builds while retaining that adapter instance.
-        }
+        var result = new List<object>();
+        if (Bindings is null || BindingType is null) return result;
+        MethodInfo? snapshot = BindingType.GetMethod("SnapshotConnections", BindingFlags.Public | BindingFlags.Instance);
+        if (snapshot?.Invoke(Bindings, null) is not IEnumerable rows) return result;
+        foreach (object row in rows) result.Add(row);
+        return result;
     }
+
+    private static object NewMessage(string typeName, params object?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;
     private static void Enqueue(object message) => ManagerType!.GetMethod("Enqueue")!.Invoke(Manager, new[] { message });
     private static void TickManager() => ManagerType!.GetMethod("Tick")!.Invoke(Manager, null);
     private static List<object> ToObjectList(IEnumerable? rows) { var result = new List<object>(); if (rows is null) return result; foreach (object row in rows) result.Add(row); return result; }

@@ -2,12 +2,15 @@
 
 mod common;
 
-use common::{welcome_frame, world_change_frame, SharedRuntime, TestKernel};
-use lumio_host_runtime::SharedClock;
+use common::{
+    runtime_wire_chat_input, welcome_frame, world_change_frame, SharedRuntime, TestKernel,
+    RUNTIME_WIRE_CHAT_INPUT,
+};
+use lumio_host_runtime::{bounded_channel, SharedClock};
 use lumio_server_process::entity_chat::{
-    apply_pending_chat_ticks, drain_chat_event_deltas, generate_keys, issue_admission_credential,
-    ChatOpKind, EntityChatHost, InputCommand, RoomClient, ADMISSION_KEY_ID,
-    MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
+    drain_chat_event_deltas, generate_keys, issue_admission_credential, ChatOpKind, EntityChatHost,
+    RoomClient, ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, MAX_WIRE_TEXT_BYTES,
+    RECONNECT_WINDOW_MS,
 };
 
 fn credential(
@@ -77,7 +80,7 @@ fn room_client_chat_input_over_wire_then_tick_sends_chat_event_delta() {
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
     client
-        .send_text(&InputCommand::from_chat_text("hello-Bot01").to_json())
+        .send_text(RUNTIME_WIRE_CHAT_INPUT)
         .expect("wire chat.input");
     std::thread::sleep(std::time::Duration::from_millis(80));
     let tick = host.run_tick("room-main".to_owned());
@@ -90,8 +93,9 @@ fn room_client_chat_input_over_wire_then_tick_sends_chat_event_delta() {
 }
 
 #[test]
-fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
+fn wire_input_observer_confirms_room_ingress_before_tick() {
     let keys = generate_keys();
+    let (observer_tx, observer_rx) = bounded_channel(4);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::test(),
@@ -101,6 +105,7 @@ fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
         keys.public.to_vec(),
         1_000,
     );
+    host.attach_wire_input_observer(observer_tx);
     let admit = host.admit(
         "room-main".to_owned(),
         "c-bot01".to_owned(),
@@ -110,20 +115,50 @@ fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
     client
-        .send_text(&InputCommand::from_chat_text("hello-Bot01").to_json())
+        .send_text(RUNTIME_WIRE_CHAT_INPUT)
         .expect("wire chat.input");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert_eq!(
-        host.pending_wire_chat_inputs(),
-        1,
-        "Room WS chat.input must be observed as pending before tick"
-    );
+    observer_rx
+        .recv_timeout(std::time::Duration::from_millis(500))
+        .expect("Room WS chat.input must be observed before tick");
     let tick = host.run_tick("room-main".to_owned());
     assert!(tick.ok, "kernel tickFrame must run, got {tick:?}");
-    assert_eq!(host.pending_wire_chat_inputs(), 0);
+}
+
+#[test]
+fn admitted_wire_input_is_observed_byte_for_byte_without_host_retention() {
+    let keys = generate_keys();
+    let (observer_tx, captured_rx) = bounded_channel::<Vec<u8>>(1);
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    host.attach_wire_input_observer(observer_tx);
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
+    let _ = client.recv_text();
+    let input = runtime_wire_chat_input();
+    client
+        .send_text(std::str::from_utf8(&input).expect("utf8 fixture"))
+        .expect("wire input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut captured = None;
+    while captured.is_none() && std::time::Instant::now() < deadline {
+        captured = captured_rx.try_recv().ok();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(captured.as_deref(), Some(input.as_slice()));
 }
 
 #[test]
@@ -146,10 +181,7 @@ fn admit_chat_input_then_tick_sends_chat_event_delta_to_room_client() {
     assert!(admit.accepted);
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
-    let admitted = host.admit_chat_input(
-        "c-bot01".to_owned(),
-        InputCommand::from_chat_text("hello-Bot01"),
-    );
+    let admitted = host.admit_input_command("c-bot01".to_owned(), runtime_wire_chat_input());
     assert_eq!(admitted.kind, ChatOpKind::Admitted);
     let tick = host.run_tick("room-main".to_owned());
     assert!(
@@ -188,7 +220,7 @@ fn tick_broadcasts_runtime_delta_bytes_in_order() {
     let mut b = RoomClient::connect(&host.listen_uri(), "c-b").expect("b");
     let _ = a.recv_text();
     let _ = b.recv_text();
-    let _ = host.admit_chat_input("c-a".to_owned(), InputCommand::from_chat_text("one"));
+    let _ = host.admit_input_command("c-a".to_owned(), runtime_wire_chat_input());
     let tick = host.run_tick("room-main".to_owned());
     assert_eq!(tick.applied_tick, 1);
     let first_a = a.recv_text().expect("a1");
@@ -235,6 +267,34 @@ fn takeover_sends_connection_superseded_before_close() {
     assert!(snapshot.contains("\"selfNetEntityId\""));
 }
 
+#[test]
+fn takeover_pending_tick_without_welcome_keeps_superseded_frame_and_cleans_new_socket() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().seed_live_binding(
+        "runtime-old",
+        "acct_Bot01",
+        "room-main",
+        lumio_server_process::entity_chat::BoundEntityKind::Bot,
+    );
+    runtime.lock().suppress_rebind_welcome();
+    let (host, keys) = host_ready(runtime.clone());
+    runtime.lock().plant_raw_delta(Vec::new());
+    let mut old = RoomClient::connect(&host.listen_uri(), "runtime-old").expect("old connect");
+    let mut new = RoomClient::connect(&host.listen_uri(), "c-new").expect("new connect");
+    let takeover = host.admit(
+        "room-main".to_owned(),
+        "c-new".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(takeover.accepted && takeover.takeover);
+    let superseded = old.recv_text().expect("superseded frame must be routed");
+    assert!(superseded.contains("\"messageType\":\"ConnectionSuperseded\""));
+    assert!(old.is_closed_after());
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    assert!(host.try_self_lookup("c-new".to_owned()).is_none());
+    assert!(new.is_closed_after());
+}
+
 const HOST_MINTED_EMPTY: &str = r#"{"connectionGeneration":1,"instanceId":0,"messageType":"Welcome","selfNetEntityId":"00000000000000000000000000000001"}"#;
 
 #[test]
@@ -270,22 +330,37 @@ fn runtime_snapshot_failure_does_not_send_host_minted_empty_full_snapshot() {
     );
 }
 
-fn wait_pending(host: &EntityChatHost, want: usize) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while host.pending_wire_chat_inputs() < want && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert_eq!(
-        host.pending_wire_chat_inputs(),
-        want,
-        "expected {want} Room-observed chat.input frames"
+#[test]
+fn pre_admission_socket_receives_runtime_rejection_frame() {
+    let runtime = SharedRuntime::new();
+    runtime
+        .lock()
+        .reject_next_admit_with_frame("invalid_binding_shape");
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(runtime),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
     );
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-rejected").expect("connect");
+    let result = host.admit(
+        "room-main".to_owned(),
+        "c-rejected".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(!result.accepted);
+    let frame = client.recv_text().expect("runtime rejection frame");
+    assert!(frame.contains("\"messageType\":\"Error\""), "got {frame}");
 }
 
 fn send_n_wire_chats(client: &mut RoomClient, n: usize) {
-    for i in 0..n {
+    for _ in 0..n {
         client
-            .send_text(&InputCommand::from_chat_text(&format!("hello-{i}")).to_json())
+            .send_text(RUNTIME_WIRE_CHAT_INPUT)
             .expect("wire chat.input");
     }
 }
@@ -322,7 +397,7 @@ fn drain_chat_event_deltas_returns_before_deadline_when_idle() {
 }
 
 #[test]
-fn apply_pending_chat_ticks_returns_when_over_budget_pending_does_not_fall() {
+fn wire_ingress_auto_ticks_before_runtime_budget_overflow() {
     let runtime = SharedRuntime::new();
     let keys = generate_keys();
     let host = EntityChatHost::new(
@@ -343,26 +418,15 @@ fn apply_pending_chat_ticks_returns_when_over_budget_pending_does_not_fall() {
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
     send_n_wire_chats(&mut client, MAX_CHAT_INPUTS_PER_TICK + 1);
-    wait_pending(&host, MAX_CHAT_INPUTS_PER_TICK + 1);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let mut tick = lumio_server_process::entity_chat::RuntimeTick::default();
-        let mut received = Vec::new();
-        let mut wire = Some(client);
-        apply_pending_chat_ticks(&host, &mut tick, &mut wire, &mut received);
-        let counts = runtime.lock().run_tick_input_counts().to_vec();
-        let _ = tx.send((tick, host.pending_wire_chat_inputs(), counts));
-    });
-    let (tick, pending, counts) = rx
-        .recv_timeout(std::time::Duration::from_millis(800))
-        .expect("apply_pending_chat_ticks must return when pending does not fall");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while runtime.lock().run_tick_input_counts().is_empty() && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let counts = runtime.lock().run_tick_input_counts().to_vec();
     assert!(
-        !tick.ok,
-        "65+ one-tick budget fault must not be SUCCESS, got {tick:?}"
-    );
-    assert!(
-        pending >= MAX_CHAT_INPUTS_PER_TICK,
-        "over-budget pending must remain, got {pending}"
+        !counts.is_empty() && counts.iter().sum::<usize>() == MAX_CHAT_INPUTS_PER_TICK,
+        "wire ingress must commit a batch at the limit, counts={counts:?}"
     );
     assert!(
         counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),
@@ -392,10 +456,7 @@ fn second_c_browser_attach_still_receives_room_delta() {
     let _ = first.recv_text();
     let mut second = RoomClient::connect(&host.listen_uri(), "c-browser").expect("second");
     let _ = second.recv_text();
-    let _ = host.admit_chat_input(
-        "c-browser".to_owned(),
-        InputCommand::from_chat_text("hello-browser"),
-    );
+    let _ = host.admit_input_command("c-browser".to_owned(), runtime_wire_chat_input());
     let tick = host.run_tick("room-main".to_owned());
     assert!(tick.ok);
     let first_frame = first.recv_text().expect("first delta");
@@ -408,4 +469,55 @@ fn second_c_browser_attach_still_receives_room_delta() {
         second_frame.contains("\"messageType\":\"WorldChange\""),
         "Playwright-style second c-browser attach must also receive WorldChange, got {second_frame}"
     );
+}
+
+#[test]
+fn closing_one_observer_keeps_the_other_logical_connection_alive() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-browser".to_owned(),
+            credential(&keys, "Browser01", false),
+        )
+        .accepted
+    );
+    let mut first = RoomClient::connect(&host.listen_uri(), "c-browser").expect("first");
+    let _ = first.recv_text();
+    let mut second = RoomClient::connect(&host.listen_uri(), "c-browser").expect("second");
+    let _ = second.recv_text();
+    drop(first);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let _ = host.run_tick("room-main".to_owned());
+    assert!(host.try_self_lookup("c-browser".to_owned()).is_some());
+}
+
+#[test]
+fn oversized_post_admission_text_closes_socket_before_runtime_input() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_ready(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-oversized".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-oversized").expect("connect");
+    let _ = client.recv_text();
+    client
+        .send_text(&"a".repeat(MAX_WIRE_TEXT_BYTES + 1))
+        .expect("wire send reaches server boundary");
+    assert!(client.is_closed_after());
+    assert!(runtime.lock().run_tick_input_counts().is_empty());
 }
