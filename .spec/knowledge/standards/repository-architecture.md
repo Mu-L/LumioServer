@@ -1,6 +1,6 @@
 ---
 name: repository-architecture
-description: LumioServer 的 V1.4 架构基线、模块所有权、依赖图、队列与跨仓契约消费规则
+description: LumioServer 的模块所有权、依赖图、队列与跨仓契约消费规则
 metadata:
   type: doc
   status: 已交付
@@ -10,16 +10,11 @@ metadata:
 
 > 本文是 LumioServer 对公共架构的只读规则镜像。项目治理与验证入口见 [`AGENTS.md`](../../AGENTS.md)、[`knowledge/README.md`](../README.md) 和 [`rules/system.md`](../../rules/system.md)；仓内模块总览见 [`modules/README.md`](../../../modules/README.md)。
 
-## 1. 唯一事实源与版本锁
+## 1. 唯一事实源与契约纪律
 
-- 当前唯一有效公共基线是 `LGE-V1.4-2026-08-27`。
-- 权威架构仓库是 `LumioGameEngineArchitecture`，固定提交为 `d3252a8886b4bfd56fbb08490c3db0e6fc8c9550`。
-- 架构正文路径为 `docs/architecture/LumioGameEngine_Architecture_v1.4.md`；本仓不把正文或 Schema 重新实现为本地契约。
-- 固定正文 SHA-256 为 `F1D36ACF33A1F5E8326A9E58D609FCF7D9FA85177F9B5B60BB3F4742C1AFEBD0`。校验应在 `C:/Work/LumioGames/LumioGameEngineArchitecture` 的固定提交上进行，不能用漂移后的 HEAD 代替。
-- 架构仓库的 ADR、Schema、ID Registry、Fixture、生成器和校验工具共同构成 Architecture Gate。LumioServer 只消费其发布的版本化结果；实现、README 或生成物不得反向定义公共语义。
-- 旧的 `LGE-V1.2-2026-08-27` 内容只可作为历史背景，不能作为当前状态、字段、错误、时序或依赖的依据。
-
-公共语义发生变化时，顺序固定为：架构源新增/更新 ADR → 更新 Schema、ID 与正/失败 Fixture → 运行 Contract validate → 生成新的 BaselineId/Hash → 同步各实现仓只读镜像。未完成这条链时，LumioServer 不得私改 Envelope、Release、Capability、FaultClass、状态机或错误码。
+- 当前处于预上线 Living Architecture 阶段；跨仓公共架构与契约唯一来源是 `LumioGameEngine` 的 `.spec/knowledge/features/architecture.md`，可运行 ABI 与 wire 定义位于其 `engine/abi` 和 `engine/wire`。
+- LumioServer 只消费契约所有者发布的接口；实现、README 或生成物不得反向定义公共语义，也不保存架构镜像或版本基线。
+- 公共语义发生变化时，先在契约所有者更新对应 ABI/wire 定义与正/失败 Fixture，再重编译直接消费者；本仓不得私改 Envelope、Release、Capability、FaultClass、状态机或错误码。
 
 ## 2. 七仓库边界与 LumioServer 所有权
 

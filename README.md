@@ -22,17 +22,17 @@
 </div>
 <!-- lumio-community:end -->
 
-## 架构基线
+## 架构与开发说明
 
-- Baseline：`LGE-V1.4-2026-08-27`
-- 唯一架构源：`LumioGameEngineArchitecture`
-- 本地镜像：[`docs/architecture/LumioGameEngine_Architecture_v1.2.md`](docs/architecture/LumioGameEngine_Architecture_v1.2.md)
+本仓处于预上线 Living Architecture 阶段，不发布或复制冻结基线。跨仓边界与可运行接口的唯一来源是
+`LumioGameEngine` 的 `.spec/knowledge/features/architecture.md`；Runtime 通过
+`engine/abi/native-abi.json` 与 `engine/wire/*.json` 提供稳定接口，本仓不保存架构镜像。
 
 `LumioServer` 拥有服务器进程、连接、Release 身份代理、WorldSlot 聚合根、Host Pacing、CoreCLR Hosting、滚动更新与强制维护的本进程侧执行。集群期望状态（Pool 存在性、Release 指派、实例替换时机）归外部控制面（架构源 ADR-012）。它加载稳定 Runtime 与 Server Gameplay，但不拥有 ECS/Voxel 内部状态，也不定义 Gameplay 语义。
 
 ## Architecture Gate
 
-ReleaseCatalog/Manifest、Envelope、Maintenance、Logging Event、Host Capability 和失败恢复契约以 `LumioGameEngineArchitecture` 为唯一来源。网络、路由、滚动更新或维护命令变更必须补齐正向/失败 Fixture，并在架构源执行 `python3 tools/lumio_contract.py validate`；目标 Pool 之外的产品/Release 不得被默认影响。
+ReleaseCatalog/Manifest、Envelope、Maintenance、Logging Event、Host Capability 和失败恢复契约由架构源 ABI/wire 定义维护。网络、路由、滚动更新或维护命令变更必须补齐正向/失败 Fixture，并重编译直接消费者；目标 Pool 之外的产品/Release 不得被默认影响。
 
 ## 拥有的状态与生命周期
 
