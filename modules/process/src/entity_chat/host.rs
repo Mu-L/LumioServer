@@ -367,23 +367,12 @@ impl EntityChatHost {
     }
 
     /// Resolve a NetEntityId in a room via Runtime.
-    #[must_use]
-    pub fn try_resolve_by_net_entity_id(
-        &self,
-        room_id: String,
-        net_entity_id: String,
-    ) -> Option<EntityResolution> {
-        self.resolve_by_net_entity_id(room_id, net_entity_id)
-            .ok()
-            .flatten()
-    }
-
-    /// Resolve a NetEntityId while preserving explicit Runtime bridge failures.
     ///
     /// # Errors
     ///
     /// Returns malformed, missing, mismatched, and request-error Runtime results.
-    pub fn resolve_by_net_entity_id(
+    #[must_use]
+    pub fn try_resolve_by_net_entity_id(
         &self,
         room_id: String,
         net_entity_id: String,

@@ -386,6 +386,16 @@ fn runtime_control_results_preserve_and_route_c1_frames() {
 }
 
 #[test]
+fn host_resolve_does_not_collapse_runtime_errors_into_none() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    let resolve = rust_fn_src(&host, "pub fn try_resolve_by_net_entity_id");
+    assert!(
+        !resolve.contains(".ok()") && !resolve.contains(".flatten()"),
+        "Runtime resolve bridge failures must remain explicit Result::Err values"
+    );
+}
+
+#[test]
 fn host_session_occupancy_has_no_account_index() {
     let path = process_root().join("src/entity_chat/host.rs");
     let text = fs::read_to_string(&path).expect("host.rs");

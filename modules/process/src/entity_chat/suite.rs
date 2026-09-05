@@ -326,7 +326,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         if let Some(binding) = host.try_self_lookup(connection.clone()) {
             if host
                 .try_resolve_by_net_entity_id(MAIN_ROOM.to_owned(), binding.net_entity_id)
-                .is_some()
+                .is_ok_and(|resolved| resolved.is_some())
             {
                 resolved += 1;
             }

@@ -147,6 +147,8 @@ pub struct ScriptedRuntime {
     pending_chats: Vec<(String, String)>,
     events_by_tick: HashMap<u64, Vec<(String, String)>>,
     run_tick_input_counts: Vec<usize>,
+    resolve_error: Option<RuntimeControlError>,
+    query_error: Option<RuntimeControlError>,
 }
 
 impl ScriptedRuntime {
@@ -171,6 +173,8 @@ impl ScriptedRuntime {
             pending_chats: Vec::new(),
             events_by_tick: HashMap::new(),
             run_tick_input_counts: Vec::new(),
+            resolve_error: None,
+            query_error: None,
         }
     }
 
@@ -182,6 +186,14 @@ impl ScriptedRuntime {
     pub fn plant_query(&mut self, room: &str, net: &str, attr: &str, result: QueryResult) {
         self.planted_query
             .insert((room.to_owned(), net.to_owned(), attr.to_owned()), result);
+    }
+
+    pub fn fail_resolve(&mut self, message: &str) {
+        self.resolve_error = Some(RuntimeControlError::new(message.to_owned(), Vec::new()));
+    }
+
+    pub fn fail_query(&mut self, message: &str) {
+        self.query_error = Some(RuntimeControlError::new(message.to_owned(), Vec::new()));
     }
 
     pub fn plant_snapshot(&mut self, json: &str) {
@@ -406,6 +418,9 @@ impl RuntimeSurface for ScriptedRuntime {
         room_id: &str,
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
+        if let Some(error) = self.resolve_error.take() {
+            return Err(error);
+        }
         let Some(occupancy) = self.entities.get(net_entity_id) else {
             return Ok(RuntimeControlResult::new(None, Vec::new()));
         };
@@ -422,6 +437,9 @@ impl RuntimeSurface for ScriptedRuntime {
         &mut self,
         request: &RuntimeQuery,
     ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
+        if let Some(error) = self.query_error.take() {
+            return Err(error);
+        }
         let net_entity_id = normalize_net_entity_id(&request.net_entity_id);
         if let Some(planted) = self.planted_query.get(&(
             request.room_id.clone(),

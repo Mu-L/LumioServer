@@ -72,6 +72,7 @@ fn admit_creates_bot_and_player_and_resolves_bindings() {
     let self_bot = host.must_self("c-bot01");
     assert!(host
         .try_resolve_by_net_entity_id("room-main".to_owned(), self_bot.net_entity_id)
+        .expect("Runtime resolve")
         .is_some());
 }
 
@@ -174,6 +175,35 @@ fn isolation_rejects_cross_room_query() {
         connection_generation: None,
     });
     assert_eq!(cross.error_code.as_deref(), Some("cross_room_reference"));
+}
+
+#[test]
+fn runtime_resolve_and_query_bridge_failures_remain_explicit() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    let admitted = host.admit(
+        "room-main".to_owned(),
+        "c-browser".to_owned(),
+        credential(&keys, "Browser01", false),
+    );
+    let net_entity_id = admitted.binding.expect("binding").net_entity_id;
+
+    runtime.lock().fail_resolve("resolve_result_missing");
+    let resolve_error = host
+        .try_resolve_by_net_entity_id("room-main".to_owned(), net_entity_id.clone())
+        .expect_err("Runtime resolve bridge error must not become None");
+    assert_eq!(resolve_error, "resolve_result_missing");
+
+    runtime.lock().fail_query("query_result_malformed");
+    let query = host.query_attribute(AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id,
+        attribute_id: "EntityIdentity.entityType".to_owned(),
+        connection_generation: None,
+    });
+    assert_eq!(query.outcome, AttributeQueryOutcome::RequestError);
+    assert_eq!(query.error_code.as_deref(), Some("query_result_malformed"));
 }
 
 #[test]
@@ -495,9 +525,12 @@ fn resolve_requires_canonical_runtime_id() {
     assert_eq!(hex.len(), 32);
     assert!(host
         .try_resolve_by_net_entity_id("room-main".to_owned(), hex.clone())
+        .expect("Runtime resolve")
         .is_some());
     let as_u64 = u64::from_str_radix(&hex, 16).expect("runtime 32-hex is a u64");
-    let resolved = host.try_resolve_by_net_entity_id("room-main".to_owned(), as_u64.to_string());
+    let resolved = host
+        .try_resolve_by_net_entity_id("room-main".to_owned(), as_u64.to_string())
+        .expect("Runtime resolve");
     assert!(
         resolved.is_none(),
         "non-canonical Runtime ID {as_u64} must not be normalized by the Server host"
