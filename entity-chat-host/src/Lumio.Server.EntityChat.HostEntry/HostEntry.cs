@@ -153,7 +153,7 @@ public static class HostEntry
 
     private static object CreateWorldMessage(string messageType, JsonElement root)
     {
-        string type = messageType.EndsWith("Message", StringComparison.Ordinal) ? messageType : messageType + "Message";
+        string type = messageType;
         if (type == "AdmitConnectionMessage")
         {
             return NewMessage(type,

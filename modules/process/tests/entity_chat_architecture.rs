@@ -532,7 +532,7 @@ fn host_entry_does_not_swallow_duplicate_control_adapter_attachment() {
 }
 
 #[test]
-fn host_entry_accepts_control_names_with_or_without_message_suffix() {
+fn host_entry_accepts_only_exact_frozen_world_message_names() {
     let path = process_root()
         .parent()
         .expect("modules")
@@ -540,8 +540,22 @@ fn host_entry_accepts_control_names_with_or_without_message_suffix() {
         .expect("repo")
         .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
     let text = fs::read_to_string(path).expect("HostEntry.cs");
-    assert!(text.contains("messageType.EndsWith(\"Message\""));
-    assert!(text.contains("messageType + \"Message\""));
+    assert!(!text.contains("messageType.EndsWith(\"Message\""));
+    assert!(!text.contains("messageType + \"Message\""));
+    for message_type in [
+        "AdmitConnectionMessage",
+        "DisconnectConnectionMessage",
+        "RebindConnectionMessage",
+        "ExpireEntityMessage",
+        "ResolveBindingMessage",
+        "AttributeQueryMessage",
+        "InputCommandMessage",
+    ] {
+        assert!(
+            text.contains(&format!("type == \"{message_type}\"")),
+            "HostEntry must accept the exact frozen name {message_type}"
+        );
+    }
 }
 
 #[test]
