@@ -72,7 +72,8 @@ fn admit_creates_bot_and_player_and_resolves_bindings() {
 
 #[test]
 fn reconnect_within_window_rebinds_entity_a() {
-    let (host, keys) = host_with(SharedRuntime::new());
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
     let _ = host.admit(
         "room-main".to_owned(),
         "c-bot01".to_owned(),
@@ -96,6 +97,12 @@ fn reconnect_within_window_rebinds_entity_a() {
     assert_eq!(rebound.net_entity_id, entity_a);
     assert_ne!(rebound.session_id, first_session);
     assert_ne!(rebound.net_entity_id, rebound.session_id);
+
+    // Rebinding within the retention window must cancel the old expiry. A
+    // stale timer must never destroy the live rebound entity.
+    host.clock().advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.drive_kernel());
+    assert!(runtime.lock().expire_calls().is_empty());
 }
 
 #[test]

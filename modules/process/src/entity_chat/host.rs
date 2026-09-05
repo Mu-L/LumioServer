@@ -1,6 +1,7 @@
 //! Consume-only Room host: session table + Runtime forward + NativeCore timers + wire.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Duration;
 
 use lumio_host_runtime::{
     bounded_channel, spawn_supervised, HostClock, KernelHandle, KernelTimer, Sender, SharedClock,
@@ -34,6 +35,13 @@ pub const MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION: usize = 1_048_576;
 /// not consume a second correlation slot. Failed records consume a slot until
 /// the caller retries the exact request and consumes the terminal result.
 pub const MAX_PENDING_QUERIES: usize = 1_024;
+/// Completed Runtime query records are diagnostic output, not an unbounded log.
+pub const MAX_RUNTIME_QUERY_HISTORY: usize = MAX_PENDING_QUERIES;
+/// Aggregate pending wire inputs across all connections.
+pub const MAX_PENDING_WIRE_INPUTS: usize = MAX_PENDING_QUERIES;
+/// Aggregate pending wire bytes across all connections.
+pub const MAX_PENDING_WIRE_INPUT_BYTES: usize = MAX_PENDING_WIRE_INPUTS * MAX_WIRE_TEXT_BYTES;
+const OWNER_CADENCE_MS: u64 = 10;
 
 /// Bounded sink for exact Runtime-admitted input bytes used by external evidence consumers.
 pub type WireInputObserver = Sender<Vec<u8>>;
@@ -139,7 +147,23 @@ struct Session {
     net_entity_id: String,
     entity_type: BoundEntityKind,
     generation: u64,
-    egresses: Vec<WireSender>,
+    egresses: Vec<ObserverEgress>,
+}
+
+struct ObserverEgress {
+    sender: WireSender,
+    pending: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+}
+
+impl ObserverEgress {
+    fn new(sender: WireSender) -> Self {
+        Self {
+            sender,
+            pending: VecDeque::new(),
+            pending_bytes: 0,
+        }
+    }
 }
 
 struct PendingWireInput {
@@ -160,6 +184,7 @@ struct PendingAdmission {
 struct ExpireTarget {
     room_id: String,
     net_entity_id: String,
+    due_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -187,7 +212,7 @@ struct Inner {
     kernel: Box<dyn KernelTimer>,
     sessions: HashMap<String, Session>,
     pending_admissions: HashMap<String, PendingAdmission>,
-    runtime_queries: Vec<RuntimeQueryRecord>,
+    runtime_queries: VecDeque<RuntimeQueryRecord>,
     completed_queries: HashMap<String, RuntimeQueryRecord>,
     failed_queries: HashMap<PendingQueryKey, String>,
     pending_queries: HashMap<PendingQueryKey, String>,
@@ -195,12 +220,15 @@ struct Inner {
     next_query_id: u64,
     query_failures: Vec<String>,
     expire_watch: HashMap<KernelHandle, ExpireTarget>,
-    pending_egress: HashMap<String, Vec<WireSender>>,
+    retry_expiries: HashMap<String, ExpireTarget>,
+    reconnect_targets: HashMap<String, ExpireTarget>,
+    pending_egress: HashMap<String, Vec<ObserverEgress>>,
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
     retired_connections: HashSet<String>,
     tick_id: u64,
     wire_chat_pending: u64,
     pending_wire_inputs: Vec<PendingWireInput>,
+    pending_wire_input_bytes: usize,
     wire_input_observer: Option<WireInputObserver>,
 }
 
@@ -215,35 +243,71 @@ enum Delivery {
     Backpressured,
     Unavailable,
     Invalid,
+    Overflow,
 }
 
-fn deliver_to_egresses(egresses: &mut Vec<WireSender>, bytes: &[u8]) -> Delivery {
+fn deliver_to_egresses(egresses: &mut Vec<ObserverEgress>, bytes: &[u8]) -> Delivery {
     let mut delivered = false;
     let mut backpressured = false;
     let mut invalid = false;
-    egresses.retain(|egress| match egress.try_send_bytes(bytes) {
-        Ok(()) => {
-            delivered = true;
-            true
+    let mut overflow = false;
+    egresses.retain_mut(|egress| {
+        if matches!(flush_observer_egress(egress), Delivery::Unavailable) {
+            return false;
         }
-        Err(WireSendError::Full) => {
-            backpressured = true;
-            true
-        }
-        Err(WireSendError::Closed) => false,
-        Err(WireSendError::TooLarge | WireSendError::InvalidUtf8) => {
-            invalid = true;
-            false
+        match egress.sender.try_send_bytes(bytes) {
+            Ok(()) => {
+                delivered = true;
+                true
+            }
+            Err(WireSendError::Full) => {
+                if egress.pending.len() >= MAX_DEFERRED_FRAMES_PER_CONNECTION
+                    || egress.pending_bytes.saturating_add(bytes.len())
+                        > MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION
+                {
+                    overflow = true;
+                } else {
+                    egress.pending.push_back(bytes.to_vec());
+                    egress.pending_bytes = egress.pending_bytes.saturating_add(bytes.len());
+                    backpressured = true;
+                }
+                true
+            }
+            Err(WireSendError::Closed) => false,
+            Err(WireSendError::TooLarge | WireSendError::InvalidUtf8) => {
+                invalid = true;
+                false
+            }
         }
     });
-    if delivered {
-        Delivery::Delivered
+    if overflow {
+        Delivery::Overflow
     } else if invalid {
         Delivery::Invalid
     } else if backpressured {
         Delivery::Backpressured
+    } else if delivered {
+        Delivery::Delivered
     } else {
         Delivery::Unavailable
+    }
+}
+
+fn flush_observer_egress(egress: &mut ObserverEgress) -> Delivery {
+    loop {
+        let Some(bytes) = egress.pending.front() else {
+            return Delivery::Delivered;
+        };
+        match egress.sender.try_send_bytes(bytes) {
+            Ok(()) => {
+                if let Some(bytes) = egress.pending.pop_front() {
+                    egress.pending_bytes = egress.pending_bytes.saturating_sub(bytes.len());
+                }
+            }
+            Err(WireSendError::Full) => return Delivery::Backpressured,
+            Err(WireSendError::Closed) => return Delivery::Unavailable,
+            Err(WireSendError::TooLarge | WireSendError::InvalidUtf8) => return Delivery::Invalid,
+        }
     }
 }
 
@@ -293,7 +357,7 @@ impl EntityChatHost {
                 kernel,
                 sessions: HashMap::new(),
                 pending_admissions: HashMap::new(),
-                runtime_queries: Vec::new(),
+                runtime_queries: VecDeque::new(),
                 completed_queries: HashMap::new(),
                 failed_queries: HashMap::new(),
                 pending_queries: HashMap::new(),
@@ -301,12 +365,15 @@ impl EntityChatHost {
                 next_query_id: 1,
                 query_failures: Vec::new(),
                 expire_watch: HashMap::new(),
+                retry_expiries: HashMap::new(),
+                reconnect_targets: HashMap::new(),
                 pending_egress: HashMap::new(),
                 deferred_frames: HashMap::new(),
                 retired_connections: HashSet::new(),
                 tick_id: 0,
                 wire_chat_pending: 0,
                 pending_wire_inputs: Vec::new(),
+                pending_wire_input_bytes: 0,
                 wire_input_observer: None,
             };
             if inner
@@ -316,11 +383,21 @@ impl EntityChatHost {
             {
                 return;
             }
+            let self_drive = !inner.clock.is_deterministic();
             loop {
-                match rx.recv() {
+                let work = if self_drive {
+                    rx.recv_timeout(Duration::from_millis(OWNER_CADENCE_MS))
+                } else {
+                    rx.recv().map_err(|_| lumio_host_runtime::RecvError::Closed)
+                };
+                match work {
                     Ok(OwnerWork::Run(work)) => work(&mut inner),
                     Ok(OwnerWork::Wire(event)) => inner.on_wire(event),
-                    Err(_) => break,
+                    Err(lumio_host_runtime::RecvError::Empty) if self_drive => {
+                        inner.drive_owner_cadence();
+                    }
+                    Err(lumio_host_runtime::RecvError::Empty) => {}
+                    Err(lumio_host_runtime::RecvError::Closed) => break,
                 }
             }
         });
@@ -472,7 +549,7 @@ impl EntityChatHost {
     /// Returns C-2 query records drained by owner ticks since the last drain.
     #[must_use]
     pub fn drain_runtime_queries(&self) -> Vec<RuntimeQueryRecord> {
-        self.on_owner(|inner| std::mem::take(&mut inner.runtime_queries))
+        self.on_owner(|inner| inner.runtime_queries.drain(..).collect())
     }
 
     /// Crate-internal suite synchronization; not part of the public HostEntry API.
@@ -606,6 +683,10 @@ impl Inner {
             valid.insert(request_id.clone());
             if expiry.is_some() {
                 self.pending_expiries.remove(&request_id);
+                if let Some(target) = expiry {
+                    self.reconnect_targets
+                        .retain(|_, row| row.net_entity_id != target.net_entity_id);
+                }
                 if record.outcome == "request_error" {
                     self.record_query_failure(
                         record
@@ -624,7 +705,10 @@ impl Inner {
                 }
                 self.completed_queries.insert(request_id, record.clone());
             }
-            self.runtime_queries.push(record);
+            if self.runtime_queries.len() >= MAX_RUNTIME_QUERY_HISTORY {
+                self.runtime_queries.pop_front();
+            }
+            self.runtime_queries.push_back(record);
         }
         if unknown_request {
             let pending_ids: HashSet<String> = self
@@ -881,6 +965,7 @@ impl Inner {
             kind,
         );
         if rebound.accepted {
+            self.cancel_expiry_for_account(&payload.account_id);
             return self.stage_admission(
                 room_id,
                 connection_id,
@@ -944,8 +1029,10 @@ impl Inner {
         // particular, takeover's addressed ConnectionSuperseded must not be
         // lost merely because Welcome is emitted on a later owner tick.
         let _ = self.route_frames(room_id, &frames);
+        // Runtime ownership moves at the supersession notice, even when the
+        // replacement Welcome is delayed or malformed.
+        self.retire_superseded(connection_id, &frames);
         if completed {
-            self.retire_superseded(connection_id, &frames);
             return RoomAdmitResult::ok(reconnected, takeover);
         }
         RoomAdmitResult::pending(reconnected, takeover)
@@ -958,7 +1045,7 @@ impl Inner {
             .remove(connection_id)
             .into_iter()
             .flatten()
-            .for_each(|egress| egress.abort());
+            .for_each(|egress| egress.sender.abort());
         if self.retired_connections.len() >= MAX_PENDING_ADMISSIONS {
             if let Some(evicted) = self.retired_connections.iter().next().cloned() {
                 self.retired_connections.remove(&evicted);
@@ -1024,18 +1111,26 @@ impl Inner {
             .filter(|connection| connection != connection_id)
             .collect();
         for old_id in superseded_connections {
-            self.clear_pending_admission(&old_id);
+            // Keep an unattached observer long enough to flush the addressed
+            // supersession frame before its close marker is queued.
+            self.pending_admissions.remove(&old_id);
             if let Some(old) = self.sessions.remove(&old_id) {
                 for egress in &old.egresses {
-                    let _ = egress.try_close();
+                    let _ = egress.sender.try_close();
                 }
             }
             if let Some(egresses) = self.pending_egress.remove(&old_id) {
                 for egress in egresses {
-                    let _ = egress.try_close();
+                    let _ = egress.sender.try_close();
                 }
             }
             self.deferred_frames.remove(&old_id);
+            if self.retired_connections.len() >= MAX_PENDING_ADMISSIONS {
+                if let Some(evicted) = self.retired_connections.iter().next().cloned() {
+                    self.retired_connections.remove(&evicted);
+                }
+            }
+            self.retired_connections.insert(old_id);
         }
     }
 
@@ -1056,12 +1151,8 @@ impl Inner {
             {
                 continue;
             }
-            if self
-                .complete_pending_admission(&connection_id, &relevant)
-                .is_some()
-            {
-                self.retire_superseded(&connection_id, &relevant);
-            }
+            self.retire_superseded(&connection_id, &relevant);
+            let _ = self.complete_pending_admission(&connection_id, &relevant);
         }
     }
 
@@ -1123,9 +1214,17 @@ impl Inner {
         let Some(session) = self.sessions.remove(connection_id) else {
             return Ok(false);
         };
+        self.reconnect_targets.insert(
+            session.account_id.clone(),
+            ExpireTarget {
+                room_id: session.room_id.clone(),
+                net_entity_id: session.net_entity_id.clone(),
+                due_ms: self.clock.now_ms().saturating_add(self.reconnect_window_ms),
+            },
+        );
         self.deferred_frames.remove(connection_id);
         for egress in &session.egresses {
-            let _ = egress.try_close();
+            let _ = egress.sender.try_close();
         }
         let routed = self.route_frames(&room_id, &runtime_result.frames);
         self.schedule_expire(&session.room_id, &session.net_entity_id)?;
@@ -1141,6 +1240,7 @@ impl Inner {
         if self.schedule_expire_at(due, room_id, net_entity_id) {
             Ok(())
         } else {
+            self.retain_expiry_retry(due, room_id, net_entity_id);
             Err("kernel_timer_schedule_failed".to_owned())
         }
     }
@@ -1157,13 +1257,62 @@ impl Inner {
             ExpireTarget {
                 room_id: room_id.to_owned(),
                 net_entity_id: net_entity_id.to_owned(),
+                due_ms: due,
             },
         );
         true
     }
 
+    fn retain_expiry_retry(&mut self, due_ms: u64, room_id: &str, net_entity_id: &str) {
+        self.retry_expiries.insert(
+            net_entity_id.to_owned(),
+            ExpireTarget {
+                room_id: room_id.to_owned(),
+                net_entity_id: net_entity_id.to_owned(),
+                due_ms,
+            },
+        );
+    }
+
+    fn cancel_expiry_for_account(&mut self, account_id: &str) {
+        let Some(target) = self.reconnect_targets.remove(account_id) else {
+            return;
+        };
+        let handles: Vec<KernelHandle> = self
+            .expire_watch
+            .iter()
+            .filter(|(_, row)| row.net_entity_id == target.net_entity_id)
+            .map(|(handle, _)| *handle)
+            .collect();
+        for handle in handles {
+            let _ = self.kernel.cancel(handle);
+            self.expire_watch.remove(&handle);
+        }
+        self.retry_expiries.remove(&target.net_entity_id);
+        let pending: Vec<String> = self
+            .pending_expiries
+            .iter()
+            .filter(|(_, row)| row.net_entity_id == target.net_entity_id)
+            .map(|(request_id, _)| request_id.clone())
+            .collect();
+        for request_id in pending {
+            self.pending_expiries.remove(&request_id);
+        }
+    }
+
     fn drive_wall(&mut self) -> bool {
         let now = self.clock.now_ms();
+        let retries: Vec<ExpireTarget> = self.retry_expiries.drain().map(|(_, row)| row).collect();
+        for target in retries {
+            if !self.schedule_expire_at(
+                target.due_ms.max(now),
+                &target.room_id,
+                &target.net_entity_id,
+            ) {
+                self.retry_expiries
+                    .insert(target.net_entity_id.clone(), target);
+            }
+        }
         let Ok(fired) = self.kernel.pump_wall_clock(now) else {
             return false;
         };
@@ -1175,11 +1324,10 @@ impl Inner {
             if let Some(target) = self.expire_watch.remove(&event.handle) {
                 if !self.correlation_capacity_available() {
                     self.record_query_failure("runtime_query_capacity");
-                    let _ = self.schedule_expire_at(
-                        now.saturating_add(1),
-                        &target.room_id,
-                        &target.net_entity_id,
-                    );
+                    let due = now.saturating_add(1);
+                    if !self.schedule_expire_at(due, &target.room_id, &target.net_entity_id) {
+                        self.retain_expiry_retry(due, &target.room_id, &target.net_entity_id);
+                    }
                     succeeded = false;
                     continue;
                 }
@@ -1188,7 +1336,10 @@ impl Inner {
                     .runtime
                     .expire_with_request_id(&request_id, &target.net_entity_id)
                 {
-                    Ok(result) if self.route_frames(&target.room_id, &result.frames) => {}
+                    Ok(result) if self.route_frames(&target.room_id, &result.frames) => {
+                        self.reconnect_targets
+                            .retain(|_, row| row.net_entity_id != target.net_entity_id);
+                    }
                     Ok(_) => {
                         self.record_query_failure("runtime_failure");
                         succeeded = false;
@@ -1255,7 +1406,11 @@ impl Inner {
         removal.sort_unstable_by(|left, right| right.cmp(left));
         let mut selected = Vec::with_capacity(removal.len());
         for index in removal {
-            selected.push(self.pending_wire_inputs.remove(index));
+            let pending = self.pending_wire_inputs.remove(index);
+            self.pending_wire_input_bytes = self
+                .pending_wire_input_bytes
+                .saturating_sub(pending.envelope_bytes.len());
+            selected.push(pending);
         }
         selected.sort_by(|left, right| {
             let left_sender = self
@@ -1289,6 +1444,10 @@ impl Inner {
             self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
             return RuntimeTick::failed("runtime_failure");
         }
+        self.run_tick_after_advance(room_id)
+    }
+
+    fn run_tick_after_advance(&mut self, room_id: &str) -> RuntimeTick {
         let expected_queries = self.pending_request_ids_for_tick();
         let tick = self.runtime.run_tick(room_id, self.tick_id);
         let completed = self.absorb_runtime_queries();
@@ -1330,6 +1489,40 @@ impl Inner {
         tick
     }
 
+    /// Production cadence consumes NativeCore firings on the owner thread.
+    /// Tests with deterministic clocks retain explicit control through the
+    /// public `run_tick`/`drive_kernel` probes.
+    fn drive_owner_cadence(&mut self) {
+        let _ = self.drive_wall();
+        self.tick_id = self.tick_id.saturating_add(1);
+        let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
+            return;
+        };
+        if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
+            return;
+        }
+        let mut rooms = HashSet::new();
+        rooms.extend(
+            self.sessions
+                .values()
+                .map(|session| session.room_id.clone()),
+        );
+        rooms.extend(
+            self.pending_admissions
+                .values()
+                .map(|pending| pending.room_id.clone()),
+        );
+        rooms.extend(
+            self.pending_wire_inputs
+                .iter()
+                .map(|pending| pending.room_id.clone()),
+        );
+        for room_id in rooms {
+            self.flush_pending_wire_inputs(&room_id);
+            let _ = self.run_tick_after_advance(&room_id);
+        }
+    }
+
     fn route_frames(&mut self, room_id: &str, frames: &[RuntimeFrame]) -> bool {
         let mut routed = true;
         for frame in frames {
@@ -1356,12 +1549,12 @@ impl Inner {
             return true;
         }
         match self.deliver_to_connection(connection, bytes) {
-            Delivery::Delivered => true,
-            Delivery::Invalid => {
+            Delivery::Delivered | Delivery::Backpressured => true,
+            Delivery::Invalid | Delivery::Overflow => {
                 let _ = self.fail_connection(connection);
                 false
             }
-            Delivery::Backpressured | Delivery::Unavailable => {
+            Delivery::Unavailable => {
                 if self.defer_frame(connection, bytes) {
                     true
                 } else {
@@ -1448,7 +1641,7 @@ impl Inner {
                 .into_iter()
                 .flatten()
                 .for_each(|egress| {
-                    egress.abort();
+                    egress.sender.abort();
                 });
             self.deferred_frames.remove(connection);
             return Ok(());
@@ -1458,13 +1651,21 @@ impl Inner {
         let Some(session) = self.sessions.remove(connection) else {
             return Ok(());
         };
+        self.reconnect_targets.insert(
+            session.account_id.clone(),
+            ExpireTarget {
+                room_id: session.room_id.clone(),
+                net_entity_id: session.net_entity_id.clone(),
+                due_ms: self.clock.now_ms().saturating_add(self.reconnect_window_ms),
+            },
+        );
         self.deferred_frames.remove(connection);
         for egress in &session.egresses {
-            egress.abort();
+            egress.sender.abort();
         }
         if let Some(egresses) = self.pending_egress.remove(connection) {
             for egress in egresses {
-                egress.abort();
+                egress.sender.abort();
             }
         }
 
@@ -1479,8 +1680,17 @@ impl Inner {
     }
 
     fn clear_pending_wire_inputs(&mut self, connection_id: &str) {
-        self.pending_wire_inputs
-            .retain(|pending| pending.connection_id != connection_id);
+        let mut removed_bytes = 0usize;
+        let mut retained = Vec::with_capacity(self.pending_wire_inputs.len());
+        for pending in self.pending_wire_inputs.drain(..) {
+            if pending.connection_id == connection_id {
+                removed_bytes = removed_bytes.saturating_add(pending.envelope_bytes.len());
+            } else {
+                retained.push(pending);
+            }
+        }
+        self.pending_wire_inputs = retained;
+        self.pending_wire_input_bytes = self.pending_wire_input_bytes.saturating_sub(removed_bytes);
         self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
     }
 
@@ -1497,7 +1707,7 @@ impl Inner {
                             let _ = self.fail_connection(&connection_id);
                             return;
                         }
-                        session.egresses.push(egress.clone());
+                        session.egresses.push(ObserverEgress::new(egress.clone()));
                     }
                     self.flush_deferred(&connection_id);
                 } else {
@@ -1514,7 +1724,7 @@ impl Inner {
                         if queue.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
                             egress.abort();
                         } else {
-                            queue.push(egress);
+                            queue.push(ObserverEgress::new(egress));
                             accepted = true;
                         }
                     }
@@ -1549,6 +1759,15 @@ impl Inner {
                     return;
                 }
                 let envelope_bytes = text.into_bytes();
+                if self.pending_wire_inputs.len() >= MAX_PENDING_WIRE_INPUTS
+                    || self
+                        .pending_wire_input_bytes
+                        .saturating_add(envelope_bytes.len())
+                        > MAX_PENDING_WIRE_INPUT_BYTES
+                {
+                    let _ = self.fail_connection(&connection_id);
+                    return;
+                }
                 if let Some(observer) = &self.wire_input_observer {
                     let _ = observer.try_send(envelope_bytes.clone());
                 }
@@ -1557,6 +1776,11 @@ impl Inner {
                     connection_id: connection_id.clone(),
                     envelope_bytes,
                 });
+                self.pending_wire_input_bytes = self.pending_wire_input_bytes.saturating_add(
+                    self.pending_wire_inputs
+                        .last()
+                        .map_or(0, |pending| pending.envelope_bytes.len()),
+                );
                 self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
                 // Preserve the bounded-ingress behavior for a single noisy
                 // connection. Multi-connection traffic is held for the next
@@ -1577,7 +1801,7 @@ impl Inner {
                         .remove(&connection_id)
                         .into_iter()
                         .flatten()
-                        .for_each(|egress| egress.abort());
+                        .for_each(|egress| egress.sender.abort());
                 }
             }
         }

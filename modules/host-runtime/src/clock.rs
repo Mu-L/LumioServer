@@ -12,6 +12,12 @@ pub trait HostClock: Send + Sync {
     /// Advances the clock. Production clocks still accept this so tests can
     /// inject the five-minute reconnect deadline without sleeping.
     fn advance_ms(&self, delta_ms: u64);
+
+    /// Deterministic clocks are manually advanced by tests and must not be
+    /// driven by the production owner cadence.
+    fn is_deterministic(&self) -> bool {
+        false
+    }
 }
 
 /// Shared handle to a [`HostClock`].
@@ -38,6 +44,11 @@ impl SharedClock {
     pub fn test() -> Self {
         Self::new(Arc::new(TestMonotonicClock::default()))
     }
+
+    #[must_use]
+    pub fn is_deterministic(&self) -> bool {
+        self.inner.is_deterministic()
+    }
 }
 
 impl HostClock for SharedClock {
@@ -47,6 +58,10 @@ impl HostClock for SharedClock {
 
     fn advance_ms(&self, delta_ms: u64) {
         self.inner.advance_ms(delta_ms);
+    }
+
+    fn is_deterministic(&self) -> bool {
+        self.inner.is_deterministic()
     }
 }
 
@@ -104,6 +119,10 @@ impl HostClock for TestMonotonicClock {
     fn advance_ms(&self, delta_ms: u64) {
         let delta = i64::try_from(delta_ms).unwrap_or(i64::MAX);
         self.now_ms.fetch_add(delta, Ordering::SeqCst);
+    }
+
+    fn is_deterministic(&self) -> bool {
+        true
     }
 }
 

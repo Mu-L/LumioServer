@@ -25,6 +25,7 @@ use super::runtime::{
     RuntimeTick,
 };
 use super::wire::RoomClient;
+use super::MAX_CHAT_INPUTS_PER_TICK;
 use super::{
     bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM, RECONNECT_WINDOW_MS,
     TEST_PASSWORD,
@@ -470,7 +471,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
-        attribute_id: "IdentityComponent.realName".to_owned(),
+        attribute_id: "EntityIdentity.claimedMark".to_owned(),
         connection_generation: None,
     };
     let missing_request = AttributeQueryRequest {
@@ -1184,13 +1185,23 @@ pub fn apply_pending_chat_ticks(
         if pending_chats == 0 {
             break;
         }
+        let batch_limit = if pending_chats >= MAX_CHAT_INPUTS_PER_TICK {
+            MAX_CHAT_INPUTS_PER_TICK
+        } else {
+            pending_chats
+        };
+        let pending_for_tick = if pending_chats > MAX_CHAT_INPUTS_PER_TICK {
+            batch_limit
+        } else {
+            pending_chats
+        };
         *tick = host.schedule_room_tick(MAIN_ROOM.to_owned(), 1);
         drain_chat_event_deltas(browser_wire, received);
         if !tick.ok {
             break;
         }
         let after = host.pending_wire_chat_inputs();
-        if after >= pending_chats {
+        if after >= pending_for_tick {
             break;
         }
     }
@@ -1532,7 +1543,6 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
             "utteranceTicks": tick.get("utteranceTicks"),
             "messageType": tick.get("messageType"),
             "mappingId": tick.get("mappingId"),
-            "payloadSha256": tick.get("payloadSha256"),
         }));
     }
     for frame in frames {
@@ -1591,8 +1601,8 @@ fn decode_hex_text(value: &str) -> Option<String> {
     let mut bytes = Vec::with_capacity(value.len() / 2);
     let mut chunks = value.as_bytes().chunks_exact(2);
     for chunk in &mut chunks {
-        let high = (chunk[0] as char).to_digit(16)? as u8;
-        let low = (chunk[1] as char).to_digit(16)? as u8;
+        let high = u8::try_from((chunk[0] as char).to_digit(16)?).ok()?;
+        let low = u8::try_from((chunk[1] as char).to_digit(16)?).ok()?;
         bytes.push((high << 4) | low);
     }
     String::from_utf8(bytes).ok()

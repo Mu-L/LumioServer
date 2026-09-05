@@ -44,27 +44,40 @@ public static class HostEntry
         {
             int code;
             byte[] response;
-            if (PendingResponse is not null
-                && PendingRequest is not null
-                && PendingRequest.AsSpan().SequenceEqual(request))
+            bool preservePending = false;
+            if (PendingResponse is not null && PendingRequest is not null)
             {
-                code = PendingCode;
-                response = PendingResponse;
-                PendingResponse = null;
-                PendingRequest = null;
-                PendingCode = EntrySuccess;
+                if (PendingRequest.AsSpan().SequenceEqual(request))
+                {
+                    code = PendingCode;
+                    response = PendingResponse;
+                    PendingResponse = null;
+                    PendingRequest = null;
+                    PendingCode = EntrySuccess;
+                }
+                else
+                {
+                    // A different request must not consume a read-once
+                    // response. The caller can retry the exact request after
+                    // observing this boundary error.
+                    code = EntryInvalidInput;
+                    response = Fail("pending_response");
+                    preservePending = true;
+                }
             }
             else
             {
-                PendingResponse = null;
-                PendingRequest = null;
-                PendingCode = EntrySuccess;
                 try { (code, response) = Execute(request); }
                 catch (Exception) { code = EntryRuntimeFailure; response = Fail("runtime_failure"); }
             }
 
             if (response.Length > outputCapacity)
             {
+                if (preservePending)
+                {
+                    bytesWritten[0] = response.Length;
+                    return EntryBufferTooSmall;
+                }
                 PendingResponse = response;
                 PendingRequest = request;
                 PendingCode = code;
