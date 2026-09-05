@@ -151,6 +151,11 @@ struct Session {
     egresses: Vec<WireSender>,
 }
 
+struct ExpireTarget {
+    room_id: String,
+    net_entity_id: String,
+}
+
 struct Inner {
     clock: SharedClock,
     reconnect_window_ms: u64,
@@ -160,7 +165,7 @@ struct Inner {
     runtime: Box<dyn RuntimeSurface>,
     kernel: Box<dyn KernelTimer>,
     sessions: HashMap<String, Session>,
-    expire_watch: HashMap<KernelHandle, String>,
+    expire_watch: HashMap<KernelHandle, ExpireTarget>,
     pending_egress: HashMap<String, Vec<WireSender>>,
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
     tick_id: u64,
@@ -368,7 +373,22 @@ impl EntityChatHost {
         room_id: String,
         net_entity_id: String,
     ) -> Option<EntityResolution> {
-        self.on_owner(move |inner| inner.try_resolve_by_net_entity_id(&room_id, &net_entity_id))
+        self.resolve_by_net_entity_id(room_id, net_entity_id)
+            .ok()
+            .flatten()
+    }
+
+    /// Resolve a NetEntityId while preserving explicit Runtime bridge failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed, missing, mismatched, and request-error Runtime results.
+    pub fn resolve_by_net_entity_id(
+        &self,
+        room_id: String,
+        net_entity_id: String,
+    ) -> Result<Option<EntityResolution>, String> {
+        self.on_owner(move |inner| inner.resolve_by_net_entity_id(&room_id, &net_entity_id))
     }
 
     /// Chat.input frames admitted from Room WS and not yet applied by a tick.
@@ -622,17 +642,23 @@ impl Inner {
                 return false;
             }
         }
-        self.schedule_expire(&session.net_entity_id);
+        self.schedule_expire(&session.room_id, &session.net_entity_id);
         true
     }
 
-    fn schedule_expire(&mut self, net_entity_id: &str) {
+    fn schedule_expire(&mut self, room_id: &str, net_entity_id: &str) {
         let due = self.clock.now_ms().saturating_add(self.reconnect_window_ms);
         if let Ok(handle) =
             self.kernel
                 .schedule_one_shot(TimerMode::WallClock, due, DISPATCH_EXPIRE)
         {
-            self.expire_watch.insert(handle, net_entity_id.to_owned());
+            self.expire_watch.insert(
+                handle,
+                ExpireTarget {
+                    room_id: room_id.to_owned(),
+                    net_entity_id: net_entity_id.to_owned(),
+                },
+            );
         }
     }
 
@@ -643,7 +669,7 @@ impl Inner {
         let handles: Vec<KernelHandle> = self
             .expire_watch
             .iter()
-            .filter(|(_, id)| *id == net_entity_id)
+            .filter(|(_, target)| target.net_entity_id == net_entity_id)
             .map(|(handle, _)| *handle)
             .collect();
         for handle in handles {
@@ -662,9 +688,14 @@ impl Inner {
             if event.dispatch_id != DISPATCH_EXPIRE {
                 continue;
             }
-            if let Some(net_entity_id) = self.expire_watch.remove(&event.handle) {
-                if self.runtime.expire(&net_entity_id).is_err() {
-                    succeeded = false;
+            if let Some(target) = self.expire_watch.remove(&event.handle) {
+                match self.runtime.expire(&target.net_entity_id) {
+                    Ok(result) if self.route_frames(&target.room_id, &result.frames) => {}
+                    Ok(_) => succeeded = false,
+                    Err(error) => {
+                        let _ = self.route_frames(&target.room_id, &error.frames);
+                        succeeded = false;
+                    }
                 }
             }
         }
@@ -826,7 +857,7 @@ impl Inner {
                 let _ = self.route_frames(&session.room_id, &[frame]);
             }
         }
-        self.schedule_expire(&session.net_entity_id);
+        self.schedule_expire(&session.room_id, &session.net_entity_id);
     }
 
     fn on_wire(&mut self, event: WireEvent) {
@@ -887,30 +918,53 @@ impl Inner {
         })
     }
 
-    fn try_resolve_by_net_entity_id(
+    fn resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
         net_entity_id: &str,
-    ) -> Option<EntityResolution> {
-        let runtime = self
+    ) -> Result<Option<EntityResolution>, String> {
+        let result = match self
             .runtime
-            .resolve_by_net_entity_id(room_id, net_entity_id)?;
-        Some(EntityResolution {
+            .resolve_by_net_entity_id(room_id, net_entity_id)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                if !self.route_frames(room_id, &error.frames) {
+                    return Err("runtime_failure".to_owned());
+                }
+                return Err(error.message);
+            }
+        };
+        if !self.route_frames(room_id, &result.frames) {
+            return Err("runtime_failure".to_owned());
+        }
+        Ok(result.value.map(|runtime| EntityResolution {
             net_entity_id: runtime.net_entity_id,
             room_id: runtime.room_id,
             entity_type: runtime.entity_type,
             account_id: runtime.account_id,
-        })
+        }))
     }
 
     fn query_attribute(&mut self, request: &AttributeQueryRequest) -> QueryResult {
-        self.runtime.query_attribute(&RuntimeQuery {
+        let result = self.runtime.query_attribute(&RuntimeQuery {
             caller_scope: request.caller_scope,
             room_id: request.room_id.clone(),
             net_entity_id: request.net_entity_id.clone(),
             attribute_id: request.attribute_id.clone(),
             connection_generation: request.connection_generation,
-        })
+        });
+        match result {
+            Ok(result) if self.route_frames(&request.room_id, &result.frames) => result.value,
+            Ok(_) => QueryResult::request_error("runtime_failure"),
+            Err(error) => {
+                if self.route_frames(&request.room_id, &error.frames) {
+                    QueryResult::request_error(&error.message)
+                } else {
+                    QueryResult::request_error("runtime_failure")
+                }
+            }
+        }
     }
 
     fn census(&mut self, room_id: &str) -> RoomCensus {

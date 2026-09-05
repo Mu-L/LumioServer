@@ -93,7 +93,7 @@ public static class HostEntry
         WireCodecType = Ecs.GetType("Lumio.GameRuntime.Ecs.WireCodec");
         EcsRegistryType = Ecs.GetType("Lumio.GameRuntime.Ecs.EcsRegistry");
         if (BindingType is null || ManagerType is null || WireCodecType is null || EcsRegistryType is null) return (EntrySuccess, Fail("boot_failed"));
-        if (WireCodecType.GetMethod("DecodeInput", BindingFlags.Public | BindingFlags.Static) is null || WireCodecType.GetMethod("EncodePack", BindingFlags.Public | BindingFlags.Static) is null) return (EntrySuccess, Fail("boot_failed"));
+        if (!HasPublicStaticMethod(WireCodecType, "DecodeInput") || !HasPublicStaticMethod(WireCodecType, "EncodePack")) return (EntrySuccess, Fail("boot_failed"));
         object? registry = EcsRegistryType.GetProperty("Current", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? FindGeneratedRegistry();
         if (registry is null) return (EntrySuccess, Fail("registry_required"));
         ulong instanceId = root.TryGetProperty("instanceId", out JsonElement id) && id.TryGetUInt64(out ulong supplied) ? supplied : 1UL;
@@ -130,6 +130,13 @@ public static class HostEntry
         foreach (string path in Directory.GetFiles(directory, "Lumio.GameRuntime.*.dll")) try { Assembly.LoadFrom(path); } catch (Exception) { }
     }
 
+    private static bool HasPublicStaticMethod(Type type, string name)
+    {
+        foreach (MethodInfo method in type.GetMethods(BindingFlags.Public | BindingFlags.Static))
+            if (method.Name == name) return true;
+        return false;
+    }
+
     private static (int, byte[]) EnqueueWorldMessage(JsonElement root)
     {
         if (!TryString(root, "messageType", out string? messageType)) return (EntryInvalidInput, Fail("bad_envelope"));
@@ -164,6 +171,33 @@ public static class HostEntry
                 RequiredString(root, "accountId"),
                 RequiredString(root, "roomId"),
                 RequiredString(root, "mode"));
+        }
+        if (type == "ExpireEntityMessage")
+        {
+            return NewMessage(type,
+                RequiredString(root, "requestId"),
+                RequiredString(root, "netEntityId"),
+                OptionalString(root, "connection"));
+        }
+        if (type == "ResolveBindingMessage")
+        {
+            return NewMessage(type,
+                RequiredString(root, "requestId"),
+                RequiredString(root, "roomId"),
+                RequiredString(root, "netEntityId"),
+                OptionalUInt64(root, "connectionGeneration"),
+                OptionalString(root, "connection"));
+        }
+        if (type == "AttributeQueryMessage")
+        {
+            return NewMessage(type,
+                RequiredString(root, "requestId"),
+                RequiredString(root, "callerScope"),
+                RequiredString(root, "roomId"),
+                RequiredString(root, "netEntityId"),
+                RequiredString(root, "attributeId"),
+                OptionalUInt64(root, "connectionGeneration"),
+                OptionalString(root, "connection"));
         }
         if (type == "InputCommandMessage") return CreateInputMessage(root);
         throw new FormatException("unsupported world message");
@@ -224,7 +258,17 @@ public static class HostEntry
 
     private static (int, byte[]) DrainOutbox()
     {
-        return (EntrySuccess, Json(new Dictionary<string, object?> { ["ok"] = true, ["frames"] = EncodeFrames(DrainManager()) }));
+        // Runtime 37eb7b0 returns a WorldDrainResponse containing C-1 frames and internal queries.
+        object response = ManagerType!.GetMethod("DrainOutbox", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Manager, null)!;
+        Type responseType = response.GetType();
+        List<object> frames = ToObjectList(responseType.GetProperty("Frames")!.GetValue(response) as IEnumerable);
+        List<object> queries = ToObjectList(responseType.GetProperty("Queries")!.GetValue(response) as IEnumerable);
+        return (EntrySuccess, Json(new Dictionary<string, object?>
+        {
+            ["ok"] = true,
+            ["frames"] = EncodeFrames(frames),
+            ["queries"] = EncodeQueries(queries),
+        }));
     }
 
     private static (int, byte[]) CaptureSnapshot()
@@ -263,11 +307,24 @@ public static class HostEntry
     }
     private static void Enqueue(object message) => ManagerType!.GetMethod("Enqueue")!.Invoke(Manager, new[] { message });
     private static void TickManager() => ManagerType!.GetMethod("Tick")!.Invoke(Manager, null);
-    private static List<object>? DrainManager() => ManagerType!.GetMethod("DrainOutbox")!.Invoke(Manager, null) is IEnumerable rows ? ToObjectList(rows) : null;
-    private static List<object> ToObjectList(IEnumerable rows) { var result = new List<object>(); foreach (object row in rows) result.Add(row); return result; }
+    private static List<object> ToObjectList(IEnumerable? rows) { var result = new List<object>(); if (rows is null) return result; foreach (object row in rows) result.Add(row); return result; }
     private static ulong WorldValue(string property) { object world = ManagerType!.GetProperty("World")!.GetValue(Manager)!; return Convert.ToUInt64(world.GetType().GetProperty(property)!.GetValue(world), System.Globalization.CultureInfo.InvariantCulture); }
 
     private static string RequiredString(JsonElement root, string name) => TryString(root, name, out string? value) ? value! : throw new FormatException("missing field: " + name);
+
+    private static string? OptionalString(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out JsonElement element) || element.ValueKind == JsonValueKind.Null) return null;
+        if (element.ValueKind == JsonValueKind.String && element.GetString() is string value) return value;
+        throw new FormatException("invalid field: " + name);
+    }
+
+    private static ulong? OptionalUInt64(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out JsonElement element) || element.ValueKind == JsonValueKind.Null) return null;
+        if (element.TryGetUInt64(out ulong value)) return value;
+        throw new FormatException("invalid field: " + name);
+    }
 
     private static bool TryString(JsonElement root, string name, out string? value)
     {
@@ -309,6 +366,44 @@ public static class HostEntry
             frames.Add(frame);
         }
         return frames;
+    }
+
+    private static List<Dictionary<string, object?>> EncodeQueries(IEnumerable<object>? messages)
+    {
+        var queries = new List<Dictionary<string, object?>>();
+        if (messages is null) return queries;
+        foreach (object message in messages)
+        {
+            Type type = message.GetType();
+            var record = new Dictionary<string, object?>
+            {
+                ["type"] = type.Name,
+                ["requestId"] = type.GetProperty("RequestId")!.GetValue(message),
+                ["outcome"] = type.GetProperty("Outcome")!.GetValue(message),
+            };
+            if (type.Name == "ResolveBindingResult" && type.GetProperty("Binding")!.GetValue(message) is object binding)
+                record["binding"] = EncodeBindingRecord(binding);
+            foreach (string name in new[] { "ObservedRevision", "ObservedTick", "NetEntityId", "RoomId", "AttributeId", "Value", "Code", "Detail" })
+            {
+                object? value = type.GetProperty(name)?.GetValue(message);
+                if (value is not null) record[char.ToLowerInvariant(name[0]) + name[1..]] = value;
+            }
+            queries.Add(record);
+        }
+        return queries;
+    }
+
+    private static Dictionary<string, object?> EncodeBindingRecord(object binding)
+    {
+        Type type = binding.GetType();
+        return new Dictionary<string, object?>
+        {
+            ["accountId"] = type.GetProperty("AccountId")!.GetValue(binding),
+            ["roomId"] = type.GetProperty("RoomId")!.GetValue(binding),
+            ["netEntityId"] = type.GetProperty("NetEntityId")!.GetValue(binding),
+            ["entityType"] = type.GetProperty("EntityType")!.GetValue(binding),
+            ["connectionGeneration"] = type.GetProperty("ConnectionGeneration")!.GetValue(binding),
+        };
     }
 
 }

@@ -8,8 +8,8 @@ use lumio_host_runtime::{KernelError, KernelFired, KernelHandle, KernelTimer, Ti
 use lumio_server_process::entity_chat::{
     normalize_net_entity_id, AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind,
     ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
-    RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
-    MAX_CHAT_INPUTS_PER_TICK,
+    RuntimeControlError, RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery,
+    RuntimeSurface, RuntimeTick, MAX_CHAT_INPUTS_PER_TICK,
 };
 
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -386,7 +386,10 @@ impl RuntimeSurface for ScriptedRuntime {
         result
     }
 
-    fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
+    fn expire(
+        &mut self,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
         let net_entity_id = normalize_net_entity_id(net_entity_id);
         self.expire_calls.push(net_entity_id.clone());
         if let Some(occupancy) = self.entities.remove(&net_entity_id) {
@@ -395,53 +398,82 @@ impl RuntimeSurface for ScriptedRuntime {
             self.retained
                 .retain(|_, row| row.binding.net_entity_id != net_entity_id);
         }
-        Ok(())
+        Ok(RuntimeControlResult::new((), Vec::new()))
     }
 
     fn resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
         net_entity_id: &str,
-    ) -> Option<RuntimeBinding> {
-        let occupancy = self.entities.get(net_entity_id)?;
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
+        let Some(occupancy) = self.entities.get(net_entity_id) else {
+            return Ok(RuntimeControlResult::new(None, Vec::new()));
+        };
         if occupancy.binding.room_id != room_id {
-            return None;
+            return Ok(RuntimeControlResult::new(None, Vec::new()));
         }
-        Some(occupancy.binding.clone())
+        Ok(RuntimeControlResult::new(
+            Some(occupancy.binding.clone()),
+            Vec::new(),
+        ))
     }
 
-    fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
+    fn query_attribute(
+        &mut self,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
         let net_entity_id = normalize_net_entity_id(&request.net_entity_id);
         if let Some(planted) = self.planted_query.get(&(
             request.room_id.clone(),
             net_entity_id.clone(),
             request.attribute_id.clone(),
         )) {
-            return planted.clone();
+            return Ok(RuntimeControlResult::new(planted.clone(), Vec::new()));
         }
         if let Some(room) = self.tombstoned.get(&net_entity_id) {
             if room != &request.room_id {
-                return QueryResult::request_error("cross_room_reference");
+                return Ok(RuntimeControlResult::new(
+                    QueryResult::request_error("cross_room_reference"),
+                    Vec::new(),
+                ));
             }
-            return QueryResult::fail(AttributeQueryOutcome::Tombstoned);
+            return Ok(RuntimeControlResult::new(
+                QueryResult::fail(AttributeQueryOutcome::Tombstoned),
+                Vec::new(),
+            ));
         }
         let Some(occupancy) = self.entities.get(&net_entity_id) else {
-            return QueryResult::fail(AttributeQueryOutcome::NonExistent);
+            return Ok(RuntimeControlResult::new(
+                QueryResult::fail(AttributeQueryOutcome::NonExistent),
+                Vec::new(),
+            ));
         };
         if occupancy.binding.room_id != request.room_id {
-            return QueryResult::request_error("cross_room_reference");
+            return Ok(RuntimeControlResult::new(
+                QueryResult::request_error("cross_room_reference"),
+                Vec::new(),
+            ));
         }
         if let Some(generation) = request.connection_generation {
             if generation < occupancy.binding.connection_generation {
-                return QueryResult::fail(AttributeQueryOutcome::StaleGeneration);
+                return Ok(RuntimeControlResult::new(
+                    QueryResult::fail(AttributeQueryOutcome::StaleGeneration),
+                    Vec::new(),
+                ));
             }
         }
         if request.caller_scope == AttributeQueryScope::ClientReplica
             && request.attribute_id == "EntityIdentity.claimedMark"
         {
-            return QueryResult::fail(AttributeQueryOutcome::Unauthorized);
+            return Ok(RuntimeControlResult::new(
+                QueryResult::fail(AttributeQueryOutcome::Unauthorized),
+                Vec::new(),
+            ));
         }
-        QueryResult::ok(occupancy.binding.entity_type.as_str().to_owned(), 0, 0)
+        Ok(RuntimeControlResult::new(
+            QueryResult::ok(occupancy.binding.entity_type.as_str().to_owned(), 0, 0),
+            Vec::new(),
+        ))
     }
 
     fn attach_member(&mut self, _room_id: &str, _connection: &str) -> Result<(), String> {
@@ -568,7 +600,10 @@ impl RuntimeSurface for SharedRuntime {
             .rebind(connection, account_id, room_id, mode, entity_type)
     }
 
-    fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
+    fn expire(
+        &mut self,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
         self.lock().expire(net_entity_id)
     }
 
@@ -576,11 +611,14 @@ impl RuntimeSurface for SharedRuntime {
         &mut self,
         room_id: &str,
         net_entity_id: &str,
-    ) -> Option<RuntimeBinding> {
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
         self.lock().resolve_by_net_entity_id(room_id, net_entity_id)
     }
 
-    fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
+    fn query_attribute(
+        &mut self,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
         self.lock().query_attribute(request)
     }
 

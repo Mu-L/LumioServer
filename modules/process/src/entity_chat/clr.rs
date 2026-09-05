@@ -10,10 +10,9 @@ use crate::sdk_loader;
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding,
-    RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    RuntimeControlError, RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery,
+    RuntimeSurface, RuntimeTick,
 };
-
-const RUNTIME_AUTHORITY_API_UNAVAILABLE: &str = "runtime_authority_api_unavailable";
 
 /// Files needed to create the CoreCLR Runtime consume host.
 #[derive(Debug, Clone)]
@@ -34,6 +33,7 @@ pub struct ClrGameplay {
     replication_assembly: String,
     ecs_assembly: String,
     booted: bool,
+    next_request_id: u64,
 }
 
 impl ClrGameplay {
@@ -57,6 +57,7 @@ impl ClrGameplay {
             replication_assembly: config.replication_assembly.to_string_lossy().into_owned(),
             ecs_assembly: config.ecs_assembly.to_string_lossy().into_owned(),
             booted: false,
+            next_request_id: 1,
         })
     }
 
@@ -102,10 +103,16 @@ impl ClrGameplay {
         }
     }
 
-    fn tick_and_drain(&mut self) -> Result<(Value, Vec<RuntimeFrame>), String> {
+    fn tick_and_drain(&mut self) -> Result<(Value, RuntimeDrain), String> {
         let tick = self.call(json!({ "op": "tick" }))?;
         let drain = self.call(json!({ "op": "drain" }))?;
-        Ok((tick, frames_from_runtime(&drain)?))
+        parse_drain_response(&drain).map(|drain| (tick, drain))
+    }
+
+    fn next_request_id(&mut self, kind: &str) -> String {
+        let id = format!("server-a2-{kind}-{}", self.next_request_id);
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        id
     }
 }
 
@@ -145,6 +152,408 @@ fn frames_from_runtime(value: &Value) -> Result<Vec<RuntimeFrame>, String> {
             })
         })
         .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeDrain {
+    frames: Vec<RuntimeFrame>,
+    queries: Vec<QueryRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueryRecord {
+    Expire {
+        request_id: String,
+        outcome: String,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    Resolve {
+        request_id: String,
+        outcome: String,
+        binding: Option<RuntimeBinding>,
+        observed_revision: Option<u64>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+    Attribute {
+        request_id: String,
+        outcome: String,
+        net_entity_id: Option<String>,
+        room_id: Option<String>,
+        attribute_id: Option<String>,
+        value: Option<String>,
+        observed_revision: Option<u64>,
+        observed_tick: Option<u64>,
+        code: Option<String>,
+        detail: Option<String>,
+    },
+}
+
+impl QueryRecord {
+    fn request_id(&self) -> &str {
+        match self {
+            Self::Expire { request_id, .. }
+            | Self::Resolve { request_id, .. }
+            | Self::Attribute { request_id, .. } => request_id,
+        }
+    }
+
+    fn type_name(&self) -> &'static str {
+        match self {
+            Self::Expire { .. } => "ExpireEntityResult",
+            Self::Resolve { .. } => "ResolveBindingResult",
+            Self::Attribute { .. } => "AttributeQueryResult",
+        }
+    }
+}
+
+/// Parses the internal `drain.queries` records emitted by Runtime.
+///
+/// The result type and outcome determine the exact required fields. This parser
+/// intentionally does not decode C-1 frame bytes or infer any Runtime state.
+fn parse_drain_response(value: &Value) -> Result<RuntimeDrain, String> {
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err("runtime drain response is not ok".to_owned());
+    }
+    if value.get("frames").is_none() {
+        return Err("runtime drain response missing frames array".to_owned());
+    }
+    let frames = frames_from_runtime(value)?;
+    let queries = parse_query_records(value)?;
+    Ok(RuntimeDrain { frames, queries })
+}
+
+fn parse_query_records(value: &Value) -> Result<Vec<QueryRecord>, String> {
+    let rows = value
+        .get("queries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "runtime drain response missing queries array".to_owned())?;
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| parse_query_record(index, row))
+        .collect()
+}
+
+fn parse_query_record(index: usize, value: &Value) -> Result<QueryRecord, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("runtime query result {index} is not an object"))?;
+    let type_name = required_query_string(object, index, "type")?;
+    let request_id = required_query_string(object, index, "requestId")?;
+    if request_id.is_empty() {
+        return Err(format!("runtime query result {index} requestId is empty"));
+    }
+    let outcome = required_query_string(object, index, "outcome")?;
+    match type_name.as_str() {
+        "ExpireEntityResult" => parse_expire_record(index, object, request_id, outcome),
+        "ResolveBindingResult" => parse_resolve_record(index, object, request_id, outcome),
+        "AttributeQueryResult" => parse_attribute_record(index, object, request_id, outcome),
+        other => Err(format!(
+            "runtime query result {index} has unknown type {other}"
+        )),
+    }
+}
+
+fn parse_expire_record(
+    index: usize,
+    object: &serde_json::Map<String, Value>,
+    request_id: String,
+    outcome: String,
+) -> Result<QueryRecord, String> {
+    match outcome.as_str() {
+        "accepted" | "tombstoned" | "non_existent" => {
+            ensure_query_keys(index, object, &["type", "requestId", "outcome"])?;
+            Ok(QueryRecord::Expire {
+                request_id,
+                outcome,
+                code: None,
+                detail: None,
+            })
+        }
+        "request_error" => {
+            ensure_query_keys(
+                index,
+                object,
+                &["type", "requestId", "outcome", "code", "detail"],
+            )?;
+            Ok(QueryRecord::Expire {
+                request_id,
+                outcome,
+                code: Some(required_query_string(object, index, "code")?),
+                detail: Some(required_query_string(object, index, "detail")?),
+            })
+        }
+        other => Err(format!(
+            "runtime query result {index} has invalid ExpireEntityResult outcome {other}"
+        )),
+    }
+}
+
+fn parse_resolve_record(
+    index: usize,
+    object: &serde_json::Map<String, Value>,
+    request_id: String,
+    outcome: String,
+) -> Result<QueryRecord, String> {
+    match outcome.as_str() {
+        "ok" => {
+            ensure_query_keys(
+                index,
+                object,
+                &[
+                    "type",
+                    "requestId",
+                    "outcome",
+                    "binding",
+                    "observedRevision",
+                ],
+            )?;
+            let binding = parse_binding_record(index, object.get("binding"))?;
+            let observed_revision = required_query_u64(object, index, "observedRevision")?;
+            Ok(QueryRecord::Resolve {
+                request_id,
+                outcome,
+                binding: Some(binding),
+                observed_revision: Some(observed_revision),
+                code: None,
+                detail: None,
+            })
+        }
+        "non_existent" | "stale_generation" | "invisible" | "unauthorized" | "tombstoned" => {
+            ensure_query_keys(index, object, &["type", "requestId", "outcome"])?;
+            Ok(QueryRecord::Resolve {
+                request_id,
+                outcome,
+                binding: None,
+                observed_revision: None,
+                code: None,
+                detail: None,
+            })
+        }
+        "request_error" => {
+            ensure_query_keys(
+                index,
+                object,
+                &["type", "requestId", "outcome", "code", "detail"],
+            )?;
+            Ok(QueryRecord::Resolve {
+                request_id,
+                outcome,
+                binding: None,
+                observed_revision: None,
+                code: Some(required_query_string(object, index, "code")?),
+                detail: Some(required_query_string(object, index, "detail")?),
+            })
+        }
+        other => Err(format!(
+            "runtime query result {index} has invalid ResolveBindingResult outcome {other}"
+        )),
+    }
+}
+
+fn parse_attribute_record(
+    index: usize,
+    object: &serde_json::Map<String, Value>,
+    request_id: String,
+    outcome: String,
+) -> Result<QueryRecord, String> {
+    match outcome.as_str() {
+        "ok" => {
+            ensure_query_keys(
+                index,
+                object,
+                &[
+                    "type",
+                    "requestId",
+                    "outcome",
+                    "netEntityId",
+                    "roomId",
+                    "attributeId",
+                    "value",
+                    "observedRevision",
+                    "observedTick",
+                ],
+            )?;
+            let value = object
+                .get("value")
+                .filter(|value| !value.is_null())
+                .ok_or_else(|| format!("runtime query result {index} is missing value"))?;
+            let value = if let Some(value) = value.as_str() {
+                value.to_owned()
+            } else {
+                serde_json::to_string(value).map_err(|_| {
+                    format!("runtime query result {index} value is not serializable")
+                })?
+            };
+            Ok(QueryRecord::Attribute {
+                request_id,
+                outcome,
+                net_entity_id: Some(required_query_string(object, index, "netEntityId")?),
+                room_id: Some(required_query_string(object, index, "roomId")?),
+                attribute_id: Some(required_query_string(object, index, "attributeId")?),
+                value: Some(value),
+                observed_revision: Some(required_query_u64(object, index, "observedRevision")?),
+                observed_tick: Some(required_query_u64(object, index, "observedTick")?),
+                code: None,
+                detail: None,
+            })
+        }
+        "non_existent" | "stale_generation" | "invisible" | "unauthorized" | "tombstoned" => {
+            ensure_query_keys(index, object, &["type", "requestId", "outcome"])?;
+            Ok(QueryRecord::Attribute {
+                request_id,
+                outcome,
+                net_entity_id: None,
+                room_id: None,
+                attribute_id: None,
+                value: None,
+                observed_revision: None,
+                observed_tick: None,
+                code: None,
+                detail: None,
+            })
+        }
+        "request_error" => {
+            ensure_query_keys(
+                index,
+                object,
+                &["type", "requestId", "outcome", "code", "detail"],
+            )?;
+            Ok(QueryRecord::Attribute {
+                request_id,
+                outcome,
+                net_entity_id: None,
+                room_id: None,
+                attribute_id: None,
+                value: None,
+                observed_revision: None,
+                observed_tick: None,
+                code: Some(required_query_string(object, index, "code")?),
+                detail: Some(required_query_string(object, index, "detail")?),
+            })
+        }
+        other => Err(format!(
+            "runtime query result {index} has invalid AttributeQueryResult outcome {other}"
+        )),
+    }
+}
+
+fn parse_binding_record(index: usize, value: Option<&Value>) -> Result<RuntimeBinding, String> {
+    let object = value
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("runtime query result {index} is missing binding"))?;
+    ensure_query_keys(
+        index,
+        object,
+        &[
+            "accountId",
+            "roomId",
+            "netEntityId",
+            "entityType",
+            "connectionGeneration",
+        ],
+    )?;
+    let entity_type = match required_query_string(object, index, "entityType")?.as_str() {
+        "player" => BoundEntityKind::Player,
+        "bot" => BoundEntityKind::Bot,
+        other => {
+            return Err(format!(
+                "runtime query result {index} has invalid entityType {other}"
+            ))
+        }
+    };
+    Ok(RuntimeBinding {
+        account_id: required_query_string(object, index, "accountId")?,
+        room_id: required_query_string(object, index, "roomId")?,
+        net_entity_id: required_query_string(object, index, "netEntityId")?,
+        entity_type,
+        connection_generation: required_query_u64(object, index, "connectionGeneration")?,
+    })
+}
+
+fn required_query_string(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+    name: &str,
+) -> Result<String, String> {
+    object
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| format!("runtime query result {index} is missing or invalid {name}"))
+}
+
+fn required_query_u64(
+    object: &serde_json::Map<String, Value>,
+    index: usize,
+    name: &str,
+) -> Result<u64, String> {
+    object
+        .get(name)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("runtime query result {index} is missing or invalid {name}"))
+}
+
+fn ensure_query_keys(
+    index: usize,
+    object: &serde_json::Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), String> {
+    if let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str())) {
+        return Err(format!(
+            "runtime query result {index} has unexpected field {key}"
+        ));
+    }
+    Ok(())
+}
+
+fn query_error(code: Option<&str>, detail: Option<&str>) -> String {
+    match (code, detail) {
+        (Some(code), Some(detail)) => format!("{code}: {detail}"),
+        (Some(code), None) => code.to_owned(),
+        _ => "runtime_failure".to_owned(),
+    }
+}
+
+fn ensure_tick_ok(tick: &Value, frames: &[RuntimeFrame]) -> Result<(), String> {
+    if tick.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    Err(tick
+        .get("code")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| error_from_frames(frames))
+        .unwrap_or_else(|| "runtime_failure".to_owned()))
+}
+
+fn correlated_query<'a>(
+    queries: &'a [QueryRecord],
+    request_id: &str,
+    expected_type: &str,
+) -> Result<&'a QueryRecord, String> {
+    let matches: Vec<&QueryRecord> = queries
+        .iter()
+        .filter(|query| query.request_id() == request_id)
+        .collect();
+    if matches.is_empty() {
+        return Err("runtime query result missing".to_owned());
+    }
+    if matches.len() != 1 {
+        return Err("runtime query result has duplicate requestId".to_owned());
+    }
+    let result = matches[0];
+    if result.type_name() != expected_type {
+        return Err(format!(
+            "runtime query result type mismatch: expected {expected_type}, got {}",
+            result.type_name()
+        ));
+    }
+    if queries.len() != 1 {
+        return Err("runtime query result requestId mismatch".to_owned());
+    }
+    Ok(result)
 }
 
 fn optional_frame_string(
@@ -224,10 +633,14 @@ impl RuntimeSurface for ClrGameplay {
         if let Err(code) = self.enqueue(enqueue) {
             return RuntimeAdmit::reject(&code);
         }
-        let (tick, frames) = match self.tick_and_drain() {
+        let (tick, drain) = match self.tick_and_drain() {
             Ok(result) => result,
             Err(_) => return RuntimeAdmit::reject("runtime_failure"),
         };
+        let RuntimeDrain { frames, queries } = drain;
+        if !queries.is_empty() {
+            return RuntimeAdmit::reject("runtime_failure");
+        }
         if tick.get("ok").and_then(Value::as_bool) != Some(true) {
             let code = tick
                 .get("code")
@@ -266,7 +679,11 @@ impl RuntimeSurface for ClrGameplay {
             "messageType": "DisconnectConnectionMessage",
             "connection": connection,
         }))?;
-        let (tick, frames) = self.tick_and_drain()?;
+        let (tick, drain) = self.tick_and_drain()?;
+        let RuntimeDrain { frames, queries } = drain;
+        if !queries.is_empty() {
+            return Err("unexpected runtime query result".to_owned());
+        }
         if tick.get("ok").and_then(Value::as_bool) != Some(true) {
             let code = tick
                 .get("code")
@@ -304,10 +721,14 @@ impl RuntimeSurface for ClrGameplay {
         })) {
             return RuntimeAdmit::reject(&code);
         }
-        let (tick, frames) = match self.tick_and_drain() {
+        let (tick, drain) = match self.tick_and_drain() {
             Ok(result) => result,
             Err(_) => return RuntimeAdmit::reject("runtime_failure"),
         };
+        let RuntimeDrain { frames, queries } = drain;
+        if !queries.is_empty() {
+            return RuntimeAdmit::reject("runtime_failure");
+        }
         if tick.get("ok").and_then(Value::as_bool) != Some(true) {
             let code = tick
                 .get("code")
@@ -336,22 +757,152 @@ impl RuntimeSurface for ClrGameplay {
         result
     }
 
-    fn expire(&mut self, net_entity_id: &str) -> Result<(), String> {
-        let _ = net_entity_id;
-        Err(RUNTIME_AUTHORITY_API_UNAVAILABLE.to_owned())
+    fn expire(
+        &mut self,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
+        let request_id = self.next_request_id("expire");
+        self.enqueue(json!({
+            "op": "enqueue",
+            "messageType": "ExpireEntityMessage",
+            "requestId": request_id.clone(),
+            "netEntityId": net_entity_id,
+        }))?;
+        let (tick, drain) = self.tick_and_drain()?;
+        ensure_tick_ok(&tick, &drain.frames)?;
+        let result = correlated_query(&drain.queries, &request_id, "ExpireEntityResult")?.clone();
+        match result {
+            QueryRecord::Expire { outcome, .. } if outcome != "request_error" => {
+                Ok(RuntimeControlResult::new((), drain.frames))
+            }
+            QueryRecord::Expire { code, detail, .. } => Err(RuntimeControlError::new(
+                query_error(code.as_deref(), detail.as_deref()),
+                drain.frames,
+            )),
+            _ => Err(RuntimeControlError::new(
+                "runtime query result type mismatch".to_owned(),
+                drain.frames,
+            )),
+        }
     }
 
     fn resolve_by_net_entity_id(
         &mut self,
-        _room_id: &str,
-        _net_entity_id: &str,
-    ) -> Option<RuntimeBinding> {
-        None
+        room_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
+        let request_id = self.next_request_id("resolve");
+        let result = self
+            .enqueue(json!({
+                "op": "enqueue",
+                "messageType": "ResolveBindingMessage",
+                "requestId": request_id.clone(),
+                "roomId": room_id,
+                "netEntityId": net_entity_id,
+            }))
+            .and_then(|()| self.tick_and_drain())
+            .and_then(|(tick, drain)| {
+                ensure_tick_ok(&tick, &drain.frames)?;
+                let record =
+                    correlated_query(&drain.queries, &request_id, "ResolveBindingResult")?.clone();
+                Ok((record, drain.frames))
+            });
+        let (record, frames) = result?;
+        match record {
+            QueryRecord::Resolve {
+                outcome,
+                binding: Some(binding),
+                ..
+            } if outcome == "ok" => {
+                if binding.room_id != room_id || binding.net_entity_id != net_entity_id {
+                    return Err(RuntimeControlError::new(
+                        "runtime query result request mismatch".to_owned(),
+                        frames,
+                    ));
+                }
+                Ok(RuntimeControlResult::new(Some(binding), frames))
+            }
+            QueryRecord::Resolve {
+                outcome,
+                code,
+                detail,
+                ..
+            } if outcome == "request_error" => Err(RuntimeControlError::new(
+                query_error(code.as_deref(), detail.as_deref()),
+                frames,
+            )),
+            QueryRecord::Resolve { .. } => Ok(RuntimeControlResult::new(None, frames)),
+            _ => Err(RuntimeControlError::new(
+                "runtime query result type mismatch".to_owned(),
+                frames,
+            )),
+        }
     }
 
-    fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult {
-        let _ = request;
-        QueryResult::request_error(RUNTIME_AUTHORITY_API_UNAVAILABLE)
+    fn query_attribute(
+        &mut self,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
+        let request_id = self.next_request_id("attribute");
+        let mut message = json!({
+            "op": "enqueue",
+            "messageType": "AttributeQueryMessage",
+            "requestId": request_id.clone(),
+            "callerScope": request.caller_scope.as_runtime_str(),
+            "roomId": request.room_id,
+            "netEntityId": request.net_entity_id,
+            "attributeId": request.attribute_id,
+        });
+        if let Some(generation) = request.connection_generation {
+            message["connectionGeneration"] = json!(generation);
+        }
+        let result = self
+            .enqueue(message)
+            .and_then(|()| self.tick_and_drain())
+            .and_then(|(tick, drain)| {
+                ensure_tick_ok(&tick, &drain.frames)?;
+                let record =
+                    correlated_query(&drain.queries, &request_id, "AttributeQueryResult")?.clone();
+                Ok((record, drain.frames))
+            });
+        let (record, frames) = result?;
+        let value = match record {
+            QueryRecord::Attribute {
+                outcome,
+                net_entity_id,
+                room_id,
+                attribute_id,
+                value,
+                observed_tick,
+                observed_revision,
+                ..
+            } if outcome == "ok" => {
+                if net_entity_id.as_deref() != Some(request.net_entity_id.as_str())
+                    || room_id.as_deref() != Some(request.room_id.as_str())
+                    || attribute_id.as_deref() != Some(request.attribute_id.as_str())
+                {
+                    return Err(RuntimeControlError::new(
+                        "runtime query result request mismatch".to_owned(),
+                        frames,
+                    ));
+                }
+                QueryResult::ok(
+                    value.unwrap_or_default(),
+                    observed_tick.unwrap_or_default(),
+                    observed_revision.unwrap_or_default(),
+                )
+            }
+            QueryRecord::Attribute { outcome, code, .. } => {
+                QueryResult::from_runtime(&outcome, code.as_deref(), None)
+            }
+            _ => {
+                return Err(RuntimeControlError::new(
+                    "runtime query result type mismatch".to_owned(),
+                    frames,
+                ))
+            }
+        };
+        Ok(RuntimeControlResult::new(value, frames))
     }
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {
@@ -381,15 +932,18 @@ impl RuntimeSurface for ClrGameplay {
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
         let _ = (room_id, tick_id);
-        let (value, frames) = match self.tick_and_drain() {
+        let (value, drain) = match self.tick_and_drain() {
             Ok(result) => result,
             Err(_) => return RuntimeTick::failed("runtime_failure"),
         };
+        if !drain.queries.is_empty() {
+            return RuntimeTick::failed("unexpected_query_result");
+        }
         let mut tick = match tick_from_hostentry_json(value) {
             Ok(tick) => tick,
             Err(_) => return RuntimeTick::failed("runtime_failure"),
         };
-        tick.frames = frames;
+        tick.frames = drain.frames;
         if let Some(code) = error_from_frames(&tick.frames) {
             tick.ok = false;
             tick.code = Some(code);
@@ -603,5 +1157,133 @@ mod tests {
             frames_from_runtime(&value).expect_err("malformed metadata must fail the bridge"),
             "runtime frame connectionGeneration must be an unsigned integer"
         );
+    }
+
+    #[test]
+    fn strict_query_parser_accepts_correlated_c2_records() {
+        let value = json!({
+            "ok": true,
+            "frames": [],
+            "queries": [
+                {
+                    "type": "ExpireEntityResult",
+                    "requestId": "expire-1",
+                    "outcome": "tombstoned"
+                },
+                {
+                    "type": "ResolveBindingResult",
+                    "requestId": "resolve-1",
+                    "outcome": "ok",
+                    "binding": {
+                        "accountId": "acct-1",
+                        "roomId": "room-1",
+                        "netEntityId": "00000000000000010000000000000001",
+                        "entityType": "bot",
+                        "connectionGeneration": 2
+                    },
+                    "observedRevision": 9
+                },
+                {
+                    "type": "AttributeQueryResult",
+                    "requestId": "attribute-1",
+                    "outcome": "ok",
+                    "netEntityId": "00000000000000010000000000000001",
+                    "roomId": "room-1",
+                    "attributeId": "EntityIdentity.entityType",
+                    "value": "bot",
+                    "observedRevision": 9,
+                    "observedTick": 4
+                }
+            ]
+        });
+        let drain = parse_drain_response(&value).expect("valid C-2 records");
+        assert_eq!(drain.queries.len(), 3);
+        assert_eq!(drain.queries[1].request_id(), "resolve-1");
+        assert_eq!(drain.queries[2].type_name(), "AttributeQueryResult");
+    }
+
+    #[test]
+    fn strict_query_parser_rejects_malformed_missing_and_mismatched_records() {
+        let malformed = json!({
+            "queries": [{
+                "type": "AttributeQueryResult",
+                "requestId": "q-1",
+                "outcome": "ok",
+                "netEntityId": "n",
+                "roomId": "r",
+                "attributeId": "A.b",
+                "value": "x",
+                "observedRevision": 1,
+                "observedTick": "bad"
+            }]
+        });
+        assert!(parse_query_records(&malformed)
+            .expect_err("wrong observedTick type")
+            .contains("observedTick"));
+
+        let missing = json!({ "ok": true, "frames": [] });
+        assert_eq!(
+            parse_drain_response(&missing).expect_err("missing query array"),
+            "runtime drain response missing queries array"
+        );
+
+        let wrong_outcome = json!({
+            "queries": [{
+                "type": "ResolveBindingResult",
+                "requestId": "q-1",
+                "outcome": "accepted"
+            }]
+        });
+        assert!(parse_query_records(&wrong_outcome)
+            .expect_err("wrong result outcome")
+            .contains("ResolveBindingResult outcome"));
+
+        let duplicate = json!({
+            "queries": [
+                {"type": "ExpireEntityResult", "requestId": "q-1", "outcome": "accepted"},
+                {"type": "ExpireEntityResult", "requestId": "q-1", "outcome": "tombstoned"}
+            ]
+        });
+        let rows = parse_query_records(&duplicate).expect("shape-valid duplicate");
+        assert!(correlated_query(&rows, "q-1", "ExpireEntityResult")
+            .expect_err("duplicate correlation")
+            .contains("duplicate"));
+        assert!(correlated_query(&rows, "missing", "ExpireEntityResult")
+            .expect_err("missing correlation")
+            .contains("missing"));
+    }
+
+    #[test]
+    fn c2_request_errors_require_code_and_detail() {
+        let missing_detail = json!({
+            "queries": [{
+                "type": "AttributeQueryResult",
+                "requestId": "q-1",
+                "outcome": "request_error",
+                "code": "undeclared_attribute"
+            }]
+        });
+        assert!(parse_query_records(&missing_detail)
+            .expect_err("request_error detail is required")
+            .contains("detail"));
+    }
+
+    #[test]
+    fn drain_response_requires_ok_frames_and_queries() {
+        for (value, expected) in [
+            (
+                json!({ "ok": false, "frames": [], "queries": [] }),
+                "not ok",
+            ),
+            (json!({ "ok": true, "queries": [] }), "missing frames"),
+            (json!({ "ok": true, "frames": [] }), "missing queries"),
+        ] {
+            assert!(
+                parse_drain_response(&value)
+                    .expect_err("incomplete drain response")
+                    .contains(expected),
+                "{value}"
+            );
+        }
     }
 }

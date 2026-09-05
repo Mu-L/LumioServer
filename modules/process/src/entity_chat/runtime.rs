@@ -86,6 +86,40 @@ pub struct RuntimeDisconnect {
     pub frames: Vec<RuntimeFrame>,
 }
 
+/// One owner-thread control result plus every raw C-1 frame emitted by its tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeControlResult<T> {
+    pub value: T,
+    pub frames: Vec<RuntimeFrame>,
+}
+
+impl<T> RuntimeControlResult<T> {
+    #[must_use]
+    pub const fn new(value: T, frames: Vec<RuntimeFrame>) -> Self {
+        Self { value, frames }
+    }
+}
+
+/// An explicit Runtime control failure plus any C-1 frames emitted by its tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeControlError {
+    pub message: String,
+    pub frames: Vec<RuntimeFrame>,
+}
+
+impl RuntimeControlError {
+    #[must_use]
+    pub const fn new(message: String, frames: Vec<RuntimeFrame>) -> Self {
+        Self { message, frames }
+    }
+}
+
+impl From<String> for RuntimeControlError {
+    fn from(message: String) -> Self {
+        Self::new(message, Vec::new())
+    }
+}
+
 /// Attribute query forwarded to Runtime.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeQuery {
@@ -286,15 +320,21 @@ pub trait RuntimeSurface: Send {
         entity_type: BoundEntityKind,
     ) -> RuntimeAdmit;
 
-    fn expire(&mut self, net_entity_id: &str) -> Result<(), String>;
+    fn expire(
+        &mut self,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError>;
 
     fn resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
         net_entity_id: &str,
-    ) -> Option<RuntimeBinding>;
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError>;
 
-    fn query_attribute(&mut self, request: &RuntimeQuery) -> QueryResult;
+    fn query_attribute(
+        &mut self,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError>;
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String>;
 

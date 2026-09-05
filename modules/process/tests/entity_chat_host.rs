@@ -198,6 +198,12 @@ fn attribute_query_is_forwarded_to_runtime() {
         "EntityIdentity.claimedMark",
         QueryResult::fail(AttributeQueryOutcome::Unauthorized),
     );
+    runtime.lock().plant_query(
+        "room-main",
+        &binding.net_entity_id,
+        "EntityIdentity.accountId",
+        QueryResult::request_error("undeclared_attribute"),
+    );
     let ok = host.query_attribute(AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: "room-main".to_owned(),
@@ -233,11 +239,23 @@ fn attribute_query_is_forwarded_to_runtime() {
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: Some(0),
     });
+    let undeclared = host.query_attribute(AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: host.must_self("c-browser").net_entity_id,
+        attribute_id: "EntityIdentity.accountId".to_owned(),
+        connection_generation: None,
+    });
     assert_eq!(ok.outcome, AttributeQueryOutcome::Ok);
     assert_eq!(invisible.outcome, AttributeQueryOutcome::Invisible);
     assert_eq!(unauthorized.outcome, AttributeQueryOutcome::Unauthorized);
     assert_eq!(missing.outcome, AttributeQueryOutcome::NonExistent);
     assert_eq!(stale.outcome, AttributeQueryOutcome::StaleGeneration);
+    assert_eq!(undeclared.outcome, AttributeQueryOutcome::RequestError);
+    assert_eq!(
+        undeclared.error_code.as_deref(),
+        Some("undeclared_attribute")
+    );
 }
 
 #[test]

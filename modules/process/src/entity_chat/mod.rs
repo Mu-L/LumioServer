@@ -51,8 +51,9 @@ pub use host::{
 };
 pub use runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,
-    PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeDisconnect,
-    RuntimeFrame, RuntimeQuery, RuntimeSurface, RuntimeTick,
+    PersistRecord, QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeControlError,
+    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface,
+    RuntimeTick,
 };
 pub use suite::{
     apply_pending_chat_ticks, drain_chat_event_deltas, run_round, run_round_blocking,

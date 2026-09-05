@@ -270,7 +270,7 @@ fn host_entry_uses_runtime_world_manager_passthrough_and_codec() {
 }
 
 #[test]
-fn host_entry_dispatch_is_exact_runtime_five_op_allowlist() {
+fn host_entry_dispatch_is_exact_runtime_six_op_allowlist() {
     let path = process_root()
         .parent()
         .expect("modules")
@@ -308,6 +308,81 @@ fn host_entry_dispatch_is_exact_runtime_five_op_allowlist() {
             "legacy op {removed} must not be dispatchable"
         );
     }
+}
+
+#[test]
+fn host_entry_drain_exposes_internal_runtime_queries_without_new_ops() {
+    let path = process_root()
+        .parent()
+        .expect("modules")
+        .parent()
+        .expect("repo")
+        .join("entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/HostEntry.cs");
+    let text = fs::read_to_string(&path).expect("HostEntry.cs");
+    assert!(
+        text.contains("WorldDrainResponse"),
+        "HostEntry must consume Runtime Drain response"
+    );
+    assert!(
+        text.contains("queries"),
+        "HostEntry drain must expose internal query records"
+    );
+    for required in [
+        "ExpireEntityMessage",
+        "ResolveBindingMessage",
+        "AttributeQueryMessage",
+    ] {
+        assert!(
+            text.contains(required),
+            "HostEntry must enqueue Runtime {required}"
+        );
+    }
+}
+
+#[test]
+fn clr_bridge_has_strict_correlated_query_result_parser() {
+    let path = process_root().join("src/entity_chat/clr.rs");
+    let text = fs::read_to_string(&path).expect("clr.rs");
+    for required in [
+        "parse_query_records",
+        "requestId",
+        "ResolveBindingResult",
+        "AttributeQueryResult",
+        "ExpireEntityResult",
+        "request_error",
+        "runtime query result missing",
+    ] {
+        assert!(
+            text.contains(required),
+            "CLR bridge query contract missing {required}"
+        );
+    }
+    assert!(
+        !text.contains("RUNTIME_AUTHORITY_API_UNAVAILABLE"),
+        "A2 Runtime owner-thread controls must replace the unavailable placeholder"
+    );
+}
+
+#[test]
+fn runtime_control_results_preserve_and_route_c1_frames() {
+    let runtime =
+        fs::read_to_string(process_root().join("src/entity_chat/runtime.rs")).expect("runtime.rs");
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    assert!(
+        runtime.contains("RuntimeControlResult")
+            && runtime.contains("pub frames: Vec<RuntimeFrame>"),
+        "owner-thread control results must carry raw C-1 frames"
+    );
+    let expire = rust_fn_src(&host, "fn drive_wall");
+    assert!(
+        expire.contains("route_frames") && expire.contains("result.frames"),
+        "expiry ticks must route Runtime C-1 frames"
+    );
+    let query = rust_fn_src(&host, "fn query_attribute(&mut self");
+    assert!(
+        query.contains("route_frames") && query.contains("result.frames"),
+        "attribute query ticks must route Runtime C-1 frames"
+    );
 }
 
 #[test]
