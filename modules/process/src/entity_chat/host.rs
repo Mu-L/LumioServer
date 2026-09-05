@@ -1118,18 +1118,24 @@ impl Inner {
 
     fn schedule_expire(&mut self, room_id: &str, net_entity_id: &str) {
         let due = self.clock.now_ms().saturating_add(self.reconnect_window_ms);
-        if let Ok(handle) =
-            self.kernel
-                .schedule_one_shot(TimerMode::WallClock, due, DISPATCH_EXPIRE)
-        {
-            self.expire_watch.insert(
-                handle,
-                ExpireTarget {
-                    room_id: room_id.to_owned(),
-                    net_entity_id: net_entity_id.to_owned(),
-                },
-            );
-        }
+        let _ = self.schedule_expire_at(due, room_id, net_entity_id);
+    }
+
+    fn schedule_expire_at(&mut self, due: u64, room_id: &str, net_entity_id: &str) -> bool {
+        let Ok(handle) = self
+            .kernel
+            .schedule_one_shot(TimerMode::WallClock, due, DISPATCH_EXPIRE)
+        else {
+            return false;
+        };
+        self.expire_watch.insert(
+            handle,
+            ExpireTarget {
+                room_id: room_id.to_owned(),
+                net_entity_id: net_entity_id.to_owned(),
+            },
+        );
+        true
     }
 
     fn drive_wall(&mut self) -> bool {
@@ -1143,12 +1149,17 @@ impl Inner {
                 continue;
             }
             if let Some(target) = self.expire_watch.remove(&event.handle) {
-                let request_id = self.next_query_id("expire");
                 if !self.correlation_capacity_available() {
                     self.record_query_failure("runtime_query_capacity");
+                    let _ = self.schedule_expire_at(
+                        now.saturating_add(1),
+                        &target.room_id,
+                        &target.net_entity_id,
+                    );
                     succeeded = false;
                     continue;
                 }
+                let request_id = self.next_query_id("expire");
                 match self
                     .runtime
                     .expire_with_request_id(&request_id, &target.net_entity_id)

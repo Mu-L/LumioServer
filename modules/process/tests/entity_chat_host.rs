@@ -509,6 +509,78 @@ fn unique_failed_async_queries_are_bounded_without_orphaning_pending_callers() {
 }
 
 #[test]
+fn expiry_retries_after_query_correlation_capacity_releases() {
+    const EXPECTED_CAPACITY: usize = MAX_PENDING_QUERIES;
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let (host, keys) = host_with(runtime.clone());
+    let clock = host.clock();
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-expiry-capacity".to_owned(),
+        credential(&keys, "ExpiryCapacityBot", true),
+    );
+    let binding = host.must_self("c-expiry-capacity");
+    let requests: Vec<_> = (0..EXPECTED_CAPACITY)
+        .map(|index| AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: "room-main".to_owned(),
+            net_entity_id: binding.net_entity_id.clone(),
+            attribute_id: format!("EntityIdentity.expiry-capacity-{index}"),
+            connection_generation: None,
+        })
+        .collect();
+    for request in &requests {
+        assert_eq!(
+            host.query_attribute(request.clone()).error_code.as_deref(),
+            Some("runtime_query_pending")
+        );
+    }
+
+    assert!(host
+        .disconnect("c-expiry-capacity".to_owned())
+        .expect("disconnect"));
+    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(
+        !host.drive_kernel(),
+        "expiry must report correlation pressure"
+    );
+    assert!(runtime.lock().expire_calls().is_empty());
+
+    assert!(!host.run_tick("room-main".to_owned()).ok);
+    let released = host.query_attribute(requests[0].clone());
+    assert_eq!(released.outcome, AttributeQueryOutcome::Ok);
+
+    clock.advance_ms(1);
+    assert!(
+        host.drive_kernel(),
+        "retained expiry must retry after release"
+    );
+    assert!(runtime
+        .lock()
+        .expire_calls()
+        .iter()
+        .any(|id| id == &binding.net_entity_id));
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    let tombstone_request = AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id,
+        attribute_id: "EntityIdentity.entityType".to_owned(),
+        connection_generation: None,
+    };
+    assert_eq!(
+        host.query_attribute(tombstone_request.clone())
+            .error_code
+            .as_deref(),
+        Some("runtime_query_pending")
+    );
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    let tombstone = host.query_attribute(tombstone_request);
+    assert_eq!(tombstone.outcome, AttributeQueryOutcome::Tombstoned);
+}
+
+#[test]
 fn restore_does_not_create_active_sessions() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
