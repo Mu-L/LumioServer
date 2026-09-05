@@ -8,8 +8,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::envelope::InputCommand;
-
 const FLEET_WAIT: Duration = Duration::from_secs(15);
 const FLEET_PROGRESS_POLL: Duration = Duration::from_millis(1);
 const R4_04_BLOCKED: &str = "BLOCKED: 等 R4-04";
@@ -177,7 +175,7 @@ pub fn run_client_bot_fleet<F>(
     bot_host: &Path,
     engine_native: &Path,
     room_uri: &str,
-    envelopes: &[(String, InputCommand)],
+    bot_count: u32,
     out_dir: &Path,
     dotnet: &str,
     on_progress: F,
@@ -189,7 +187,7 @@ where
         bot_host,
         engine_native,
         room_uri,
-        envelopes,
+        bot_count,
         out_dir,
         dotnet,
     )?;
@@ -205,13 +203,13 @@ pub fn start_client_bot_fleet(
     bot_host: &Path,
     engine_native: &Path,
     room_uri: &str,
-    envelopes: &[(String, InputCommand)],
+    bot_count: u32,
     out_dir: &Path,
     dotnet: &str,
 ) -> Result<ClientBotFleet, String> {
     std::fs::create_dir_all(out_dir).map_err(|error| error.to_string())?;
     let host = ensure_bot_host_executable(bot_host, dotnet)?;
-    let launch = bot_host_launch(room_uri, envelopes, engine_native, out_dir);
+    let launch = bot_host_launch(room_uri, bot_count, engine_native, out_dir);
     let release_path = launch.log_dir.join("release.flag");
     let stdout_path = launch.log_dir.join("bot-host.stdout");
     let stderr_path = launch.log_dir.join("bot-host.stderr");
@@ -234,9 +232,7 @@ pub fn start_client_bot_fleet(
         log_dir: launch.log_dir,
         stdout_path,
         stderr_path,
-        expected_submissions: u32::try_from(envelopes.len())
-            .unwrap_or(u32::MAX)
-            .saturating_mul(3),
+        expected_submissions: expected_submission_count(bot_count),
     })
 }
 
@@ -349,17 +345,11 @@ fn build_bot_host(csproj: &Path, dotnet: &str) -> Result<PathBuf, String> {
 
 fn bot_host_launch(
     server: &str,
-    envelopes: &[(String, InputCommand)],
+    bot_count: u32,
     engine_native: &Path,
     log_dir: &Path,
 ) -> BotHostLaunch {
-    let count = if envelopes.is_empty() {
-        super::BOT_COUNT
-    } else {
-        u32::try_from(envelopes.len())
-            .unwrap_or(super::BOT_COUNT)
-            .max(1)
-    };
+    let count = bot_count.max(1);
     BotHostLaunch {
         server: server.to_owned(),
         account_from: super::bot_name(1),
@@ -367,6 +357,10 @@ fn bot_host_launch(
         engine_native: engine_native.to_path_buf(),
         log_dir: log_dir.to_path_buf(),
     }
+}
+
+const fn expected_submission_count(bot_count: u32) -> u32 {
+    bot_count
 }
 
 fn apply_bot_host_launch(command: &mut Command, launch: &BotHostLaunch) {
@@ -506,8 +500,8 @@ fn read_bot_host_logs(log_dir: &Path) -> Result<ClientBotTrace, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bot_host_launch, discover_bot_host_in, read_bot_host_logs, BotHostEnv, ClientBotFleet,
-        ClientBotTrace, R4_04_BLOCKED,
+        bot_host_launch, discover_bot_host_in, expected_submission_count, read_bot_host_logs,
+        BotHostEnv, ClientBotFleet, ClientBotTrace, R4_04_BLOCKED,
     };
     use std::collections::HashMap;
     use std::fs;
@@ -589,13 +583,18 @@ mod tests {
     fn launch_spec_uses_inclusive_bot_account_range() {
         let spec = bot_host_launch(
             "ws://127.0.0.1:1/",
-            &[],
+            100,
             Path::new("engine"),
             Path::new("logs"),
         );
         assert_eq!(spec.server, "ws://127.0.0.1:1/");
         assert_eq!(spec.account_from, "Bot01");
         assert_eq!(spec.account_to, "Bot100");
+    }
+
+    #[test]
+    fn fleet_waits_for_exactly_one_submission_per_bot() {
+        assert_eq!(expected_submission_count(100), 100);
     }
 
     #[test]

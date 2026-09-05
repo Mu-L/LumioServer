@@ -25,7 +25,6 @@ mod browser;
 mod clr;
 mod crypto;
 mod discover;
-mod envelope;
 mod host;
 mod runtime;
 mod suite;
@@ -42,7 +41,6 @@ pub use bots::{
 };
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
-pub use envelope::{CommandBlock, InputCommand, CHAT_INPUT_MAPPING, MESSAGE_TYPE};
 pub use host::{
     AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
     RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,

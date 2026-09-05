@@ -2,11 +2,11 @@
 
 mod common;
 
-use common::{SharedRuntime, TestKernel};
+use common::{runtime_wire_chat_input, SharedRuntime, TestKernel, RUNTIME_WIRE_CHAT_INPUT};
 use lumio_host_runtime::{HostClock, SharedClock};
 use lumio_server_process::entity_chat::{
     generate_keys, issue_admission_credential, AttributeQueryOutcome, AttributeQueryRequest,
-    AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, InputCommand, QueryResult,
+    AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, QueryResult,
     ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
     RECONNECT_WINDOW_MS,
 };
@@ -88,10 +88,7 @@ fn reconnect_within_window_rebinds_entity_a() {
     let entity_a = first.net_entity_id.clone();
     let first_session = first.session_id.clone();
     assert!(host.disconnect("c-bot01".to_owned()));
-    let rejected = host.admit_chat_input(
-        "c-bot01".to_owned(),
-        InputCommand::from_chat_text("while-down"),
-    );
+    let rejected = host.admit_input_command("c-bot01".to_owned(), runtime_wire_chat_input());
     assert_eq!(rejected.kind, ChatOpKind::Rejected);
     let rebind = host.admit(
         "room-main".to_owned(),
@@ -312,10 +309,7 @@ fn kernel_tick_frame_runs_runtime_tick() {
         "c-bot01".to_owned(),
         credential(&keys, "Bot01", true),
     );
-    let _ = host.admit_chat_input(
-        "c-bot01".to_owned(),
-        InputCommand::from_chat_text("hello-Bot01"),
-    );
+    let _ = host.admit_input_command("c-bot01".to_owned(), runtime_wire_chat_input());
     let tick = host.schedule_room_tick("room-main".to_owned(), 0);
     assert_eq!(tick.applied_tick, 1);
 }
@@ -349,10 +343,7 @@ fn admit_n(
 
 fn enqueue_n(host: &EntityChatHost, n: usize) {
     for i in 1..=n {
-        let admitted = host.admit_chat_input(
-            format!("c-{i:03}"),
-            InputCommand::from_chat_text(&format!("hello-{i}")),
-        );
+        let admitted = host.admit_input_command(format!("c-{i:03}"), runtime_wire_chat_input());
         assert_eq!(admitted.kind, ChatOpKind::Admitted);
     }
 }
@@ -390,9 +381,9 @@ fn host_wire_ingress_ticks_at_max_chat_inputs() {
         lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-bot01")
             .expect("connect");
     let _ = client.recv_text();
-    for i in 0..=MAX_CHAT_INPUTS_PER_TICK {
+    for _ in 0..=MAX_CHAT_INPUTS_PER_TICK {
         client
-            .send_text(&InputCommand::from_chat_text(&format!("hello-{i}")).to_json())
+            .send_text(RUNTIME_WIRE_CHAT_INPUT)
             .expect("wire chat.input");
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

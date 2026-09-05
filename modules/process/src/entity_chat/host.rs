@@ -10,7 +10,6 @@ use lumio_host_runtime::{
 };
 
 use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
-use super::envelope::InputCommand;
 use super::runtime::BoundEntityKind;
 use super::runtime::{
     AttributeQueryScope, ChatOpKind, ChatOperation, PersistRecord, QueryResult, RebindMode,
@@ -170,6 +169,7 @@ struct Inner {
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
     tick_id: u64,
     wire_chat_pending: u64,
+    latest_wire_input: Option<Vec<u8>>,
 }
 
 enum OwnerWork {
@@ -230,6 +230,7 @@ impl EntityChatHost {
                 deferred_frames: HashMap::new(),
                 tick_id: 0,
                 wire_chat_pending: 0,
+                latest_wire_input: None,
             };
             if inner
                 .kernel
@@ -329,12 +330,20 @@ impl EntityChatHost {
         self.clock.clone()
     }
 
-    /// Decodes a frozen InputCommand (chat.input) envelope, then queues ChatInput.
+    /// Forwards one complete Runtime-produced InputCommand frame without inspecting it.
     #[must_use]
-    pub fn admit_chat_input(&self, connection_id: String, envelope: InputCommand) -> ChatOperation {
-        self.on_owner(move |inner| {
-            inner.admit_chat_input(&connection_id, envelope.to_json().as_bytes())
-        })
+    pub fn admit_input_command(
+        &self,
+        connection_id: String,
+        envelope_bytes: Vec<u8>,
+    ) -> ChatOperation {
+        self.on_owner(move |inner| inner.admit_input_command(&connection_id, &envelope_bytes))
+    }
+
+    /// Returns the latest Runtime-admitted input observed on the Room wire, unchanged.
+    #[must_use]
+    pub fn latest_wire_input(&self) -> Option<Vec<u8>> {
+        self.on_owner(|inner| inner.latest_wire_input.clone())
     }
 
     /// Advances kernel tickFrame and routes Runtime-owned outbox frames.
@@ -691,7 +700,7 @@ impl Inner {
         succeeded
     }
 
-    fn admit_chat_input(&mut self, connection_id: &str, envelope_bytes: &[u8]) -> ChatOperation {
+    fn admit_input_command(&mut self, connection_id: &str, envelope_bytes: &[u8]) -> ChatOperation {
         let Some(session) = self.sessions.get(connection_id) else {
             return ChatOperation::rejected("disconnected");
         };
@@ -894,8 +903,10 @@ impl Inner {
                     .sessions
                     .get(&connection_id)
                     .map(|session| session.room_id.clone());
-                let admitted = self.admit_chat_input(&connection_id, text.as_bytes());
+                let envelope_bytes = text.into_bytes();
+                let admitted = self.admit_input_command(&connection_id, &envelope_bytes);
                 if admitted.kind == ChatOpKind::Admitted {
+                    self.latest_wire_input = Some(envelope_bytes);
                     self.wire_chat_pending = self.wire_chat_pending.saturating_add(1);
                     if self.wire_chat_pending >= MAX_CHAT_INPUTS_PER_TICK as u64 {
                         if let Some(room_id) = room_id {

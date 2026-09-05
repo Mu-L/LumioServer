@@ -275,22 +275,6 @@ fn assert_round_shape(round_dir: &Path, evidence: &Value) {
         assert!(s5_blob.contains(needed), "S5 missing {needed}");
     }
 
-    let s6 = evidence.pointer("/scenarios/6").unwrap_or(&empty);
-    assert_eq!(
-        s6.get("messageType").and_then(Value::as_str),
-        Some("InputCommand")
-    );
-    assert_eq!(
-        s6.get("mappingId").and_then(Value::as_str),
-        Some("chat.input")
-    );
-    let sha = s6
-        .get("payloadSha256")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    assert_eq!(sha.len(), 64, "payloadSha256");
-    assert!(sha.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')));
-
     let s8 = evidence.pointer("/scenarios/8").cloned().unwrap_or(empty);
     let reconnect = evidence
         .pointer("/traces/reconnect")

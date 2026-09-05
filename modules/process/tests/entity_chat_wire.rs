@@ -2,11 +2,14 @@
 
 mod common;
 
-use common::{welcome_frame, world_change_frame, SharedRuntime, TestKernel};
+use common::{
+    runtime_wire_chat_input, welcome_frame, world_change_frame, SharedRuntime, TestKernel,
+    RUNTIME_WIRE_CHAT_INPUT,
+};
 use lumio_host_runtime::SharedClock;
 use lumio_server_process::entity_chat::{
     drain_chat_event_deltas, generate_keys, issue_admission_credential, ChatOpKind, EntityChatHost,
-    InputCommand, RoomClient, ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
+    RoomClient, ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
 };
 
 fn credential(
@@ -76,7 +79,7 @@ fn room_client_chat_input_over_wire_then_tick_sends_chat_event_delta() {
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
     client
-        .send_text(&InputCommand::from_chat_text("hello-Bot01").to_json())
+        .send_text(RUNTIME_WIRE_CHAT_INPUT)
         .expect("wire chat.input");
     std::thread::sleep(std::time::Duration::from_millis(80));
     let tick = host.run_tick("room-main".to_owned());
@@ -109,7 +112,7 @@ fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
     client
-        .send_text(&InputCommand::from_chat_text("hello-Bot01").to_json())
+        .send_text(RUNTIME_WIRE_CHAT_INPUT)
         .expect("wire chat.input");
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while host.pending_wire_chat_inputs() == 0 && std::time::Instant::now() < deadline {
@@ -123,6 +126,39 @@ fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
     let tick = host.run_tick("room-main".to_owned());
     assert!(tick.ok, "kernel tickFrame must run, got {tick:?}");
     assert_eq!(host.pending_wire_chat_inputs(), 0);
+}
+
+#[test]
+fn admitted_wire_input_is_retained_byte_for_byte() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
+    let _ = client.recv_text();
+    let input = runtime_wire_chat_input();
+    client
+        .send_text(std::str::from_utf8(&input).expect("utf8 fixture"))
+        .expect("wire input");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while host.latest_wire_input().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(host.latest_wire_input().as_deref(), Some(input.as_slice()));
 }
 
 #[test]
@@ -145,10 +181,7 @@ fn admit_chat_input_then_tick_sends_chat_event_delta_to_room_client() {
     assert!(admit.accepted);
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
-    let admitted = host.admit_chat_input(
-        "c-bot01".to_owned(),
-        InputCommand::from_chat_text("hello-Bot01"),
-    );
+    let admitted = host.admit_input_command("c-bot01".to_owned(), runtime_wire_chat_input());
     assert_eq!(admitted.kind, ChatOpKind::Admitted);
     let tick = host.run_tick("room-main".to_owned());
     assert!(
@@ -187,7 +220,7 @@ fn tick_broadcasts_runtime_delta_bytes_in_order() {
     let mut b = RoomClient::connect(&host.listen_uri(), "c-b").expect("b");
     let _ = a.recv_text();
     let _ = b.recv_text();
-    let _ = host.admit_chat_input("c-a".to_owned(), InputCommand::from_chat_text("one"));
+    let _ = host.admit_input_command("c-a".to_owned(), runtime_wire_chat_input());
     let tick = host.run_tick("room-main".to_owned());
     assert_eq!(tick.applied_tick, 1);
     let first_a = a.recv_text().expect("a1");
@@ -303,9 +336,9 @@ fn pre_admission_socket_receives_runtime_rejection_frame() {
 }
 
 fn send_n_wire_chats(client: &mut RoomClient, n: usize) {
-    for i in 0..n {
+    for _ in 0..n {
         client
-            .send_text(&InputCommand::from_chat_text(&format!("hello-{i}")).to_json())
+            .send_text(RUNTIME_WIRE_CHAT_INPUT)
             .expect("wire chat.input");
     }
 }
@@ -404,10 +437,7 @@ fn second_c_browser_attach_still_receives_room_delta() {
     let _ = first.recv_text();
     let mut second = RoomClient::connect(&host.listen_uri(), "c-browser").expect("second");
     let _ = second.recv_text();
-    let _ = host.admit_chat_input(
-        "c-browser".to_owned(),
-        InputCommand::from_chat_text("hello-browser"),
-    );
+    let _ = host.admit_input_command("c-browser".to_owned(), runtime_wire_chat_input());
     let tick = host.run_tick("room-main".to_owned());
     assert!(tick.ok);
     let first_frame = first.recv_text().expect("first delta");

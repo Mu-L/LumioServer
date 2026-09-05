@@ -14,6 +14,11 @@ use lumio_server_process::entity_chat::{
 
 pub const DISPATCH_EXPIRE: u32 = 1;
 pub const DISPATCH_TICK: u32 = 2;
+pub const RUNTIME_WIRE_CHAT_INPUT: &str = r#"{"commands":[{"mappingId":"chat.input","payload":"020000006767","payloadSha256":"5dbd584f1718b8bcd0dab4abeea83169f4a990defab81a8316ed845798d92dab"}],"messageType":"InputCommand"}"#;
+
+pub fn runtime_wire_chat_input() -> Vec<u8> {
+    RUNTIME_WIRE_CHAT_INPUT.as_bytes().to_vec()
+}
 
 pub struct TestKernel {
     one_shots: Vec<(u64, u32, KernelHandle)>,

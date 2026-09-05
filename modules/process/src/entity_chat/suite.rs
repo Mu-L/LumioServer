@@ -19,7 +19,6 @@ use super::bots::{
 use super::browser::capture_browser_login;
 use super::clr::{ClrGameplay, ClrGameplayConfig};
 use super::crypto::hex_lower;
-use super::envelope::InputCommand;
 use super::host::{AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost};
 use super::runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, RuntimeSurface,
@@ -234,16 +233,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             (format!("c-{}", name.to_ascii_lowercase()), name)
         })
         .collect();
-    let envelopes: Vec<(String, InputCommand)> = planned_connections
-        .iter()
-        .map(|(connection, name)| {
-            (
-                connection.clone(),
-                InputCommand::from_chat_text(&format!("hello-{name}")),
-            )
-        })
-        .collect();
-    let first_envelope = envelopes.first().map(|(_, envelope)| envelope.clone());
     let bot_host = match discover_bot_host() {
         Ok(path) => path,
         Err(reason) => return write_blocked(out_dir, &reason),
@@ -257,7 +246,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         &bot_host,
         &engine_native,
         &listen_uri,
-        &envelopes,
+        BOT_COUNT,
         &fleet_dir,
         &options.dotnet,
     ) {
@@ -489,6 +478,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 ClientBotTrace::default()
             }
         };
+    let runtime_input = host.latest_wire_input().unwrap_or_default();
+    if runtime_input.is_empty() {
+        blocked = blocked.or(Some(
+            "Client Bot.Host did not deliver a Runtime-encoded InputCommand".to_owned(),
+        ));
+    }
     wait_for_observed_chat_events(
         &host,
         &mut tick,
@@ -497,8 +492,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         BOT_COUNT as usize,
         Duration::from_secs(30),
     );
-    if let Some(client) = browser_wire.as_mut() {
-        let _ = client.send_text(&InputCommand::from_chat_text("hello-browser").to_json());
+    if let (Some(client), Ok(input)) = (browser_wire.as_mut(), std::str::from_utf8(&runtime_input))
+    {
+        let _ = client.send_text(input);
     }
     wait_for_observed_chat_events(
         &host,
@@ -522,9 +518,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         .iter()
         .filter_map(|frame| delta_tick_id(frame))
         .collect();
-    let first_block = first_envelope
-        .as_ref()
-        .and_then(|envelope| envelope.commands.first());
     scenarios.insert(
         "6".to_owned(),
         json!({
@@ -535,10 +528,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "cadence": bot_trace.tick_source,
             "tickSource": bot_trace.tick_source,
             "utteranceTicks": bot_trace.utterance_ticks,
-            "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
-            "mappingId": first_block.map(|block| block.mapping_id.as_str()),
-            "payload": first_block.map(|block| block.payload.as_str()),
-            "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
         }),
     );
 
@@ -664,14 +653,8 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             let _ = old.is_closed_after();
         }
     }
-    let rejected = host.admit_chat_input(
-        "c-bot100".to_owned(),
-        InputCommand::from_chat_text("while-down"),
-    );
-    let _ = host.admit_chat_input(
-        "c-browser".to_owned(),
-        InputCommand::from_chat_text("room-continues"),
-    );
+    let rejected = host.admit_input_command("c-bot100".to_owned(), runtime_input.clone());
+    let _ = host.admit_input_command("c-browser".to_owned(), runtime_input.clone());
     let _ = host.run_tick(MAIN_ROOM.to_owned());
     re_ok = re_ok && rejected.kind == ChatOpKind::Rejected && connection_superseded_received;
     let reconnect_trace = json!({
@@ -780,8 +763,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             {
                 let _ = host.admit(ISO_ROOM.to_owned(), "iso-a".to_owned(), cred_a);
                 let _ = host.admit(ISO_ROOM.to_owned(), "iso-b".to_owned(), cred_b);
-                let _ = host
-                    .admit_chat_input("iso-a".to_owned(), InputCommand::from_chat_text("iso-only"));
+                let _ = host.admit_input_command("iso-a".to_owned(), runtime_input.clone());
                 let _ = host.run_tick(ISO_ROOM.to_owned());
                 let cross = host.query_attribute(AttributeQueryRequest {
                     caller_scope: AttributeQueryScope::ServerAuthoritative,
@@ -887,9 +869,6 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 "timerManagerInvoked": timer_ok,
                 "utteranceTicks": bot_trace.utterance_ticks,
                 "botHostPid": bot_trace.pid,
-                "messageType": first_envelope.as_ref().map(|envelope| envelope.message_type.as_str()),
-                "mappingId": first_block.map(|block| block.mapping_id.as_str()),
-                "payloadSha256": first_block.map(|block| block.payload_sha256.as_str()),
                 "receivedEvents": chat_events,
                 "windowLines": chat_events,
             },

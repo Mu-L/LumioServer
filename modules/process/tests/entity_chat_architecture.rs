@@ -506,26 +506,16 @@ fn runtime_frame_and_input_ownership_stays_at_runtime_boundary() {
 }
 
 #[test]
-fn entity_chat_architecture_scan_covers_envelope_source() {
-    let owned = read_owned_sources();
+fn server_has_no_second_c1_input_encoder() {
+    let envelope = process_root().join("src/entity_chat/envelope.rs");
     assert!(
-        owned
-            .iter()
-            .any(|(path, _)| path.ends_with("src/entity_chat/envelope.rs")),
-        "architecture ownership scan must include envelope.rs"
+        !envelope.exists(),
+        "Server must consume Runtime-produced InputCommand bytes, not own envelope.rs"
     );
-    let envelope = fs::read_to_string(process_root().join("src/entity_chat/envelope.rs"))
-        .expect("envelope.rs");
-    for forbidden in [
-        "try_decode_chat_text",
-        "normalize_net_entity_id",
-        "from_str_radix",
-    ] {
-        assert!(
-            !envelope.contains(forbidden),
-            "Server must not keep a second C-1 decoder or non-canonical identity fallback: {forbidden}"
-        );
-    }
+    let suite =
+        fs::read_to_string(process_root().join("src/entity_chat/suite.rs")).expect("suite.rs");
+    assert!(!suite.contains("from_chat_text"));
+    assert!(!suite.contains("payloadSha256"));
 }
 
 #[test]
