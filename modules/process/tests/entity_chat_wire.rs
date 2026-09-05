@@ -272,6 +272,39 @@ fn takeover_sends_connection_superseded_before_close() {
     assert!(snapshot.contains("\"selfNetEntityId\""));
 }
 
+#[test]
+fn takeover_pending_tick_without_welcome_keeps_superseded_frame_and_cleans_new_socket() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().seed_live_binding(
+        "runtime-old",
+        "acct_Bot01",
+        "room-main",
+        lumio_server_process::entity_chat::BoundEntityKind::Bot,
+    );
+    runtime.lock().suppress_rebind_welcome();
+    let (host, keys) = host_ready(runtime.clone());
+    runtime.lock().plant_raw_delta(Vec::new());
+    let mut old = RoomClient::connect(&host.listen_uri(), "runtime-old").expect("old connect");
+    let mut new = RoomClient::connect(&host.listen_uri(), "c-new").expect("new connect");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while host.wire_observer_count("c-new".to_owned()) == 0 && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let takeover = host.admit(
+        "room-main".to_owned(),
+        "c-new".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(takeover.accepted && takeover.takeover);
+    let superseded = old.recv_text().expect("superseded frame must be routed");
+    assert!(superseded.contains("\"messageType\":\"ConnectionSuperseded\""));
+    assert!(old.is_closed_after());
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    assert!(host.try_self_lookup("c-new".to_owned()).is_none());
+    assert!(new.is_closed_after());
+}
+
 const HOST_MINTED_EMPTY: &str = r#"{"connectionGeneration":1,"instanceId":0,"messageType":"Welcome","selfNetEntityId":"00000000000000000000000000000001"}"#;
 
 #[test]

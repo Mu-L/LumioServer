@@ -742,17 +742,21 @@ impl RuntimeSurface for ClrGameplay {
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
         let request_id = self.next_request_id("expire");
+        self.expire_with_request_id(&request_id, net_entity_id)
+    }
+
+    fn expire_with_request_id(
+        &mut self,
+        request_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
         self.enqueue(json!({
             "op": "enqueue",
             "messageType": "ExpireEntityMessage",
-            "requestId": request_id.clone(),
+            "requestId": request_id,
             "netEntityId": net_entity_id,
         }))?;
-        let _ = request_id;
-        Err(RuntimeControlError::new(
-            "runtime_query_pending".to_owned(),
-            Vec::new(),
-        ))
+        Err(RuntimeControlError::pending(request_id))
     }
 
     fn resolve_by_net_entity_id(
@@ -761,18 +765,23 @@ impl RuntimeSurface for ClrGameplay {
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
         let request_id = self.next_request_id("resolve");
+        self.resolve_by_net_entity_id_with_request_id(&request_id, room_id, net_entity_id)
+    }
+
+    fn resolve_by_net_entity_id_with_request_id(
+        &mut self,
+        request_id: &str,
+        room_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
         self.enqueue(json!({
             "op": "enqueue",
             "messageType": "ResolveBindingMessage",
-            "requestId": request_id.clone(),
+            "requestId": request_id,
             "roomId": room_id,
             "netEntityId": net_entity_id,
         }))?;
-        let _ = (request_id, room_id, net_entity_id);
-        Err(RuntimeControlError::new(
-            "runtime_query_pending".to_owned(),
-            Vec::new(),
-        ))
+        Err(RuntimeControlError::pending(request_id))
     }
 
     fn query_attribute(
@@ -780,10 +789,18 @@ impl RuntimeSurface for ClrGameplay {
         request: &RuntimeQuery,
     ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
         let request_id = self.next_request_id("attribute");
+        self.query_attribute_with_request_id(&request_id, request)
+    }
+
+    fn query_attribute_with_request_id(
+        &mut self,
+        request_id: &str,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
         let mut message = json!({
             "op": "enqueue",
             "messageType": "AttributeQueryMessage",
-            "requestId": request_id.clone(),
+            "requestId": request_id,
             "callerScope": request.caller_scope.as_runtime_str(),
             "roomId": request.room_id,
             "netEntityId": request.net_entity_id,
@@ -793,11 +810,7 @@ impl RuntimeSurface for ClrGameplay {
             message["connectionGeneration"] = json!(generation);
         }
         self.enqueue(message)?;
-        let _ = request_id;
-        Err(RuntimeControlError::new(
-            "runtime_query_pending".to_owned(),
-            Vec::new(),
-        ))
+        Err(RuntimeControlError::pending(request_id))
     }
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {

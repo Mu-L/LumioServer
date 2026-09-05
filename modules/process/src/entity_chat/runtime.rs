@@ -110,6 +110,8 @@ impl<T> RuntimeControlResult<T> {
 pub struct RuntimeControlError {
     pub message: String,
     pub frames: Vec<RuntimeFrame>,
+    /// Correlation id when the Runtime accepted an asynchronous C-2 request.
+    pub request_id: Option<String>,
 }
 
 /// Runtime C-2 query result drained by the owner tick. The server keeps this
@@ -133,7 +135,20 @@ pub struct RuntimeQueryRecord {
 impl RuntimeControlError {
     #[must_use]
     pub const fn new(message: String, frames: Vec<RuntimeFrame>) -> Self {
-        Self { message, frames }
+        Self {
+            message,
+            frames,
+            request_id: None,
+        }
+    }
+
+    #[must_use]
+    pub fn pending(request_id: &str) -> Self {
+        Self {
+            message: "runtime_query_pending".to_owned(),
+            frames: Vec::new(),
+            request_id: Some(request_id.to_owned()),
+        }
     }
 }
 
@@ -154,7 +169,7 @@ pub struct RuntimeQuery {
 }
 
 /// Query caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AttributeQueryScope {
     ServerAuthoritative,
     ClientReplica,
@@ -190,6 +205,8 @@ pub struct QueryResult {
     pub error_code: Option<String>,
     pub observed_tick: u64,
     pub observed_revision: u64,
+    /// Stable request id while the owner tick has not emitted a result.
+    pub request_id: Option<String>,
 }
 
 impl QueryResult {
@@ -201,6 +218,7 @@ impl QueryResult {
             error_code: None,
             observed_tick: tick,
             observed_revision: revision,
+            request_id: None,
         }
     }
 
@@ -212,6 +230,7 @@ impl QueryResult {
             error_code: None,
             observed_tick: 0,
             observed_revision: 0,
+            request_id: None,
         }
     }
 
@@ -223,7 +242,15 @@ impl QueryResult {
             error_code: Some(code.to_owned()),
             observed_tick: 0,
             observed_revision: 0,
+            request_id: None,
         }
+    }
+
+    #[must_use]
+    pub fn pending(request_id: &str) -> Self {
+        let mut result = Self::request_error("runtime_query_pending");
+        result.request_id = Some(request_id.to_owned());
+        result
     }
 
     #[must_use]
@@ -348,16 +375,46 @@ pub trait RuntimeSurface: Send {
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<()>, RuntimeControlError>;
 
+    /// Enqueues an expiry with a caller-owned stable request id. Implementors
+    /// that provide asynchronous C-2 may override this; synchronous doubles
+    /// retain the original API through the default.
+    fn expire_with_request_id(
+        &mut self,
+        _request_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
+        self.expire(net_entity_id)
+    }
+
     fn resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
         net_entity_id: &str,
     ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError>;
 
+    /// Enqueues a resolve with a caller-owned stable request id.
+    fn resolve_by_net_entity_id_with_request_id(
+        &mut self,
+        _request_id: &str,
+        room_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
+        self.resolve_by_net_entity_id(room_id, net_entity_id)
+    }
+
     fn query_attribute(
         &mut self,
         request: &RuntimeQuery,
     ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError>;
+
+    /// Enqueues an attribute query with a caller-owned stable request id.
+    fn query_attribute_with_request_id(
+        &mut self,
+        _request_id: &str,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
+        self.query_attribute(request)
+    }
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String>;
 

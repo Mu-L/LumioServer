@@ -384,10 +384,25 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let census_payload = census_payload(&admits);
     let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
     let mut resolved = 0;
+    let mut pending_resolves = Vec::new();
     for (connection, _) in &connections {
         if let Some(binding) = host.try_self_lookup(connection.clone()) {
+            match host
+                .try_resolve_by_net_entity_id(MAIN_ROOM.to_owned(), binding.net_entity_id.clone())
+            {
+                Ok(Some(_)) => resolved += 1,
+                Err(error) if error == "runtime_query_pending" => {
+                    pending_resolves.push(binding.net_entity_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    if !pending_resolves.is_empty() {
+        let _ = host.run_tick(MAIN_ROOM.to_owned());
+        for net_entity_id in pending_resolves {
             if host
-                .try_resolve_by_net_entity_id(MAIN_ROOM.to_owned(), binding.net_entity_id)
+                .try_resolve_by_net_entity_id(MAIN_ROOM.to_owned(), net_entity_id)
                 .is_ok_and(|resolved| resolved.is_some())
             {
                 resolved += 1;
@@ -435,41 +450,57 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         return evidence;
     };
 
-    let ok_query = host.query_attribute(AttributeQueryRequest {
+    let ok_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: None,
-    });
-    let invisible = host.query_attribute(AttributeQueryRequest {
+    };
+    let invisible_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "ChatComponent.lastMessageText".to_owned(),
         connection_generation: None,
-    });
-    let unauthorized = host.query_attribute(AttributeQueryRequest {
+    };
+    let unauthorized_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ClientReplica,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "EntityIdentity.claimedMark".to_owned(),
         connection_generation: None,
-    });
-    let missing = host.query_attribute(AttributeQueryRequest {
+    };
+    let missing_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: "ffffffffffffffffffffffffffffffff".to_owned(),
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: None,
-    });
-    let stale = host.query_attribute(AttributeQueryRequest {
+    };
+    let stale_request = AttributeQueryRequest {
         caller_scope: AttributeQueryScope::ServerAuthoritative,
         room_id: MAIN_ROOM.to_owned(),
         net_entity_id: browser_binding.net_entity_id.clone(),
         attribute_id: "EntityIdentity.entityType".to_owned(),
         connection_generation: Some(0),
-    });
+    };
+    let mut ok_query = host.query_attribute(ok_request.clone());
+    let mut invisible = host.query_attribute(invisible_request.clone());
+    let mut unauthorized = host.query_attribute(unauthorized_request.clone());
+    let mut missing = host.query_attribute(missing_request.clone());
+    let mut stale = host.query_attribute(stale_request.clone());
+    if [&ok_query, &invisible, &unauthorized, &missing, &stale]
+        .iter()
+        .any(|result| result.error_code.as_deref() == Some("runtime_query_pending"))
+    {
+        let _ = host.run_tick(MAIN_ROOM.to_owned());
+        ok_query = host.query_attribute(ok_request);
+        invisible = host.query_attribute(invisible_request);
+        unauthorized = host.query_attribute(unauthorized_request);
+        missing = host.query_attribute(missing_request);
+        stale = host.query_attribute(stale_request);
+    }
     let query_traces = json!({
         "okValue": ok_query.value,
         "invisible": format!("{:?}", invisible.outcome),
@@ -588,13 +619,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         Err(error) => return write_blocked(out_dir, &format!("Runtime snapshot failed: {error}")),
     };
     let window_before = chat_events.len();
-    let last_before = host.query_attribute(AttributeQueryRequest {
-        caller_scope: AttributeQueryScope::ServerAuthoritative,
-        room_id: MAIN_ROOM.to_owned(),
-        net_entity_id: browser_binding.net_entity_id.clone(),
-        attribute_id: "ChatComponent.lastMessageText".to_owned(),
-        connection_generation: None,
-    });
+    let last_before = query_after_owner_tick(
+        &host,
+        MAIN_ROOM,
+        AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: MAIN_ROOM.to_owned(),
+            net_entity_id: browser_binding.net_entity_id.clone(),
+            attribute_id: "ChatComponent.lastMessageText".to_owned(),
+            connection_generation: None,
+        },
+    );
     let snapshot_path = out_dir.join("persist-snapshot.bin");
     let snapshot_sha256 = if snapshot.bytes.is_empty() {
         None
@@ -608,13 +643,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }
     }
     let still_bound = host.try_self_lookup("c-browser".to_owned()).is_some();
-    let last_after = host.query_attribute(AttributeQueryRequest {
-        caller_scope: AttributeQueryScope::ServerAuthoritative,
-        room_id: MAIN_ROOM.to_owned(),
-        net_entity_id: browser_binding.net_entity_id.clone(),
-        attribute_id: "ChatComponent.lastMessageText".to_owned(),
-        connection_generation: None,
-    });
+    let last_after = query_after_owner_tick(
+        &host,
+        MAIN_ROOM,
+        AttributeQueryRequest {
+            caller_scope: AttributeQueryScope::ServerAuthoritative,
+            room_id: MAIN_ROOM.to_owned(),
+            net_entity_id: browser_binding.net_entity_id.clone(),
+            attribute_id: "ChatComponent.lastMessageText".to_owned(),
+            connection_generation: None,
+        },
+    );
     let extra_after_restore = browser_wire
         .as_mut()
         .and_then(|client| client.recv_text().ok());
@@ -777,13 +816,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                     host.admit(MAIN_ROOM.to_owned(), "c-bot99-b".to_owned(), credential);
                 let _ = host.run_tick(MAIN_ROOM.to_owned());
                 let created_binding = host.try_self_lookup("c-bot99-b".to_owned());
-                let tombstoned = host.query_attribute(AttributeQueryRequest {
-                    caller_scope: AttributeQueryScope::ServerAuthoritative,
-                    room_id: MAIN_ROOM.to_owned(),
-                    net_entity_id: entity_99.clone(),
-                    attribute_id: "EntityIdentity.entityType".to_owned(),
-                    connection_generation: None,
-                });
+                let tombstoned = query_after_owner_tick(
+                    &host,
+                    MAIN_ROOM,
+                    AttributeQueryRequest {
+                        caller_scope: AttributeQueryScope::ServerAuthoritative,
+                        room_id: MAIN_ROOM.to_owned(),
+                        net_entity_id: entity_99.clone(),
+                        attribute_id: "EntityIdentity.entityType".to_owned(),
+                        connection_generation: None,
+                    },
+                );
                 tombstoned_observed = tombstoned.outcome == AttributeQueryOutcome::Tombstoned;
                 expired = usize::from(tombstoned_observed);
                 expiry_ok = created_b.accepted
@@ -854,13 +897,17 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                     .collect();
                 let _ = host.admit_input_command("iso-a".to_owned(), runtime_input.clone());
                 let _ = host.run_tick(ISO_ROOM.to_owned());
-                let cross = host.query_attribute(AttributeQueryRequest {
-                    caller_scope: AttributeQueryScope::ServerAuthoritative,
-                    room_id: ISO_ROOM.to_owned(),
-                    net_entity_id: browser_binding.net_entity_id.clone(),
-                    attribute_id: "EntityIdentity.entityType".to_owned(),
-                    connection_generation: None,
-                });
+                let cross = query_after_owner_tick(
+                    &host,
+                    ISO_ROOM,
+                    AttributeQueryRequest {
+                        caller_scope: AttributeQueryScope::ServerAuthoritative,
+                        room_id: ISO_ROOM.to_owned(),
+                        net_entity_id: browser_binding.net_entity_id.clone(),
+                        attribute_id: "EntityIdentity.entityType".to_owned(),
+                        connection_generation: None,
+                    },
+                );
                 let leaked = browser_wire.as_ref().is_some_and(|client| {
                     client
                         .received
@@ -1203,6 +1250,19 @@ fn empty_login() -> super::AccountLoginResult {
     }
 }
 
+fn query_after_owner_tick(
+    host: &EntityChatHost,
+    room_id: &str,
+    request: AttributeQueryRequest,
+) -> super::QueryResult {
+    let mut result = host.query_attribute(request.clone());
+    if result.error_code.as_deref() == Some("runtime_query_pending") {
+        let _ = host.run_tick(room_id.to_owned());
+        result = host.query_attribute(request);
+    }
+    result
+}
+
 fn observed_host_admit(
     host: &EntityChatHost,
     connection_id: &str,
@@ -1224,13 +1284,28 @@ fn observed_host_admit(
 }
 
 fn runtime_resolved_count(host: &EntityChatHost, room_id: &str, admits: &[AdmitTrace]) -> usize {
-    admits
-        .iter()
-        .filter(|row| {
-            host.try_resolve_by_net_entity_id(room_id.to_owned(), row.net_entity_id.clone())
-                .is_ok_and(|resolved| resolved.is_some())
-        })
-        .count()
+    let mut resolved = 0;
+    let mut pending = Vec::new();
+    for row in admits {
+        match host.try_resolve_by_net_entity_id(room_id.to_owned(), row.net_entity_id.clone()) {
+            Ok(Some(_)) => resolved += 1,
+            Err(error) if error == "runtime_query_pending" => {
+                pending.push(row.net_entity_id.clone());
+            }
+            _ => {}
+        }
+    }
+    if !pending.is_empty() {
+        let _ = host.run_tick(room_id.to_owned());
+        resolved += pending
+            .into_iter()
+            .filter(|net_entity_id| {
+                host.try_resolve_by_net_entity_id(room_id.to_owned(), net_entity_id.clone())
+                    .is_ok_and(|resolved| resolved.is_some())
+            })
+            .count();
+    }
+    resolved
 }
 
 fn census_payload(admits: &[AdmitTrace]) -> Value {

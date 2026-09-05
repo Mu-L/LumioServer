@@ -149,6 +149,51 @@ fn wall_clock_kernel_expire_tombstones_a_and_creates_b() {
 }
 
 #[test]
+fn async_expiry_is_pending_until_owner_tick_and_reports_runtime_error() {
+    let clock = SharedClock::test();
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        clock.clone(),
+        Box::new(runtime.clone()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    assert!(host.disconnect("c-bot01".to_owned()).expect("disconnect"));
+    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.drive_kernel());
+    assert!(host.run_tick("room-main".to_owned()).ok);
+
+    runtime.lock().fail_next_async_query("expire_failed");
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot02".to_owned(),
+            credential(&keys, "Bot02", true),
+        )
+        .accepted
+    );
+    assert!(host.disconnect("c-bot02".to_owned()).expect("disconnect"));
+    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.drive_kernel());
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(!tick.ok);
+    assert_eq!(tick.code.as_deref(), Some("expire_failed"));
+}
+
+#[test]
 fn isolation_rejects_cross_room_query() {
     let (host, keys) = host_with(SharedRuntime::new());
     let _ = host.admit(
@@ -284,6 +329,69 @@ fn attribute_query_is_forwarded_to_runtime() {
 }
 
 #[test]
+fn async_runtime_query_is_pending_until_owner_tick_then_correlates_success() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().enable_async_queries();
+    let (host, keys) = host_with(runtime);
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-browser".to_owned(),
+        credential(&keys, "Browser01", false),
+    );
+    let binding = host.must_self("c-browser");
+    let request = AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id,
+        attribute_id: "EntityIdentity.entityType".to_owned(),
+        connection_generation: None,
+    };
+    let pending = host.query_attribute(request.clone());
+    assert_eq!(
+        pending.error_code.as_deref(),
+        Some("runtime_query_pending"),
+        "query must expose pending before an owner tick"
+    );
+    assert!(pending.request_id.is_some());
+    let tick = host.run_tick("room-main".to_owned());
+    assert!(tick.ok);
+    let records = host.drain_runtime_queries();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].request_id.starts_with("server-a2-attribute-"));
+    let completed = host.query_attribute(request);
+    assert_eq!(completed.outcome, AttributeQueryOutcome::Ok);
+    assert_eq!(completed.value.as_deref(), Some("player"));
+}
+
+#[test]
+fn async_runtime_query_error_is_correlated_after_owner_tick() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().fail_next_async_query("query_failed");
+    let (host, keys) = host_with(runtime);
+    let _ = host.admit(
+        "room-main".to_owned(),
+        "c-browser".to_owned(),
+        credential(&keys, "Browser01", false),
+    );
+    let binding = host.must_self("c-browser");
+    let request = AttributeQueryRequest {
+        caller_scope: AttributeQueryScope::ServerAuthoritative,
+        room_id: "room-main".to_owned(),
+        net_entity_id: binding.net_entity_id,
+        attribute_id: "EntityIdentity.entityType".to_owned(),
+        connection_generation: None,
+    };
+    assert_eq!(
+        host.query_attribute(request.clone()).error_code.as_deref(),
+        Some("runtime_query_pending")
+    );
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    let error = host.query_attribute(request);
+    assert_eq!(error.outcome, AttributeQueryOutcome::RequestError);
+    assert_eq!(error.error_code.as_deref(), Some("query_failed"));
+}
+
+#[test]
 fn restore_does_not_create_active_sessions() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
@@ -395,6 +503,49 @@ fn takeover_uses_runtime_addressed_connection_when_local_session_is_missing() {
     assert!(takeover.accepted);
     assert!(takeover.takeover);
     assert!(host.try_self_lookup("c-new".to_owned()).is_some());
+}
+
+#[test]
+fn takeover_rejection_does_not_stage_cross_room_pending_admission() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().seed_live_binding(
+        "runtime-old",
+        "acct_Bot01",
+        "room-other",
+        BoundEntityKind::Bot,
+    );
+    let (host, keys) = host_with(runtime);
+    let takeover = host.admit(
+        "room-main".to_owned(),
+        "c-new".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(!takeover.accepted);
+    assert_eq!(takeover.error_code.as_deref(), Some("cross_room_reference"));
+    assert_eq!(host.wire_observer_count("c-new".to_owned()), 0);
+}
+
+#[test]
+fn takeover_pending_without_next_tick_identity_is_retired() {
+    let runtime = SharedRuntime::new();
+    runtime.lock().seed_live_binding(
+        "runtime-old",
+        "acct_Bot01",
+        "room-main",
+        BoundEntityKind::Bot,
+    );
+    runtime.lock().suppress_rebind_frames();
+    let (host, keys) = host_with(runtime);
+    let takeover = host.admit(
+        "room-main".to_owned(),
+        "c-new".to_owned(),
+        credential(&keys, "Bot01", true),
+    );
+    assert!(takeover.accepted && takeover.takeover);
+    assert!(host.try_self_lookup("c-new".to_owned()).is_none());
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    assert!(host.try_self_lookup("c-new".to_owned()).is_none());
+    assert_eq!(host.wire_observer_count("c-new".to_owned()), 0);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Test doubles of Runtime and `NativeCore` ABI. Not production kernels or binding tables.
 #![allow(dead_code)]
+#![allow(clippy::struct_excessive_bools)]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -8,8 +9,8 @@ use lumio_host_runtime::{KernelError, KernelFired, KernelHandle, KernelTimer, Ti
 use lumio_server_process::entity_chat::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOperation, PersistRecord,
     QueryResult, RebindMode, RuntimeAdmit, RuntimeBinding, RuntimeControlError,
-    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeSurface,
-    RuntimeTick, MAX_CHAT_INPUTS_PER_TICK,
+    RuntimeControlResult, RuntimeDisconnect, RuntimeFrame, RuntimeQuery, RuntimeQueryRecord,
+    RuntimeSurface, RuntimeTick, MAX_CHAT_INPUTS_PER_TICK,
 };
 
 pub const DISPATCH_EXPIRE: u32 = 1;
@@ -159,6 +160,11 @@ pub struct ScriptedRuntime {
     tick_error: Option<String>,
     persist_error: Option<String>,
     restore_error: Option<String>,
+    async_queries: bool,
+    queued_queries: Vec<RuntimeQueryRecord>,
+    async_query_error: Option<String>,
+    suppress_rebind_frames: bool,
+    suppress_rebind_welcome: bool,
 }
 
 impl ScriptedRuntime {
@@ -190,6 +196,11 @@ impl ScriptedRuntime {
             tick_error: None,
             persist_error: None,
             restore_error: None,
+            async_queries: false,
+            queued_queries: Vec::new(),
+            async_query_error: None,
+            suppress_rebind_frames: false,
+            suppress_rebind_welcome: false,
         }
     }
 
@@ -249,6 +260,23 @@ impl ScriptedRuntime {
         self.restore_error = Some(message.to_owned());
     }
 
+    pub fn enable_async_queries(&mut self) {
+        self.async_queries = true;
+    }
+
+    pub fn fail_next_async_query(&mut self, message: &str) {
+        self.async_queries = true;
+        self.async_query_error = Some(message.to_owned());
+    }
+
+    pub fn suppress_rebind_frames(&mut self) {
+        self.suppress_rebind_frames = true;
+    }
+
+    pub fn suppress_rebind_welcome(&mut self) {
+        self.suppress_rebind_welcome = true;
+    }
+
     pub fn seed_live_binding(
         &mut self,
         connection: &str,
@@ -293,6 +321,62 @@ impl ScriptedRuntime {
         let id = format!("{:032x}", self.next);
         self.next += 1;
         id
+    }
+
+    fn async_outcome(
+        result_type: &str,
+        request_id: &str,
+        result: QueryResult,
+    ) -> RuntimeQueryRecord {
+        let (outcome, code) = match result.outcome {
+            AttributeQueryOutcome::Ok => ("ok", None),
+            AttributeQueryOutcome::RequestError => (
+                "request_error",
+                result
+                    .error_code
+                    .or_else(|| Some("runtime_failure".to_owned())),
+            ),
+            AttributeQueryOutcome::NonExistent => ("non_existent", None),
+            AttributeQueryOutcome::StaleGeneration => ("stale_generation", None),
+            AttributeQueryOutcome::Invisible => ("invisible", None),
+            AttributeQueryOutcome::Unauthorized => ("unauthorized", None),
+            AttributeQueryOutcome::Tombstoned => ("tombstoned", None),
+        };
+        RuntimeQueryRecord {
+            request_id: request_id.to_owned(),
+            result_type: result_type.to_owned(),
+            outcome: outcome.to_owned(),
+            binding: None,
+            value: result.value,
+            net_entity_id: None,
+            room_id: None,
+            attribute_id: None,
+            code,
+            detail: (outcome == "request_error").then(|| "test failure".to_owned()),
+            observed_revision: Some(result.observed_revision),
+            observed_tick: Some(result.observed_tick),
+        }
+    }
+
+    fn queue_async_error(&mut self, result_type: &str, request_id: &str) {
+        let code = self
+            .async_query_error
+            .take()
+            .unwrap_or_else(|| "runtime_failure".to_owned());
+        self.queued_queries.push(RuntimeQueryRecord {
+            request_id: request_id.to_owned(),
+            result_type: result_type.to_owned(),
+            outcome: "request_error".to_owned(),
+            binding: None,
+            value: None,
+            net_entity_id: None,
+            room_id: None,
+            attribute_id: None,
+            code: Some(code),
+            detail: Some("test failure".to_owned()),
+            observed_revision: None,
+            observed_tick: None,
+        });
     }
 }
 
@@ -436,14 +520,19 @@ impl RuntimeSurface for ScriptedRuntime {
             self.by_connection
                 .insert(connection.to_owned(), binding.clone());
             let mut result = RuntimeAdmit::ok(binding.clone());
-            result.frames.push(RuntimeFrame {
-                connection: Some(old_conn),
-                bytes: superseded_frame(result.binding.as_ref().expect("binding")),
-                observer_net_entity_id: None,
-                connection_generation: Some(binding.connection_generation),
-                message_type: Some("ConnectionSuperseded".to_owned()),
-                code: None,
-            });
+            if !self.suppress_rebind_frames {
+                result.frames.push(RuntimeFrame {
+                    connection: Some(old_conn),
+                    bytes: superseded_frame(result.binding.as_ref().expect("binding")),
+                    observer_net_entity_id: None,
+                    connection_generation: Some(binding.connection_generation),
+                    message_type: Some("ConnectionSuperseded".to_owned()),
+                    code: None,
+                });
+            }
+            if self.suppress_rebind_frames || self.suppress_rebind_welcome {
+                return result;
+            }
             result.frames.push(RuntimeFrame {
                 connection: Some(connection.to_owned()),
                 bytes: default_snapshot().into_bytes(),
@@ -498,6 +587,37 @@ impl RuntimeSurface for ScriptedRuntime {
         Ok(RuntimeControlResult::new((), Vec::new()))
     }
 
+    fn expire_with_request_id(
+        &mut self,
+        request_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
+        if !self.async_queries {
+            return self.expire(net_entity_id);
+        }
+        let id = net_entity_id.to_owned();
+        self.expire(net_entity_id)?;
+        if self.async_query_error.is_some() {
+            self.queue_async_error("ExpireEntityResult", request_id);
+        } else {
+            self.queued_queries.push(RuntimeQueryRecord {
+                request_id: request_id.to_owned(),
+                result_type: "ExpireEntityResult".to_owned(),
+                outcome: "tombstoned".to_owned(),
+                binding: None,
+                value: None,
+                net_entity_id: Some(id),
+                room_id: None,
+                attribute_id: None,
+                code: None,
+                detail: None,
+                observed_revision: None,
+                observed_tick: None,
+            });
+        }
+        Err(RuntimeControlError::pending(request_id))
+    }
+
     fn resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
@@ -516,6 +636,39 @@ impl RuntimeSurface for ScriptedRuntime {
             Some(occupancy.binding.clone()),
             Vec::new(),
         ))
+    }
+
+    fn resolve_by_net_entity_id_with_request_id(
+        &mut self,
+        request_id: &str,
+        room_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
+        if !self.async_queries {
+            return self.resolve_by_net_entity_id(room_id, net_entity_id);
+        }
+        if self.async_query_error.is_some() {
+            self.queue_async_error("ResolveBindingResult", request_id);
+        } else {
+            let binding = self.entities.get(net_entity_id).and_then(|occupancy| {
+                (occupancy.binding.room_id == room_id).then(|| occupancy.binding.clone())
+            });
+            self.queued_queries.push(RuntimeQueryRecord {
+                request_id: request_id.to_owned(),
+                result_type: "ResolveBindingResult".to_owned(),
+                outcome: binding.as_ref().map_or("non_existent", |_| "ok").to_owned(),
+                binding,
+                value: None,
+                net_entity_id: None,
+                room_id: None,
+                attribute_id: None,
+                code: None,
+                detail: None,
+                observed_revision: Some(self.revision),
+                observed_tick: None,
+            });
+        }
+        Err(RuntimeControlError::pending(request_id))
     }
 
     fn query_attribute(
@@ -577,6 +730,29 @@ impl RuntimeSurface for ScriptedRuntime {
             QueryResult::ok(occupancy.binding.entity_type.as_str().to_owned(), 0, 0),
             Vec::new(),
         ))
+    }
+
+    fn query_attribute_with_request_id(
+        &mut self,
+        request_id: &str,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
+        if !self.async_queries {
+            return self.query_attribute(request);
+        }
+        if self.async_query_error.is_some() {
+            self.queue_async_error("AttributeQueryResult", request_id);
+        } else {
+            let result = self.query_attribute(request)?;
+            let mut record = Self::async_outcome("AttributeQueryResult", request_id, result.value);
+            if record.outcome == "ok" {
+                record.net_entity_id = Some(request.net_entity_id.clone());
+                record.room_id = Some(request.room_id.clone());
+                record.attribute_id = Some(request.attribute_id.clone());
+            }
+            self.queued_queries.push(record);
+        }
+        Err(RuntimeControlError::pending(request_id))
     }
 
     fn attach_member(&mut self, _room_id: &str, _connection: &str) -> Result<(), String> {
@@ -646,6 +822,10 @@ impl RuntimeSurface for ScriptedRuntime {
             });
         }
         result
+    }
+
+    fn drain_queries(&mut self) -> Vec<RuntimeQueryRecord> {
+        std::mem::take(&mut self.queued_queries)
     }
 
     fn persist(&mut self, _room_id: &str) -> Result<PersistRecord, String> {
@@ -719,6 +899,15 @@ impl RuntimeSurface for SharedRuntime {
         self.lock().expire(net_entity_id)
     }
 
+    fn expire_with_request_id(
+        &mut self,
+        request_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<()>, RuntimeControlError> {
+        self.lock()
+            .expire_with_request_id(request_id, net_entity_id)
+    }
+
     fn resolve_by_net_entity_id(
         &mut self,
         room_id: &str,
@@ -727,11 +916,30 @@ impl RuntimeSurface for SharedRuntime {
         self.lock().resolve_by_net_entity_id(room_id, net_entity_id)
     }
 
+    fn resolve_by_net_entity_id_with_request_id(
+        &mut self,
+        request_id: &str,
+        room_id: &str,
+        net_entity_id: &str,
+    ) -> Result<RuntimeControlResult<Option<RuntimeBinding>>, RuntimeControlError> {
+        self.lock()
+            .resolve_by_net_entity_id_with_request_id(request_id, room_id, net_entity_id)
+    }
+
     fn query_attribute(
         &mut self,
         request: &RuntimeQuery,
     ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
         self.lock().query_attribute(request)
+    }
+
+    fn query_attribute_with_request_id(
+        &mut self,
+        request_id: &str,
+        request: &RuntimeQuery,
+    ) -> Result<RuntimeControlResult<QueryResult>, RuntimeControlError> {
+        self.lock()
+            .query_attribute_with_request_id(request_id, request)
     }
 
     fn attach_member(&mut self, room_id: &str, connection: &str) -> Result<(), String> {
@@ -757,6 +965,10 @@ impl RuntimeSurface for SharedRuntime {
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
         self.lock().run_tick(room_id, tick_id)
+    }
+
+    fn drain_queries(&mut self) -> Vec<RuntimeQueryRecord> {
+        self.lock().drain_queries()
     }
 
     fn persist(&mut self, room_id: &str) -> Result<PersistRecord, String> {
