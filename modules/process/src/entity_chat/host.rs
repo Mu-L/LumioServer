@@ -154,6 +154,8 @@ struct ObserverEgress {
     sender: WireSender,
     pending: VecDeque<Vec<u8>>,
     pending_bytes: usize,
+    close_requested: bool,
+    close_enqueued: bool,
 }
 
 impl ObserverEgress {
@@ -162,7 +164,13 @@ impl ObserverEgress {
             sender,
             pending: VecDeque::new(),
             pending_bytes: 0,
+            close_requested: false,
+            close_enqueued: false,
         }
+    }
+
+    fn request_close(&mut self) {
+        self.close_requested = true;
     }
 }
 
@@ -296,6 +304,16 @@ fn deliver_to_egresses(egresses: &mut Vec<ObserverEgress>, bytes: &[u8]) -> Deli
 fn flush_observer_egress(egress: &mut ObserverEgress) -> Delivery {
     loop {
         let Some(bytes) = egress.pending.front() else {
+            if egress.close_requested && !egress.close_enqueued {
+                match egress.sender.try_close_ordered() {
+                    Ok(()) => egress.close_enqueued = true,
+                    Err(WireSendError::Full) => return Delivery::Backpressured,
+                    Err(WireSendError::Closed) => return Delivery::Unavailable,
+                    Err(WireSendError::TooLarge | WireSendError::InvalidUtf8) => {
+                        return Delivery::Invalid
+                    }
+                }
+            }
             return Delivery::Delivered;
         };
         match egress.sender.try_send_bytes(bytes) {
@@ -1146,14 +1164,18 @@ impl Inner {
             // Keep an unattached observer long enough to flush the addressed
             // supersession frame before its close marker is queued.
             self.pending_admissions.remove(&old_id);
-            if let Some(old) = self.sessions.remove(&old_id) {
-                for egress in &old.egresses {
-                    let _ = egress.sender.try_close();
+            if let Some(mut old) = self.sessions.remove(&old_id) {
+                for egress in &mut old.egresses {
+                    egress.request_close();
                 }
+                self.pending_egress
+                    .entry(old_id.clone())
+                    .or_default()
+                    .extend(old.egresses);
             }
-            if let Some(egresses) = self.pending_egress.remove(&old_id) {
+            if let Some(egresses) = self.pending_egress.get_mut(&old_id) {
                 for egress in egresses {
-                    let _ = egress.sender.try_close();
+                    egress.request_close();
                 }
             }
             self.deferred_frames.remove(&old_id);
@@ -1822,7 +1844,6 @@ impl Inner {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
                         if session.egresses.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
                             egress.abort();
-                            let _ = self.fail_connection(&connection_id);
                             return;
                         }
                         session.egresses.push(ObserverEgress::new(egress.clone()));
@@ -1911,15 +1932,37 @@ impl Inner {
                     let _ = self.run_tick(&room_id);
                 }
             }
-            WireEvent::Closed { connection_id } => {
-                if !self.disconnect(&connection_id).unwrap_or(false) {
+            WireEvent::Closed {
+                connection_id,
+                observer_id,
+            } => {
+                let mut removed = false;
+                let mut has_observer = false;
+                if let Some(session) = self.sessions.get_mut(&connection_id) {
+                    let before = session.egresses.len();
+                    session
+                        .egresses
+                        .retain(|egress| egress.sender.observer_id() != observer_id);
+                    removed = before != session.egresses.len();
+                    has_observer = !session.egresses.is_empty();
+                }
+                if !removed {
+                    if let Some(egresses) = self.pending_egress.get_mut(&connection_id) {
+                        let before = egresses.len();
+                        egresses.retain(|egress| egress.sender.observer_id() != observer_id);
+                        removed = before != egresses.len();
+                        has_observer = !egresses.is_empty();
+                    }
+                }
+                if !removed || has_observer {
+                    return;
+                }
+                if self.sessions.contains_key(&connection_id) {
+                    let _ = self.disconnect(&connection_id);
+                } else {
                     self.pending_admissions.remove(&connection_id);
                     self.deferred_frames.remove(&connection_id);
-                    self.pending_egress
-                        .remove(&connection_id)
-                        .into_iter()
-                        .flatten()
-                        .for_each(|egress| egress.sender.abort());
+                    self.pending_egress.remove(&connection_id);
                 }
             }
         }
@@ -2078,5 +2121,27 @@ mod tests {
             rx.recv().expect("consumer wake receives queued"),
             WireOut::Text(bytes) if bytes == b"queued"
         ));
+    }
+
+    #[test]
+    fn ordered_close_waits_for_pending_frames() {
+        let (sender, rx) = test_sender_pair(1);
+        let mut egress = ObserverEgress::new(sender.clone());
+
+        sender.try_send_bytes(b"occupied").expect("fill egress");
+        egress.pending.push_back(b"superseded".to_vec());
+        egress.pending_bytes = b"superseded".len();
+        egress.request_close();
+
+        assert_eq!(flush_observer_egress(&mut egress), Delivery::Backpressured);
+        assert!(
+            matches!(rx.recv().expect("occupied"), WireOut::Text(bytes) if bytes == b"occupied")
+        );
+        assert_eq!(flush_observer_egress(&mut egress), Delivery::Backpressured);
+        assert!(
+            matches!(rx.recv().expect("superseded"), WireOut::Text(bytes) if bytes == b"superseded")
+        );
+        assert_eq!(flush_observer_egress(&mut egress), Delivery::Delivered);
+        assert!(matches!(rx.recv().expect("close"), WireOut::Close));
     }
 }

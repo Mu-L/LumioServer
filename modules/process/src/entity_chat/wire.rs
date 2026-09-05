@@ -1,6 +1,7 @@
 //! Loopback WebSocket Room wire. Bytes on the socket are Runtime/C-1 JSON.
 
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -22,6 +23,7 @@ pub const MAX_WIRE_TEXT_BYTES: usize = 65_536;
 pub struct WireSender {
     inner: Sender<WireOut>,
     cancel: CancelToken,
+    observer_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +66,14 @@ impl WireSender {
         }
     }
 
+    pub(crate) fn try_close_ordered(&self) -> Result<(), WireSendError> {
+        self.inner.try_send(WireOut::Close).map_err(map_send_error)
+    }
+
+    pub(crate) fn observer_id(&self) -> u64 {
+        self.observer_id
+    }
+
     pub(crate) fn abort(&self) {
         self.cancel.cancel();
     }
@@ -78,6 +88,7 @@ pub(crate) fn test_sender_pair(
         WireSender {
             inner,
             cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         },
         receiver,
     )
@@ -102,8 +113,11 @@ pub enum WireEvent {
     },
     Closed {
         connection_id: String,
+        observer_id: u64,
     },
 }
+
+static NEXT_OBSERVER_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Loopback listener. Handshake is blocking; frames are polled.
 pub struct RoomListener {
@@ -192,7 +206,9 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
     let egress = WireSender {
         inner: out_tx,
         cancel: cancel.clone(),
+        observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
     };
+    let observer_id = egress.observer_id();
     if event_tx
         .send(WireEvent::Attached {
             connection_id: connection_id.clone(),
@@ -252,7 +268,10 @@ fn handle_conn(stream: TcpStream, event_tx: Sender<WireEvent>, cancel: CancelTok
         }
         thread::sleep(Duration::from_millis(5));
     }
-    let _ = event_tx.send(WireEvent::Closed { connection_id });
+    let _ = event_tx.send(WireEvent::Closed {
+        connection_id,
+        observer_id,
+    });
 }
 
 fn is_would_block(error: &tokio_tungstenite::tungstenite::Error) -> bool {
@@ -397,6 +416,7 @@ mod tests {
         let sender = WireSender {
             inner: tx,
             cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         };
         sender
             .try_send_text("first".to_owned())
@@ -414,6 +434,7 @@ mod tests {
         let sender = WireSender {
             inner: tx,
             cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         };
         drop(rx);
 
@@ -430,6 +451,7 @@ mod tests {
         let sender = WireSender {
             inner: tx,
             cancel: cancel.clone(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         };
         sender
             .try_send_text("frame".to_owned())
@@ -445,6 +467,7 @@ mod tests {
         let sender = WireSender {
             inner: tx,
             cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         };
         drop(rx);
 
@@ -457,6 +480,7 @@ mod tests {
         let sender = WireSender {
             inner: tx,
             cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         };
 
         sender
@@ -471,6 +495,7 @@ mod tests {
         let sender = WireSender {
             inner: tx,
             cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         };
 
         assert_eq!(
@@ -485,6 +510,7 @@ mod tests {
         let sender = WireSender {
             inner: tx,
             cancel: CancelToken::new(),
+            observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
         };
 
         assert_eq!(

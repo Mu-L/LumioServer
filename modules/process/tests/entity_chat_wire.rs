@@ -472,6 +472,36 @@ fn second_c_browser_attach_still_receives_room_delta() {
 }
 
 #[test]
+fn closing_one_observer_keeps_the_other_logical_connection_alive() {
+    let keys = generate_keys();
+    let host = EntityChatHost::new(
+        RECONNECT_WINDOW_MS,
+        SharedClock::test(),
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        ADMISSION_KEY_ID,
+        keys.public.to_vec(),
+        1_000,
+    );
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-browser".to_owned(),
+            credential(&keys, "Browser01", false),
+        )
+        .accepted
+    );
+    let mut first = RoomClient::connect(&host.listen_uri(), "c-browser").expect("first");
+    let _ = first.recv_text();
+    let mut second = RoomClient::connect(&host.listen_uri(), "c-browser").expect("second");
+    let _ = second.recv_text();
+    drop(first);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let _ = host.run_tick("room-main".to_owned());
+    assert!(host.try_self_lookup("c-browser".to_owned()).is_some());
+}
+
+#[test]
 fn oversized_post_admission_text_closes_socket_before_runtime_input() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_ready(runtime.clone());
