@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 const FLEET_WAIT: Duration = Duration::from_secs(15);
 const FLEET_PROGRESS_POLL: Duration = Duration::from_millis(1);
@@ -20,7 +20,30 @@ pub struct ClientBotTrace {
     pub timer_manager_invoked: bool,
     pub submitted: u32,
     pub pid: u32,
+    pub input: Option<ClientInputEvidence>,
     pub blocked: Option<String>,
+}
+
+/// Input envelope metadata emitted by the Client Bot after Runtime encoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientInputEvidence {
+    pub message_type: String,
+    pub mapping_id: String,
+    pub payload_sha256: String,
+}
+
+impl ClientBotTrace {
+    /// Returns the Runtime-encoded input metadata exactly as emitted by Client.
+    #[must_use]
+    pub fn input_evidence_json(&self) -> Option<Value> {
+        self.input.as_ref().map(|input| {
+            json!({
+                "messageType": input.message_type,
+                "mappingId": input.mapping_id,
+                "payloadSha256": input.payload_sha256,
+            })
+        })
+    }
 }
 
 /// Live Bot.Host process until [`ClientBotFleet::release`].
@@ -433,6 +456,7 @@ fn read_bot_host_logs(log_dir: &Path) -> Result<ClientBotTrace, String> {
     let mut utterance_ticks = Vec::new();
     let mut tick_source = String::new();
     let mut pid = 0_u32;
+    let mut input = None;
     let entries = match std::fs::read_dir(log_dir) {
         Ok(entries) => entries,
         Err(_) => {
@@ -468,6 +492,14 @@ fn read_bot_host_logs(log_dir: &Path) -> Result<ClientBotTrace, String> {
             if value.get("kind").and_then(Value::as_str) != Some("chat.input") {
                 continue;
             }
+            let evidence = parse_input_evidence(&value).ok_or_else(|| {
+                format!(
+                    "{R4_04_BLOCKED}: malformed Runtime InputCommand metadata in Client Bot.Host logs"
+                )
+            })?;
+            if input.is_none() {
+                input = Some(evidence);
+            }
             submitted = submitted.saturating_add(1);
             if let Some(tick) = value.get("tick").and_then(Value::as_u64) {
                 utterance_ticks.push(tick);
@@ -484,6 +516,11 @@ fn read_bot_host_logs(log_dir: &Path) -> Result<ClientBotTrace, String> {
             "{R4_04_BLOCKED}: Lumio.Client.Bot.Host logs missing chat.input lines"
         ));
     }
+    if input.is_none() {
+        return Err(format!(
+            "{R4_04_BLOCKED}: Lumio.Client.Bot.Host logs missing Runtime InputCommand metadata"
+        ));
+    }
     utterance_ticks.sort_unstable();
     utterance_ticks.dedup();
     Ok(ClientBotTrace {
@@ -493,8 +530,33 @@ fn read_bot_host_logs(log_dir: &Path) -> Result<ClientBotTrace, String> {
         utterance_ticks,
         submitted,
         pid,
+        input,
         blocked: None,
     })
+}
+
+fn parse_input_evidence(value: &Value) -> Option<ClientInputEvidence> {
+    let message_type = value.get("messageType")?.as_str()?;
+    let mapping_id = value.get("mappingId")?.as_str()?;
+    let payload_sha256 = value.get("payloadSha256")?.as_str()?;
+    if message_type != "InputCommand"
+        || mapping_id != "chat.input"
+        || !is_lower_sha256(payload_sha256)
+    {
+        return None;
+    }
+    Some(ClientInputEvidence {
+        message_type: message_type.to_owned(),
+        mapping_id: mapping_id.to_owned(),
+        payload_sha256: payload_sha256.to_owned(),
+    })
+}
+
+fn is_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(test)]
@@ -621,7 +683,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         fs::write(
             tmp.path().join("bot-host.ndjson"),
-            "{\"kind\":\"chat.input\",\"tickSource\":\"native-kernel/tickFrame\",\"tick\":5}\n",
+            concat!(
+                "{\"kind\":\"chat.input\",\"tickSource\":\"native-kernel/tickFrame\",",
+                "\"tick\":5,\"messageType\":\"InputCommand\",\"mappingId\":\"chat.input\",",
+                "\"payloadSha256\":\"5dbd584f1718b8bcd0dab4abeea83169f4a990defab81a8316ed845798d92dab\"}\n"
+            ),
         )
         .expect("ndjson");
         let trace = read_bot_host_logs(tmp.path()).expect("logs");
@@ -630,6 +696,37 @@ mod tests {
         assert_eq!(trace.submitted, 1);
         assert!(trace.timer_manager_invoked);
         assert!(trace.blocked.is_none());
+    }
+
+    #[test]
+    fn bot_host_ndjson_preserves_runtime_input_evidence() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fs::write(
+            tmp.path().join("bot-host.ndjson"),
+            concat!(
+                "{\"kind\":\"chat.input\",\"tickSource\":\"native-kernel/tickFrame\",",
+                "\"tick\":5,\"messageType\":\"InputCommand\",\"mappingId\":\"chat.input\",",
+                "\"payloadSha256\":\"5dbd584f1718b8bcd0dab4abeea83169f4a990defab81a8316ed845798d92dab\"}\n"
+            ),
+        )
+        .expect("ndjson");
+        let trace = read_bot_host_logs(tmp.path()).expect("logs");
+        let input = trace.input.expect("input evidence");
+        assert_eq!(input.message_type, "InputCommand");
+        assert_eq!(input.mapping_id, "chat.input");
+        assert_eq!(input.payload_sha256.len(), 64);
+    }
+
+    #[test]
+    fn bot_host_chat_input_without_runtime_wire_metadata_is_blocked() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        fs::write(
+            tmp.path().join("bot-host.ndjson"),
+            "{\"kind\":\"chat.input\",\"tickSource\":\"native-kernel/tickFrame\",\"tick\":5}\n",
+        )
+        .expect("ndjson");
+        let err = read_bot_host_logs(tmp.path()).expect_err("metadata is required");
+        assert!(err.starts_with(R4_04_BLOCKED), "{err}");
     }
 
     #[test]

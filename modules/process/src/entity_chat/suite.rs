@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use lumio_host_runtime::{HostClock, NativeAbiKernel, SharedClock};
+use lumio_host_runtime::{bounded_channel, HostClock, NativeAbiKernel, SharedClock};
 use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
@@ -179,6 +179,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             return write_blocked(out_dir, "BLOCKED: NativeCore timer ABI was not provided");
         }
     };
+    let (wire_input_tx, wire_input_rx) = bounded_channel(1);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::system(),
@@ -188,6 +189,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         admission.public.to_vec(),
         now,
     );
+    host.attach_wire_input_observer(wire_input_tx);
 
     let mut scenarios: HashMap<String, Value> = HashMap::new();
     let mut blocked: Option<String> = None;
@@ -478,7 +480,9 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 ClientBotTrace::default()
             }
         };
-    let runtime_input = host.latest_wire_input().unwrap_or_default();
+    let runtime_input = wire_input_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or_default();
     if runtime_input.is_empty() {
         blocked = blocked.or(Some(
             "Client Bot.Host did not deliver a Runtime-encoded InputCommand".to_owned(),
@@ -512,24 +516,23 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         && tick.ok
         && tick.applied_tick >= 1;
     let chat_events = received.clone();
-    let chat_ok = chat_events.len() == 101 && timer_ok;
+    let chat_ok = chat_events.len() == 101 && timer_ok && bot_trace.input.is_some();
     let event_order: Vec<String> = chat_events.clone();
     let applied_ticks: Vec<u64> = chat_events
         .iter()
         .filter_map(|frame| delta_tick_id(frame))
         .collect();
-    scenarios.insert(
-        "6".to_owned(),
-        json!({
-            "ok": chat_ok,
-            "eventCount": chat_events.len(),
-            "appliedTick": tick.applied_tick,
-            "timerManagerInvoked": timer_ok,
-            "cadence": bot_trace.tick_source,
-            "tickSource": bot_trace.tick_source,
-            "utteranceTicks": bot_trace.utterance_ticks,
-        }),
-    );
+    let mut scenario_6 = json!({
+        "ok": chat_ok,
+        "eventCount": chat_events.len(),
+        "appliedTick": tick.applied_tick,
+        "timerManagerInvoked": timer_ok,
+        "cadence": bot_trace.tick_source,
+        "tickSource": bot_trace.tick_source,
+        "utteranceTicks": bot_trace.utterance_ticks,
+    });
+    merge_input_evidence(&mut scenario_6, bot_trace.input_evidence_json());
+    scenarios.insert("6".to_owned(), scenario_6);
 
     let snapshot = host.capture_persist_snapshot(MAIN_ROOM.to_owned());
     let window_before = chat_events.len();
@@ -835,6 +838,16 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }
     }
     let session_ids: Vec<String> = admits.iter().map(|row| row.session_id.clone()).collect();
+    let mut chat_trace = json!({
+        "eventCount": chat_events.len(),
+        "tickSource": bot_trace.tick_source,
+        "timerManagerInvoked": timer_ok,
+        "utteranceTicks": bot_trace.utterance_ticks,
+        "botHostPid": bot_trace.pid,
+        "receivedEvents": chat_events,
+        "windowLines": chat_events,
+    });
+    merge_input_evidence(&mut chat_trace, bot_trace.input_evidence_json());
     let evidence = json!({
         "ok": all_ok,
         "blocked": blocked,
@@ -863,15 +876,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
                 "wrongPasswordCode": wrong.error_code,
             },
             "queries": query_traces,
-            "chat": {
-                "eventCount": chat_events.len(),
-                "tickSource": bot_trace.tick_source,
-                "timerManagerInvoked": timer_ok,
-                "utteranceTicks": bot_trace.utterance_ticks,
-                "botHostPid": bot_trace.pid,
-                "receivedEvents": chat_events,
-                "windowLines": chat_events,
-            },
+            "chat": chat_trace,
             "reconnect": reconnect_trace,
             "persist": {
                 "clientWindowBeforeSnapshot": window_before,
@@ -962,6 +967,16 @@ fn delta_tick_id(frame: &str) -> Option<u64> {
         .ok()?
         .get("tick")?
         .as_u64()
+}
+
+fn merge_input_evidence(target: &mut Value, input: Option<Value>) {
+    let Some(target) = target.as_object_mut() else {
+        return;
+    };
+    let Some(fields) = input.and_then(|value| value.as_object().cloned()) else {
+        return;
+    };
+    target.extend(fields);
 }
 
 /// Drains already-queued Room `chat.event` frames. Must not block past a deadline.
@@ -1079,38 +1094,6 @@ fn spawn_restore_process(snapshot_path: &Path, out_dir: &Path) -> Option<Value> 
             .and_then(Value::as_str)
             .unwrap_or("lumio-entity-chat-replay"),
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn batched_world_change_yields_one_record_per_chat_rpc() {
-        let frame = json!({
-            "messageType": "WorldChange",
-            "rpcs": [
-                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 1},
-                {"componentId": "OtherComponent", "method": "OnChatMessage", "messageId": 2},
-                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 3}
-            ],
-            "tick": 9
-        })
-        .to_string();
-
-        let records = chat_event_records(&frame);
-
-        assert_eq!(records.len(), 2);
-        assert_eq!(
-            records
-                .iter()
-                .filter_map(|record| delta_tick_id(record))
-                .collect::<Vec<_>>(),
-            vec![9, 9]
-        );
-        assert!(records[0].contains("\"messageId\":1"));
-        assert!(records[1].contains("\"messageId\":3"));
-    }
 }
 
 fn empty_login() -> super::AccountLoginResult {
@@ -1235,4 +1218,36 @@ fn chrono_now() -> String {
     // RFC3339-ish UTC without pulling chrono. Evidence timestamp only.
     let secs = unix_seconds();
     format!("{secs}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batched_world_change_yields_one_record_per_chat_rpc() {
+        let frame = json!({
+            "messageType": "WorldChange",
+            "rpcs": [
+                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 1},
+                {"componentId": "OtherComponent", "method": "OnChatMessage", "messageId": 2},
+                {"componentId": "ChatComponent", "method": "OnChatMessage", "messageId": 3}
+            ],
+            "tick": 9
+        })
+        .to_string();
+
+        let records = chat_event_records(&frame);
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| delta_tick_id(record))
+                .collect::<Vec<_>>(),
+            vec![9, 9]
+        );
+        assert!(records[0].contains("\"messageId\":1"));
+        assert!(records[1].contains("\"messageId\":3"));
+    }
 }

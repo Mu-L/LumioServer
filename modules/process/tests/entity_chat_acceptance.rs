@@ -164,6 +164,28 @@ fn assert_identical_suite_stamps(evidence: &Value) {
     }
 }
 
+fn assert_input_evidence(value: &Value, label: &str) {
+    assert_eq!(
+        value.get("messageType").and_then(Value::as_str),
+        Some("InputCommand"),
+        "{label} messageType"
+    );
+    assert_eq!(
+        value.get("mappingId").and_then(Value::as_str),
+        Some("chat.input"),
+        "{label} mappingId"
+    );
+    let sha = value
+        .get("payloadSha256")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert_eq!(sha.len(), 64, "{label} payloadSha256");
+    assert!(
+        sha.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "{label} payloadSha256 must be lowercase hex"
+    );
+}
+
 fn is_launcher_loop_index(id: &str) -> bool {
     id.parse::<u32>()
         .is_ok_and(|n| (1..=101).contains(&n) && id == n.to_string())
@@ -274,6 +296,15 @@ fn assert_round_shape(round_dir: &Path, evidence: &Value) {
     for needed in ["unauthorized", "invisible", "stale"] {
         assert!(s5_blob.contains(needed), "S5 missing {needed}");
     }
+
+    assert_input_evidence(
+        evidence.pointer("/scenarios/6").unwrap_or(&empty),
+        "scenario 6",
+    );
+    assert_input_evidence(
+        evidence.pointer("/traces/chat").unwrap_or(&empty),
+        "traces.chat",
+    );
 
     let s8 = evidence.pointer("/scenarios/8").cloned().unwrap_or(empty);
     let reconnect = evidence

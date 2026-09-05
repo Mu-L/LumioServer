@@ -37,13 +37,13 @@ pub use admission::{
 };
 pub use bots::{
     discover_bot_host, run_client_bot_fleet, start_client_bot_fleet, wait_for_client_bot_fleet,
-    ClientBotFleet, ClientBotTrace,
+    ClientBotFleet, ClientBotTrace, ClientInputEvidence,
 };
 pub use clr::{ClrGameplay, ClrGameplayConfig};
 pub use discover::{discover, ReplayArtifacts};
 pub use host::{
     AdmitTrace, AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution,
-    RoomAdmitResult, RoomCensus, DISPATCH_EXPIRE, DISPATCH_TICK,
+    RoomAdmitResult, RoomCensus, WireInputObserver, DISPATCH_EXPIRE, DISPATCH_TICK,
     MAX_DEFERRED_FRAMES_PER_CONNECTION, MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION,
     MAX_DEFERRED_FRAME_CONNECTIONS, MAX_PENDING_EGRESS_CONNECTIONS,
     MAX_PENDING_EGRESS_PER_CONNECTION,

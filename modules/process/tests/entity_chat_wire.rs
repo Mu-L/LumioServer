@@ -6,7 +6,7 @@ use common::{
     runtime_wire_chat_input, welcome_frame, world_change_frame, SharedRuntime, TestKernel,
     RUNTIME_WIRE_CHAT_INPUT,
 };
-use lumio_host_runtime::SharedClock;
+use lumio_host_runtime::{bounded_channel, SharedClock};
 use lumio_server_process::entity_chat::{
     drain_chat_event_deltas, generate_keys, issue_admission_credential, ChatOpKind, EntityChatHost,
     RoomClient, ADMISSION_KEY_ID, MAX_CHAT_INPUTS_PER_TICK, RECONNECT_WINDOW_MS,
@@ -129,8 +129,9 @@ fn pending_wire_chat_inputs_counts_room_ingress_until_tick() {
 }
 
 #[test]
-fn admitted_wire_input_is_retained_byte_for_byte() {
+fn admitted_wire_input_is_observed_byte_for_byte_without_host_retention() {
     let keys = generate_keys();
+    let (observer_tx, captured_rx) = bounded_channel::<Vec<u8>>(1);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::test(),
@@ -140,6 +141,7 @@ fn admitted_wire_input_is_retained_byte_for_byte() {
         keys.public.to_vec(),
         1_000,
     );
+    host.attach_wire_input_observer(observer_tx);
     assert!(
         host.admit(
             "room-main".to_owned(),
@@ -155,10 +157,12 @@ fn admitted_wire_input_is_retained_byte_for_byte() {
         .send_text(std::str::from_utf8(&input).expect("utf8 fixture"))
         .expect("wire input");
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    while host.latest_wire_input().is_none() && std::time::Instant::now() < deadline {
+    let mut captured = None;
+    while captured.is_none() && std::time::Instant::now() < deadline {
+        captured = captured_rx.try_recv().ok();
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    assert_eq!(host.latest_wire_input().as_deref(), Some(input.as_slice()));
+    assert_eq!(captured.as_deref(), Some(input.as_slice()));
 }
 
 #[test]

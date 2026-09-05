@@ -29,6 +29,9 @@ pub const MAX_DEFERRED_FRAMES_PER_CONNECTION: usize = 64;
 /// Maximum bytes retained by one deferred Runtime frame queue.
 pub const MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION: usize = 1_048_576;
 
+/// Bounded sink for exact Runtime-admitted input bytes used by external evidence consumers.
+pub type WireInputObserver = Sender<Vec<u8>>;
+
 /// WallClock expire dispatch id (NativeCore slot).
 pub const DISPATCH_EXPIRE: u32 = 1;
 /// TickFrame room tick dispatch id (NativeCore slot).
@@ -169,7 +172,7 @@ struct Inner {
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
     tick_id: u64,
     wire_chat_pending: u64,
-    latest_wire_input: Option<Vec<u8>>,
+    wire_input_observer: Option<WireInputObserver>,
 }
 
 enum OwnerWork {
@@ -230,7 +233,7 @@ impl EntityChatHost {
                 deferred_frames: HashMap::new(),
                 tick_id: 0,
                 wire_chat_pending: 0,
-                latest_wire_input: None,
+                wire_input_observer: None,
             };
             if inner
                 .kernel
@@ -257,6 +260,11 @@ impl EntityChatHost {
             listen_uri,
             clock,
         }
+    }
+
+    /// Attaches a bounded observer for exact admitted input bytes.
+    pub fn attach_wire_input_observer(&self, observer: WireInputObserver) {
+        self.on_owner(move |inner| inner.wire_input_observer = Some(observer));
     }
 
     fn on_owner<T, F>(&self, work: F) -> T
@@ -338,12 +346,6 @@ impl EntityChatHost {
         envelope_bytes: Vec<u8>,
     ) -> ChatOperation {
         self.on_owner(move |inner| inner.admit_input_command(&connection_id, &envelope_bytes))
-    }
-
-    /// Returns the latest Runtime-admitted input observed on the Room wire, unchanged.
-    #[must_use]
-    pub fn latest_wire_input(&self) -> Option<Vec<u8>> {
-        self.on_owner(|inner| inner.latest_wire_input.clone())
     }
 
     /// Advances kernel tickFrame and routes Runtime-owned outbox frames.
@@ -906,7 +908,9 @@ impl Inner {
                 let envelope_bytes = text.into_bytes();
                 let admitted = self.admit_input_command(&connection_id, &envelope_bytes);
                 if admitted.kind == ChatOpKind::Admitted {
-                    self.latest_wire_input = Some(envelope_bytes);
+                    if let Some(observer) = &self.wire_input_observer {
+                        let _ = observer.try_send(envelope_bytes);
+                    }
                     self.wire_chat_pending = self.wire_chat_pending.saturating_add(1);
                     if self.wire_chat_pending >= MAX_CHAT_INPUTS_PER_TICK as u64 {
                         if let Some(room_id) = room_id {
