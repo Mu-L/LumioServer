@@ -455,8 +455,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "census": census_payload,
             "scenarios": scenarios,
         });
-        write_evidence(out_dir, &evidence, &host_audit);
-        return evidence;
+        return match write_evidence(out_dir, &evidence, &host_audit) {
+            Ok(()) => evidence,
+            Err(error) => {
+                json!({"ok":false,"blocked":"evidence_write_failed","detail":error.to_string()})
+            }
+        };
     };
 
     let ok_request = AttributeQueryRequest {

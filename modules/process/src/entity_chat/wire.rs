@@ -57,6 +57,7 @@ pub enum WireSendError {
     InvalidUtf8,
 }
 impl WireSender {
+    #[cfg(test)]
     pub fn try_send_text(&self, text: String) -> Result<(), WireSendError> {
         self.try_send_bytes(text.as_bytes())
     }
@@ -227,6 +228,10 @@ fn unauthorized() -> ErrorResponse {
         .expect("fixed response")
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "tungstenite Callback requires its concrete HTTP ErrorResponse"
+)]
 async fn run_socket(
     stream: tokio::net::TcpStream,
     tx: Sender<WireEvent>,

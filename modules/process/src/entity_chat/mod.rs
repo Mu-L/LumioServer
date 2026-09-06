@@ -54,12 +54,12 @@ pub use clr::{ClrGameplay, ClrGameplayConfig};
 #[cfg(any(test, feature = "test-harness"))]
 pub use discover::{discover, ReplayArtifacts};
 pub use host::{
-    AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution, RoomAdmitResult,
-    WireInputObserver, DISPATCH_EXPIRE, DISPATCH_TICK, MAX_DEFERRED_FRAMES_PER_CONNECTION,
-    MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION, MAX_DEFERRED_FRAME_CONNECTIONS,
-    MAX_PENDING_ADMISSIONS, MAX_PENDING_EGRESS_CONNECTIONS, MAX_PENDING_EGRESS_PER_CONNECTION,
-    MAX_PENDING_QUERIES, MAX_PENDING_WIRE_INPUTS, MAX_PENDING_WIRE_INPUT_BYTES,
-    MAX_RUNTIME_QUERY_HISTORY,
+    AttributeQueryRequest, ConnectionBinding, EntityChatHost, EntityResolution, HostHealth,
+    RoomAdmitResult, WireInputObserver, DISPATCH_EXPIRE, DISPATCH_TICK,
+    MAX_DEFERRED_FRAMES_PER_CONNECTION, MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION,
+    MAX_DEFERRED_FRAME_CONNECTIONS, MAX_PENDING_ADMISSIONS, MAX_PENDING_EGRESS_CONNECTIONS,
+    MAX_PENDING_EGRESS_PER_CONNECTION, MAX_PENDING_QUERIES, MAX_PENDING_WIRE_INPUTS,
+    MAX_PENDING_WIRE_INPUT_BYTES, MAX_RUNTIME_QUERY_HISTORY,
 };
 pub use runtime::{
     AttributeQueryOutcome, AttributeQueryScope, BoundEntityKind, ChatOpKind, ChatOperation,

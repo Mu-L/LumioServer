@@ -337,7 +337,7 @@ fn verified_bytes(path: &Path, length: u64, hash: [u8; 32]) -> io::Result<Vec<u8
 }
 
 /// Journal entries are opaque committed change records supplied by Runtime.
-/// InputCommand bytes are NOT a substitute for a committed change record.
+/// `InputCommand` bytes are NOT a substitute for a committed change record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalRecord {
     pub sequence: u64,
@@ -522,8 +522,8 @@ mod tests {
         Checkpoint {
             tick,
             wal_sequence: tick,
-            runtime: vec![1, tick as u8],
-            voxel: Some(vec![2, tick as u8]),
+            runtime: vec![1, u8::try_from(tick).expect("small test tick")],
+            voxel: Some(vec![2, u8::try_from(tick).expect("small test tick")]),
         }
     }
     #[test]

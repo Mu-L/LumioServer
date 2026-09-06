@@ -661,6 +661,16 @@ fn error_from_frames(frames: &[RuntimeFrame]) -> Option<String> {
 }
 
 impl RuntimeSurface for ClrGameplay {
+    fn initialize(&mut self) -> Result<(), String> {
+        // Forces actual boot/signature checks before the host publishes Ready.
+        let response = self.call(json!({"op":"drain"}))?;
+        if response.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err("runtime_initialization_failed".to_owned())
+        }
+    }
+
     fn admit(
         &mut self,
         connection: &str,
