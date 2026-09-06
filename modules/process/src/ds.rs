@@ -4,7 +4,7 @@ use futures_util::FutureExt;
 use lumio_host_runtime::{NativeAbiKernel, SharedClock};
 use lumio_server_process::entity_chat::{
     AllocationContext, BoundAdmissionVerifier, ClrGameplay, ClrGameplayConfig, EntityChatHost,
-    PersistRecord,
+    HostLimitsConfig, PersistRecord, TransportConfig,
 };
 use lumio_server_process::persistence::{
     Checkpoint, CheckpointStore, StorageDurability, StoreIdentity,
@@ -28,10 +28,16 @@ struct Config {
     world_profile: String,
     checkpoint_seconds: u64,
     watchdog_timeout_ms: u64,
+    #[serde(default)]
+    transport: TransportConfig,
+    #[serde(default)]
+    host: HostLimitsConfig,
 }
 impl Config {
     fn validate(&self) -> Result<(Vec<u8>, StorageDurability), String> {
         self.allocation.validate()?;
+        self.transport.validate()?;
+        self.host.validate()?;
         if self.world_profile != "runtime-only" {
             return Err("this host profile requires runtime-only; Voxel/WAL recovery needs a committed-cut provider".to_owned());
         }
@@ -193,7 +199,9 @@ fn boot(config: &Config) -> Result<RunningHost, String> {
         clock,
         unix,
     )?;
-    let host = Arc::new(EntityChatHost::new_authenticated_restored(
+    let host = Arc::new(EntityChatHost::new_with_configs(
+        config.transport.clone(),
+        config.host.clone(),
         300_000,
         Box::new(runtime),
         Box::new(kernel),

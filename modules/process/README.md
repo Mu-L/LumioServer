@@ -33,9 +33,7 @@ Owner 请求入队与结果等待各有 2 秒期限；超时的操作可能已�
 
 ## 存储范围与限制
 
-`CheckpointStore` 已实现成组文件发布，`Journal` 已实现有界记录、校验链、刷盘回执及不完整尾部处理。它们不生成 ECS/Voxel 变更集。
-
-当前默认入口接入的是 **Runtime 检查点模式**，没有把 Journal 冒充已接通的世界 WAL。完整 WAL 重放、ECS/Voxel 同切点提供方、真实游戏迁移/长压测仍需跨仓闭环。
+`CheckpointStore` 已实现成组文件发布，不生成 ECS/Voxel 变更集。当前默认入口接入的是 **Runtime 检查点模式**。完整 WAL 重放、ECS/Voxel 同切点提供方、真实游戏迁移/长压测仍需跨仓闭环。
 
 账号 fixture 使用独立的成组文件事务与失败封锁；账号权威仍应归 LumioPlatform。退役条件遵循本仓 ADR 0011，不能在平台登录/Launch 与原验收尺子尚未全部打通时删目录。
 

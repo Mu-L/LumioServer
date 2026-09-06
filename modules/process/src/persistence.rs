@@ -1,17 +1,14 @@
 //! Host-owned opaque storage. Runtime supplies a committed cut, never network
 //! traffic; this module owns neither ECS fields nor Voxel serialization.
 //! Checkpoint publication groups both payloads in one immutable directory.
-//! Journal framing is internal storage metadata, not a public game protocol.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const MAX_CHECKPOINTS: usize = 4096;
 const MAX_MANIFEST_BYTES: u64 = 16_384;
-const HEADER_BYTES: usize = 88;
-const MAGIC: &[u8; 4] = b"LW01";
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -161,14 +158,16 @@ impl CheckpointStore {
             let name = name.to_string_lossy();
             if let Some(number) = name.strip_prefix("checkpoint-") {
                 if number.len() != 20 || !number.bytes().all(|c| c.is_ascii_digit()) {
-                    return Err(invalid("invalid checkpoint generation name"));
+                    // Ignore non-compliant directory names instead of permanently erroring
+                    continue;
                 }
                 if !entry.file_type()?.is_dir() {
-                    return Err(invalid("checkpoint is not a directory"));
+                    // Ignore non-directory items with checkpoint prefix
+                    continue;
                 }
-                let generation = number
-                    .parse()
-                    .map_err(|_| invalid("invalid checkpoint generation"))?;
+                let Ok(generation) = number.parse() else {
+                    continue;
+                };
                 rows.push((generation, entry.path()));
                 if rows.len() > MAX_CHECKPOINTS {
                     return Err(invalid("checkpoint count exceeds retention bound"));
@@ -342,177 +341,6 @@ fn verified_bytes(path: &Path, length: u64, hash: [u8; 32]) -> io::Result<Vec<u8
     Ok(bytes)
 }
 
-/// Journal entries are opaque committed change records supplied by Runtime.
-/// `InputCommand` bytes are NOT a substitute for a committed change record.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JournalRecord {
-    pub sequence: u64,
-    pub tick: u64,
-    pub bytes: Vec<u8>,
-}
-/// Receipt is returned only after `sync_all`. No speculative durable watermark.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DurableReceipt {
-    pub sequence: u64,
-    pub tick: u64,
-}
-pub struct Journal {
-    file: File,
-    last_sequence: u64,
-    last_tick: u64,
-    previous: [u8; 32],
-    max_record: usize,
-    max_file: u64,
-    poisoned: bool,
-}
-impl Journal {
-    /// Opens/revalidates a single-writer journal. An incomplete final write is
-    /// truncated; a complete record with invalid framing/checksum is rejected.
-    ///
-    /// # Errors
-    /// Lock, bounds, sequence, corruption and I/O errors are fatal.
-    pub fn open(
-        path: &Path,
-        max_record: usize,
-        max_file: u64,
-    ) -> io::Result<(Self, Vec<JournalRecord>)> {
-        if max_record == 0
-            || max_record > 16 * 1024 * 1024
-            || max_file > 512 * 1024 * 1024
-            || max_file < HEADER_BYTES as u64
-        {
-            return Err(invalid("invalid journal bounds"));
-        }
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        file.try_lock()?;
-        let length = file.metadata()?.len();
-        if length > max_file {
-            return Err(invalid("journal exceeds configured size"));
-        }
-        let mut offset = 0;
-        let mut previous = [0; 32];
-        let mut sequence = 0;
-        let mut last_tick = 0;
-        let mut rows = Vec::new();
-        while offset < length {
-            if length - offset < HEADER_BYTES as u64 {
-                file.set_len(offset)?;
-                file.sync_all()?;
-                break;
-            }
-            let mut header = [0u8; HEADER_BYTES];
-            file.read_exact(&mut header)?;
-            if &header[..4] != MAGIC {
-                return Err(invalid("journal magic mismatch"));
-            }
-            let size = u32::from_le_bytes(header[4..8].try_into().map_err(|_| invalid("length"))?)
-                as usize;
-            let seq =
-                u64::from_le_bytes(header[8..16].try_into().map_err(|_| invalid("sequence"))?);
-            let tick = u64::from_le_bytes(header[16..24].try_into().map_err(|_| invalid("tick"))?);
-            if size > max_record
-                || size == 0
-                || seq != sequence + 1
-                || tick < last_tick
-                || header[24..56] != previous
-            {
-                return Err(invalid("journal metadata mismatch"));
-            }
-            if length - offset - (HEADER_BYTES as u64) < size as u64 {
-                file.set_len(offset)?;
-                file.sync_all()?;
-                break;
-            }
-            let mut body = vec![0u8; size];
-            file.read_exact(&mut body)?;
-            let mut hash = Sha256::new();
-            hash.update(&header[..56]);
-            hash.update(&body);
-            let expected: [u8; 32] = hash.finalize().into();
-            if header[56..88] != expected {
-                return Err(invalid("journal checksum mismatch"));
-            }
-            previous = expected;
-            sequence = seq;
-            last_tick = tick;
-            rows.push(JournalRecord {
-                sequence: seq,
-                tick,
-                bytes: body,
-            });
-            offset += HEADER_BYTES as u64 + size as u64;
-        }
-        file.seek(SeekFrom::End(0))?;
-        Ok((
-            Self {
-                file,
-                last_sequence: sequence,
-                last_tick,
-                previous,
-                max_record,
-                max_file,
-                poisoned: false,
-            },
-            rows,
-        ))
-    }
-    /// Appends one committed cut and synchronizes before acknowledging it.
-    ///
-    /// # Errors
-    /// Capacity/order rejection leaves the file unchanged. An I/O failure
-    /// poisons the writer because the durable outcome is then ambiguous.
-    pub fn append(&mut self, tick: u64, bytes: &[u8]) -> io::Result<DurableReceipt> {
-        if self.poisoned {
-            return Err(invalid("journal writer requires reopen"));
-        }
-        if bytes.is_empty() || bytes.len() > self.max_record || tick < self.last_tick {
-            return Err(invalid("invalid journal record"));
-        }
-        let sequence = self
-            .last_sequence
-            .checked_add(1)
-            .ok_or_else(|| invalid("journal sequence exhausted"))?;
-        if self
-            .file
-            .metadata()?
-            .len()
-            .saturating_add(HEADER_BYTES as u64 + bytes.len() as u64)
-            > self.max_file
-        {
-            return Err(invalid("journal rotation required"));
-        }
-        let mut header = [0u8; HEADER_BYTES];
-        header[..4].copy_from_slice(MAGIC);
-        header[4..8].copy_from_slice(
-            &u32::try_from(bytes.len())
-                .map_err(|_| invalid("length overflow"))?
-                .to_le_bytes(),
-        );
-        header[8..16].copy_from_slice(&sequence.to_le_bytes());
-        header[16..24].copy_from_slice(&tick.to_le_bytes());
-        header[24..56].copy_from_slice(&self.previous);
-        let mut hash = Sha256::new();
-        hash.update(&header[..56]);
-        hash.update(bytes);
-        let checksum: [u8; 32] = hash.finalize().into();
-        header[56..88].copy_from_slice(&checksum);
-        self.poisoned = true;
-        self.file.write_all(&header)?;
-        self.file.write_all(bytes)?;
-        self.file.sync_all()?;
-        self.previous = checksum;
-        self.last_sequence = sequence;
-        self.last_tick = tick;
-        self.poisoned = false;
-        Ok(DurableReceipt { sequence, tick })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,40 +408,32 @@ mod tests {
         assert!(s.recover().unwrap().is_none());
     }
     #[test]
-    fn journal_truncated_tail_recovers_but_full_corruption_does_not() {
+    fn non_compliant_checkpoint_directory_entries_are_ignored() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("wal");
-        let (mut w, _) = Journal::open(&p, 1024, 4096).unwrap();
-        assert_eq!(
-            w.append(1, b"one").unwrap(),
-            DurableReceipt {
-                sequence: 1,
-                tick: 1
-            }
-        );
-        w.append(2, b"two").unwrap();
-        drop(w);
-        let f = OpenOptions::new().write(true).open(&p).unwrap();
-        f.set_len(f.metadata().unwrap().len() - 1).unwrap();
-        drop(f);
-        let (mut w, rows) = Journal::open(&p, 1024, 4096).unwrap();
-        assert_eq!(rows.len(), 1);
-        w.append(2, b"two").unwrap();
-        drop(w);
-        let mut f = OpenOptions::new().write(true).open(&p).unwrap();
-        f.seek(SeekFrom::Start(HEADER_BYTES as u64)).unwrap();
-        f.write_all(b"BAD").unwrap();
-        drop(f);
-        assert!(Journal::open(&p, 1024, 4096).is_err());
+        let mut s =
+            CheckpointStore::open(d.path(), identity(), 1024, StorageDurability::ProcessCrash)
+                .unwrap();
+        s.publish(&point(1)).unwrap();
+        // Create invalid checkpoint entries: non-numeric suffix, too short/long, or not a directory
+        fs::create_dir(d.path().join("checkpoint-notanumber")).unwrap();
+        fs::create_dir(d.path().join("checkpoint-123")).unwrap();
+        fs::write(d.path().join("checkpoint-00000000000000000099"), b"file").unwrap();
+        // The store must still list the valid generation and recover cleanly
+        assert_eq!(s.recover().unwrap(), Some(point(1)));
     }
     #[test]
-    fn journal_capacity_and_sequence_are_explicit() {
+    fn power_loss_durability_behavior_matches_platform() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("wal");
-        let (mut w, _) = Journal::open(&p, 8, 100).unwrap();
-        assert!(w.append(1, b"ninebytes").is_err());
-        assert_eq!(w.append(2, b"ok").unwrap().sequence, 1);
-        assert!(w.append(1, b"late").is_err());
-        assert!(w.append(3, b"full").is_err());
+        let res = CheckpointStore::open(d.path(), identity(), 1024, StorageDurability::PowerLoss);
+        #[cfg(unix)]
+        {
+            let mut store = res.expect("Unix supports directory fsync for power loss");
+            assert_eq!(store.publish(&point(1)).unwrap(), 1);
+            assert_eq!(store.recover().unwrap(), Some(point(1)));
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(res.is_err(), "Non-unix rejects power-loss fsync durability");
+        }
     }
 }

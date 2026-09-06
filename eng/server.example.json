@@ -25,5 +25,28 @@
   "world_profile": "runtime-only",
   "durability": "process-crash",
   "checkpoint_seconds": 30,
-  "watchdog_timeout_ms": 2000
+  "watchdog_timeout_ms": 2000,
+  "transport": {
+    "handshake_timeout_ms": 5000,
+    "idle_timeout_ms": 30000,
+    "write_timeout_ms": 5000,
+    "max_concurrent_connections": 1024,
+    "max_connections_per_ip": 16,
+    "max_pending_handshakes": 128,
+    "handshake_rate_limit_per_second": 32,
+    "max_frame_bytes": 65536
+  },
+  "host": {
+    "max_pending_admissions": 1024,
+    "max_pending_egress_per_connection": 8,
+    "max_pending_egress_connections": 1024,
+    "max_deferred_frames_per_connection": 64,
+    "max_deferred_frame_bytes_per_connection": 262144,
+    "max_deferred_frame_connections": 1024,
+    "ingress_queue_per_connection": 32,
+    "max_pending_wire_inputs": 1024,
+    "max_chat_inputs_per_tick": 32,
+    "max_pending_queries": 1024,
+    "tick_hz": 100
+  }
 }

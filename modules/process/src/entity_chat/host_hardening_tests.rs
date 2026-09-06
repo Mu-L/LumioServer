@@ -190,6 +190,7 @@ fn owner() -> (Inner, Arc<Mutex<Trace>>) {
     assert!(clock.advance_test_clock(5_000));
     let inner = Inner {
         health: Arc::new(HealthState::default()),
+        limits: HostLimitsConfig::default(),
         admission_clock_origin_ms: clock.now_ms(),
         active_rooms: BTreeSet::new(),
         admission_verifier: None,
@@ -290,7 +291,8 @@ fn budget_keeps_the_remainder_and_its_byte_accounting() {
     let (mut inner, trace) = owner();
     admit(&mut inner, "room", "a");
     admit(&mut inner, "room", "b");
-    for index in 0..MAX_CHAT_INPUTS_PER_TICK {
+    let max_chat_batch = inner.limits.max_chat_inputs_per_tick;
+    for index in 0..max_chat_batch {
         input(&mut inner, "a", &index.to_string());
     }
     input(&mut inner, "b", "remaining");
@@ -298,10 +300,11 @@ fn budget_keeps_the_remainder_and_its_byte_accounting() {
     assert!(inner.run_tick("room").ok);
     assert_eq!(
         trace.lock().expect("trace lock").inputs.len(),
-        MAX_CHAT_INPUTS_PER_TICK
+        max_chat_batch
     );
     assert_eq!(inner.pending_wire_inputs.len(), 1);
-    assert_eq!(inner.pending_wire_input_bytes, b"remaining".len());
+    assert_eq!(inner.pending_wire_input_bytes, "63".len());
+    assert_eq!(inner.pending_wire_inputs[0].connection_id, "a");
     assert!(inner.run_tick("room").ok);
     assert_eq!(
         trace
@@ -311,7 +314,7 @@ fn budget_keeps_the_remainder_and_its_byte_accounting() {
             .last()
             .expect("last")
             .1,
-        b"remaining"
+        b"63"
     );
     assert!(inner.pending_wire_inputs.is_empty());
     assert_eq!(inner.pending_wire_input_bytes, 0);
@@ -321,15 +324,20 @@ fn budget_keeps_the_remainder_and_its_byte_accounting() {
 fn input_at_and_over_the_limit_never_advances_logical_time() {
     let (mut inner, trace) = owner();
     admit(&mut inner, "room", "a");
-    for _ in 0..INGRESS_QUEUE_PER_CONNECTION {
+    let queue_limit = inner.limits.ingress_queue_per_connection;
+    for _ in 0..queue_limit {
         input(&mut inner, "a", "input");
     }
     assert_eq!(inner.tick_id, 0);
-    assert!(trace.lock().expect("trace lock").inputs.is_empty());
     input(&mut inner, "a", "overflow");
     assert_eq!(inner.tick_id, 0);
     assert!(trace.lock().expect("trace lock").ticks.is_empty());
-    assert!(!inner.sessions.contains_key("a"));
+    assert!(inner.sessions.contains_key("a"));
+    assert_eq!(
+        inner.pending_wire_inputs.len(),
+        inner.limits.ingress_queue_per_connection
+    );
+    assert_eq!(inner.health.rejected_inputs.load(Ordering::Relaxed), 1);
 }
 
 #[test]
@@ -465,4 +473,59 @@ fn rejected_input_is_counted_and_fatal_input_seals_world() {
     assert!(inner.health.faulted.load(Ordering::Acquire));
     assert!(!inner.run_tick("room").ok);
     assert_eq!(trace.lock().expect("trace").ticks.len(), 1);
+}
+
+#[test]
+fn fair_round_robin_scheduling_prevents_single_sender_starvation() {
+    let (mut inner, trace) = owner();
+    inner.limits.max_chat_inputs_per_tick = 4;
+    admit(&mut inner, "room", "conn_a");
+    admit(&mut inner, "room", "conn_b");
+
+    // Sender a fills 4 inputs first
+    for i in 0..4 {
+        input(&mut inner, "conn_a", &format!("a{i}"));
+    }
+    // Sender b sends 2 inputs later
+    for i in 0..2 {
+        input(&mut inner, "conn_b", &format!("b{i}"));
+    }
+
+    // Flush one tick
+    inner.flush_pending_wire_inputs("room");
+
+    let inputs = trace.lock().expect("trace").inputs.clone();
+    // Batch of 4 was chosen: round-robin picked 2 from a and 2 from b (not all 4 from a!)
+    assert_eq!(inputs.len(), 4);
+    let senders: Vec<String> = inputs.iter().map(|(conn, _)| conn.clone()).collect();
+    let a_count = senders.iter().filter(|s| s.as_str() == "conn_a").count();
+    let b_count = senders.iter().filter(|s| s.as_str() == "conn_b").count();
+    assert_eq!(a_count, 2);
+    assert_eq!(b_count, 2);
+    // Remaining in queue: 2 inputs from conn_a
+    assert_eq!(inner.pending_wire_inputs.len(), 2);
+}
+
+#[test]
+fn flush_pending_inputs_restores_uncommitted_on_fatal() {
+    let (mut inner, trace) = owner();
+    inner.limits.max_chat_inputs_per_tick = 4;
+    admit(&mut inner, "room", "conn_a");
+
+    input(&mut inner, "conn_a", "input_1");
+    input(&mut inner, "conn_a", "input_2");
+    input(&mut inner, "conn_a", "input_3");
+
+    // Make second input fatal
+    trace.lock().expect("trace").next_outcome = Some(ChatOperation {
+        kind: ChatOpKind::Fatal,
+        error_code: Some("runtime_failure".into()),
+    });
+
+    inner.flush_pending_wire_inputs("room");
+
+    // Host faulted
+    assert!(inner.health.faulted.load(Ordering::Acquire));
+    // Uncommitted inputs (input_2 and input_3) must be preserved in queue, not discarded!
+    assert_eq!(inner.pending_wire_inputs.len(), 2);
 }

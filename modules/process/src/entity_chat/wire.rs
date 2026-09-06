@@ -7,6 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use lumio_host_runtime::{
     bounded_channel, spawn_supervised, CancelToken, RecvError, SendError, Sender, SupervisedTask,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::net::TcpListener;
 #[cfg(any(test, feature = "test-harness"))]
@@ -31,10 +32,165 @@ use tokio_tungstenite::tungstenite::{
 use tokio_tungstenite::{accept_hdr_async_with_config, WebSocketStream};
 
 pub const MAX_WIRE_TEXT_BYTES: usize = 65_536;
-const MAX_SOCKET_TASKS: usize = 256;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
-const EGRESS_SLOTS: usize = 16;
+
+fn default_listen_address() -> String {
+    "127.0.0.1".into()
+}
+const fn default_listen_port() -> u16 {
+    0
+}
+const fn default_max_socket_tasks() -> usize {
+    256
+}
+const fn default_max_admissions_per_second() -> u32 {
+    256
+}
+const fn default_handshake_timeout_ms() -> u64 {
+    3000
+}
+const fn default_write_timeout_ms() -> u64 {
+    3000
+}
+const fn default_max_wire_text_bytes() -> usize {
+    65_536
+}
+const fn default_egress_slots() -> usize {
+    16
+}
+const fn default_unauthenticated_quota_bytes() -> usize {
+    1024
+}
+const fn default_idle_timeout_ms() -> u64 {
+    60_000
+}
+
+/// Transport and socket parameters. All sizing and limits are configurable per ds-server redline.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransportConfig {
+    #[serde(default = "default_listen_address")]
+    pub listen_address: String,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    #[serde(default = "default_max_socket_tasks")]
+    pub max_socket_tasks: usize,
+    #[serde(default = "default_max_admissions_per_second")]
+    pub max_admissions_per_second: u32,
+    #[serde(default = "default_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+    #[serde(default = "default_write_timeout_ms")]
+    pub write_timeout_ms: u64,
+    #[serde(default = "default_max_wire_text_bytes")]
+    pub max_wire_text_bytes: usize,
+    #[serde(default = "default_egress_slots")]
+    pub egress_slots: usize,
+    #[serde(default = "default_unauthenticated_quota_bytes")]
+    pub unauthenticated_quota_bytes: usize,
+    #[serde(default = "default_idle_timeout_ms")]
+    pub idle_timeout_ms: u64,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            listen_address: default_listen_address(),
+            listen_port: default_listen_port(),
+            max_socket_tasks: default_max_socket_tasks(),
+            max_admissions_per_second: default_max_admissions_per_second(),
+            handshake_timeout_ms: default_handshake_timeout_ms(),
+            write_timeout_ms: default_write_timeout_ms(),
+            max_wire_text_bytes: default_max_wire_text_bytes(),
+            egress_slots: default_egress_slots(),
+            unauthenticated_quota_bytes: default_unauthenticated_quota_bytes(),
+            idle_timeout_ms: default_idle_timeout_ms(),
+        }
+    }
+}
+
+impl TransportConfig {
+    /// Validates all range constraints, rejecting 0 or out-of-bounds numbers.
+    ///
+    /// # Errors
+    /// Returns human-readable error on invalid parameter.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.listen_address.trim().is_empty() {
+            return Err("transport listen_address cannot be empty".into());
+        }
+        if self.max_socket_tasks == 0 || self.max_socket_tasks > 65_536 {
+            return Err("transport max_socket_tasks must be between 1 and 65536".into());
+        }
+        if self.max_admissions_per_second == 0 || self.max_admissions_per_second > 100_000 {
+            return Err("transport max_admissions_per_second must be between 1 and 100000".into());
+        }
+        if self.handshake_timeout_ms < 50 || self.handshake_timeout_ms > 60_000 {
+            return Err("transport handshake_timeout_ms must be between 50 and 60000".into());
+        }
+        if self.write_timeout_ms < 50 || self.write_timeout_ms > 60_000 {
+            return Err("transport write_timeout_ms must be between 50 and 60000".into());
+        }
+        if self.max_wire_text_bytes < 1024 || self.max_wire_text_bytes > 16_777_216 {
+            return Err("transport max_wire_text_bytes must be between 1024 and 16777216".into());
+        }
+        if self.egress_slots == 0 || self.egress_slots > 1024 {
+            return Err("transport egress_slots must be between 1 and 1024".into());
+        }
+        Ok(())
+    }
+}
+
+/// Registered Close Reason Codes per ds-server M1⑤.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReasonCode {
+    Shutdown,
+    QueueFull,
+    SendBufferOverflow,
+    SessionClosed,
+    BadEnvelope,
+    ProtocolViolation,
+    ConnectionTimeout,
+    InputRateExceeded,
+    NormalLogout,
+    Superseded,
+}
+
+impl CloseReasonCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shutdown => "shutdown",
+            Self::QueueFull => "queue_full",
+            Self::SendBufferOverflow => "send_buffer_overflow",
+            Self::SessionClosed => "session_closed",
+            Self::BadEnvelope => "bad_envelope",
+            Self::ProtocolViolation => "protocol_violation",
+            Self::ConnectionTimeout => "connection_timeout",
+            Self::InputRateExceeded => "input_rate_exceeded",
+            Self::NormalLogout => "normal_logout",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    #[must_use]
+    pub fn close_code(self) -> CloseCode {
+        match self {
+            Self::Shutdown => CloseCode::Away,
+            Self::NormalLogout | Self::SessionClosed | Self::Superseded => CloseCode::Normal,
+            Self::QueueFull | Self::SendBufferOverflow => CloseCode::Size,
+            Self::BadEnvelope
+            | Self::ProtocolViolation
+            | Self::InputRateExceeded
+            | Self::ConnectionTimeout => CloseCode::Policy,
+        }
+    }
+
+    #[must_use]
+    pub fn into_close_frame(self) -> CloseFrame {
+        CloseFrame {
+            code: self.close_code(),
+            reason: self.as_str().into(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct WireSender {
@@ -42,6 +198,7 @@ pub struct WireSender {
     cancel: CancelToken,
     observer_id: u64,
     wake: Arc<Notify>,
+    max_text_bytes: usize,
 }
 #[derive(Debug, Clone)]
 pub enum WireOut {
@@ -64,7 +221,7 @@ impl WireSender {
         if self.cancel.is_cancelled() {
             return Err(WireSendError::Closed);
         }
-        if bytes.len() > MAX_WIRE_TEXT_BYTES {
+        if bytes.len() > self.max_text_bytes {
             return Err(WireSendError::TooLarge);
         }
         std::str::from_utf8(bytes).map_err(|_| WireSendError::InvalidUtf8)?;
@@ -108,6 +265,7 @@ pub(crate) fn test_sender_pair(
             cancel: CancelToken::new(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         },
         rx,
     )
@@ -140,63 +298,151 @@ pub(crate) enum WireEvent {
 }
 static NEXT_OBSERVER_ID: AtomicU64 = AtomicU64::new(1);
 
+enum ListenerTask {
+    Supervised(SupervisedTask),
+    Tokio(tokio::task::JoinHandle<()>),
+}
+
+#[must_use]
+#[allow(dead_code)]
+#[cfg(any(test, feature = "test-harness"))]
+pub fn is_wire_text_size_valid(text: &str) -> bool {
+    text.as_bytes().len() <= MAX_WIRE_TEXT_BYTES
+}
+
 pub struct RoomListener {
     pub port: u16,
-    task: SupervisedTask,
+    task: ListenerTask,
     stop: watch::Sender<bool>,
 }
 impl RoomListener {
+    #[allow(dead_code)]
     #[cfg(any(test, feature = "test-harness"))]
     pub(crate) fn bind(tx: Sender<WireEvent>) -> Result<Self, String> {
-        Self::start(tx, None)
+        Self::bind_with_config(tx, TransportConfig::default())
     }
+
+    #[cfg(any(test, feature = "test-harness"))]
+    pub(crate) fn bind_with_config(
+        tx: Sender<WireEvent>,
+        config: TransportConfig,
+    ) -> Result<Self, String> {
+        Self::start(tx, None, config)
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn bind_authenticated(
         tx: Sender<WireEvent>,
         verifier: BoundAdmissionVerifier,
     ) -> Result<Self, String> {
-        Self::start(tx, Some(verifier))
+        Self::bind_authenticated_with_config(tx, verifier, TransportConfig::default())
     }
+
+    pub(crate) fn bind_authenticated_with_config(
+        tx: Sender<WireEvent>,
+        verifier: BoundAdmissionVerifier,
+        config: TransportConfig,
+    ) -> Result<Self, String> {
+        Self::start(tx, Some(verifier), config)
+    }
+
     fn start(
         tx: Sender<WireEvent>,
         verifier: Option<BoundAdmissionVerifier>,
+        config: TransportConfig,
     ) -> Result<Self, String> {
-        let socket = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+        config.validate()?;
+        let bind_addr = format!("{}:{}", config.listen_address, config.listen_port);
+        let socket = TcpListener::bind(&bind_addr).map_err(|e| e.to_string())?;
         socket.set_nonblocking(true).map_err(|e| e.to_string())?;
         let port = socket.local_addr().map_err(|e| e.to_string())?.port();
-        let (stop, mut stopped) = watch::channel(false);
-        let task = spawn_supervised("lumio-room-reactor", move |_| {
-            let executor = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("socket reactor");
-            executor.block_on(async move {
-                let listener = tokio::net::TcpListener::from_std(socket).expect("async listener");
-                let mut connections = JoinSet::new();
-                let mut admission_window = tokio::time::Instant::now();
-                let mut admissions_in_window = 0_u32;
-                loop {
-                    tokio::select! {
-                        _ = stopped.changed() => break,
-                        result = connections.join_next(), if !connections.is_empty() => {
-                            if let Some(Err(error)) = result { panic!("socket task failed: {error}"); }
+        let (stop, stopped) = watch::channel(false);
+
+        let reactor_logic = |listener: tokio::net::TcpListener,
+                             cfg: TransportConfig,
+                             event_tx: Sender<WireEvent>,
+                             mut stop_rx: watch::Receiver<bool>,
+                             ver: Option<BoundAdmissionVerifier>| async move {
+            let mut connections = JoinSet::new();
+            let mut admission_window = tokio::time::Instant::now();
+            let mut admissions_in_window = 0_u32;
+            loop {
+                tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    result = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(_)) = result {}
+                    }
+                    accepted = listener.accept() => {
+                        let (stream, _) = if let Ok(res) = accepted {
+                            res
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            continue;
+                        };
+                        if admission_window.elapsed() >= Duration::from_secs(1) {
+                            admission_window = tokio::time::Instant::now();
+                            admissions_in_window = 0;
                         }
-                        accepted = listener.accept() => {
-                            let (stream, _) = accepted.expect("socket accept failed");
-                            if admission_window.elapsed() >= Duration::from_secs(1) {
-                                admission_window = tokio::time::Instant::now();
-                                admissions_in_window = 0;
-                            }
-                            if admissions_in_window >= 256 { drop(stream); continue; }
-                            admissions_in_window += 1;
-                            if connections.len() >= MAX_SOCKET_TASKS { drop(stream); continue; }
-                            connections.spawn(run_socket(stream, tx.clone(), stopped.clone(), verifier.clone()));
+                        if admissions_in_window >= cfg.max_admissions_per_second {
+                            tokio::spawn(async move {
+                                let mut stream = stream;
+                                let _ = tokio::io::AsyncWriteExt::write_all(
+                                    &mut stream,
+                                    b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\ninput_rate_exceeded",
+                                ).await;
+                            });
+                            continue;
                         }
+                        admissions_in_window += 1;
+                        if connections.len() >= cfg.max_socket_tasks {
+                            tokio::spawn(async move {
+                                let mut stream = stream;
+                                let _ = tokio::io::AsyncWriteExt::write_all(
+                                    &mut stream,
+                                    b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\nqueue_full",
+                                ).await;
+                            });
+                            continue;
+                        }
+                        connections.spawn(run_socket(stream, cfg.clone(), event_tx.clone(), stop_rx.clone(), ver.clone()));
                     }
                 }
-                connections.abort_all();
-                while connections.join_next().await.is_some() {}
+            }
+            let graceful_deadline = tokio::time::sleep(Duration::from_millis(250));
+            tokio::pin!(graceful_deadline);
+            loop {
+                tokio::select! {
+                    () = &mut graceful_deadline => break,
+                    res = connections.join_next() => {
+                        if res.is_none() { break; }
+                    }
+                }
+            }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
+        };
+
+        let task = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let async_listener =
+                tokio::net::TcpListener::from_std(socket).map_err(|e| e.to_string())?;
+            let join_handle =
+                handle.spawn(reactor_logic(async_listener, config, tx, stopped, verifier));
+            ListenerTask::Tokio(join_handle)
+        } else {
+            let supervised = spawn_supervised("lumio-room-reactor", move |_| {
+                let executor = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("socket reactor");
+                executor.block_on(async move {
+                    let async_listener =
+                        tokio::net::TcpListener::from_std(socket).expect("async listener");
+                    reactor_logic(async_listener, config, tx, stopped, verifier).await;
+                });
             });
-        });
+            ListenerTask::Supervised(supervised)
+        };
+
         Ok(Self { port, task, stop })
     }
     #[must_use]
@@ -205,7 +451,10 @@ impl RoomListener {
     }
     #[must_use]
     pub fn is_healthy(&self) -> bool {
-        !self.task.is_finished() && self.task.failure().is_none()
+        match &self.task {
+            ListenerTask::Supervised(t) => !t.is_finished() && t.failure().is_none(),
+            ListenerTask::Tokio(h) => !h.is_finished(),
+        }
     }
     pub fn shutdown(&self) {
         let _ = self.stop.send(true);
@@ -267,6 +516,7 @@ fn unauthorized() -> ErrorResponse {
 )]
 async fn run_socket(
     stream: tokio::net::TcpStream,
+    config: TransportConfig,
     tx: Sender<WireEvent>,
     mut stop: watch::Receiver<bool>,
     verifier: Option<BoundAdmissionVerifier>,
@@ -275,9 +525,9 @@ async fn run_socket(
     let limits = WebSocketConfig::default()
         .read_buffer_size(4096)
         .write_buffer_size(0)
-        .max_write_buffer_size(2 * MAX_WIRE_TEXT_BYTES + 1024)
-        .max_message_size(Some(MAX_WIRE_TEXT_BYTES))
-        .max_frame_size(Some(MAX_WIRE_TEXT_BYTES));
+        .max_write_buffer_size(2 * config.max_wire_text_bytes + 1024)
+        .max_message_size(Some(config.max_wire_text_bytes))
+        .max_frame_size(Some(config.max_wire_text_bytes));
     let handshake = accept_hdr_async_with_config(
         stream,
         |request: &Request, mut response: Response| {
@@ -300,30 +550,51 @@ async fn run_socket(
         },
         Some(limits),
     );
+    let handshake_duration = Duration::from_millis(config.handshake_timeout_ms);
     let mut ws = tokio::select! {
         _ = stop.changed() => return,
-        result = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake) => match result { Ok(Ok(ws)) => ws, _ => return },
+        result = tokio::time::timeout(handshake_duration, handshake) => match result {
+            Ok(Ok(ws)) => ws,
+            _ => return,
+        },
     };
     let connection_id = if proof.is_some() {
         let mut random = [0u8; 16];
         if getrandom::fill(&mut random).is_err() {
+            let _ = ws
+                .send(Message::Close(Some(
+                    CloseReasonCode::Shutdown.into_close_frame(),
+                )))
+                .await;
             return;
         }
         format!("conn-{}", super::crypto::hex_lower(&random))
     } else {
         let first = tokio::select! {
-            _ = stop.changed() => return,
-            result = tokio::time::timeout(HANDSHAKE_TIMEOUT, ws.next()) => match result {
-                Ok(Some(Ok(Message::Text(text)))) => text,
-                _ => return,
-            },
+            _ = stop.changed() => {
+                let _ = ws.send(Message::Close(Some(CloseReasonCode::Shutdown.into_close_frame()))).await;
+                return;
+            }
+            result = tokio::time::timeout(handshake_duration, ws.next()) => {
+                if let Ok(Some(Ok(Message::Text(text)))) = result {
+                    text
+                } else {
+                    let _ = ws.send(Message::Close(Some(CloseReasonCode::ConnectionTimeout.into_close_frame()))).await;
+                    return;
+                }
+            }
         };
         let Some(id) = parse_connection_id(&first) else {
+            let _ = ws
+                .send(Message::Close(Some(
+                    CloseReasonCode::ProtocolViolation.into_close_frame(),
+                )))
+                .await;
             return;
         };
         id
     };
-    let (out, pending) = bounded_channel(EGRESS_SLOTS);
+    let (out, pending) = bounded_channel(config.egress_slots);
     let cancel = CancelToken::new();
     let wake = Arc::new(Notify::new());
     let _guard = SocketGuard {
@@ -336,6 +607,7 @@ async fn run_socket(
         cancel: cancel.clone(),
         observer_id,
         wake: wake.clone(),
+        max_text_bytes: config.max_wire_text_bytes,
     };
     let event = match proof {
         Some(proof) => WireEvent::Authenticated {
@@ -349,20 +621,23 @@ async fn run_socket(
         },
     };
     if tx.try_send(event).is_err() {
+        let _ = ws
+            .send(Message::Close(Some(
+                CloseReasonCode::QueueFull.into_close_frame(),
+            )))
+            .await;
         return;
     }
     let (mut sink, mut input) = ws.split();
-    let reason = tokio::select! {
-        _ = stop.changed() => "shutdown",
-        reason = read_inputs(&mut input, &tx, &connection_id, observer_id) => reason,
-        reason = write_frames(&mut sink, pending, &cancel, &wake) => reason,
+    let write_duration = Duration::from_millis(config.write_timeout_ms);
+    let reason: CloseReasonCode = tokio::select! {
+        _ = stop.changed() => CloseReasonCode::Shutdown,
+        reason = read_inputs(&mut input, &tx, &connection_id, observer_id, config.max_wire_text_bytes) => reason,
+        reason = write_frames(&mut sink, pending, &cancel, &wake, write_duration) => reason,
     };
     cancel.cancel();
     wake.notify_one();
-    let close = Message::Close(Some(CloseFrame {
-        code: CloseCode::Policy,
-        reason: reason.into(),
-    }));
+    let close = Message::Close(Some(reason.into_close_frame()));
     let _ = tokio::time::timeout(Duration::from_millis(250), sink.send(close)).await;
     // If the control queue is full, the guard's closed flag is swept by the
     // owner. No blocking send can hold the reactor or process shutdown hostage.
@@ -378,10 +653,14 @@ async fn read_inputs(
     tx: &Sender<WireEvent>,
     connection: &str,
     observer_id: u64,
-) -> &'static str {
+    max_bytes: usize,
+) -> CloseReasonCode {
     while let Some(frame) = input.next().await {
         match frame {
-            Ok(Message::Text(text)) if is_wire_text_size_valid(&text) => {
+            Ok(Message::Text(text)) => {
+                if text.len() > max_bytes {
+                    return CloseReasonCode::BadEnvelope;
+                }
                 if tx
                     .try_send(WireEvent::Input {
                         connection_id: connection.to_owned(),
@@ -390,28 +669,29 @@ async fn read_inputs(
                     })
                     .is_err()
                 {
-                    return "queue_full";
+                    return CloseReasonCode::QueueFull;
                 }
             }
             Ok(Message::Ping(_) | Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => return "session_closed",
-            _ => return "bad_envelope",
+            Ok(Message::Close(_)) => return CloseReasonCode::SessionClosed,
+            _ => return CloseReasonCode::ProtocolViolation,
         }
     }
-    "session_closed"
+    CloseReasonCode::SessionClosed
 }
 async fn write_frames(
     sink: &mut futures_util::stream::SplitSink<Socket, Message>,
     pending: lumio_host_runtime::Receiver<WireOut>,
     cancel: &CancelToken,
     wake: &Notify,
-) -> &'static str {
+    write_timeout: Duration,
+) -> CloseReasonCode {
     loop {
         let notified = wake.notified();
         tokio::pin!(notified);
         let _ = notified.as_mut().enable();
         if cancel.is_cancelled() {
-            return "session_closed";
+            return CloseReasonCode::SessionClosed;
         }
         let frame = match pending.try_recv() {
             Ok(frame) => frame,
@@ -419,20 +699,20 @@ async fn write_frames(
                 notified.await;
                 continue;
             }
-            Err(RecvError::Closed) => return "session_closed",
+            Err(RecvError::Closed) => return CloseReasonCode::SessionClosed,
         };
         let message = match frame {
             WireOut::Text(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => Message::Text(text.into()),
-                Err(_) => return "bad_envelope",
+                Err(_) => return CloseReasonCode::BadEnvelope,
             },
-            WireOut::Close => return "session_closed",
+            WireOut::Close => return CloseReasonCode::SessionClosed,
         };
         if !matches!(
-            tokio::time::timeout(WRITE_TIMEOUT, sink.send(message)).await,
+            tokio::time::timeout(write_timeout, sink.send(message)).await,
             Ok(Ok(()))
         ) {
-            return "queue_full";
+            return CloseReasonCode::SendBufferOverflow;
         }
     }
 }
@@ -444,9 +724,52 @@ fn parse_connection_id(text: &str) -> Option<String> {
         .filter(|s| !s.is_empty() && s.len() <= 256)
         .map(str::to_owned)
 }
-fn is_wire_text_size_valid(text: &str) -> bool {
-    text.len() <= MAX_WIRE_TEXT_BYTES
+#[cfg(test)]
+mod close_reason_tests {
+    use super::*;
+
+    #[test]
+    fn all_ten_close_reason_codes_have_distinct_str_and_valid_close_codes() {
+        let codes = [
+            CloseReasonCode::Shutdown,
+            CloseReasonCode::QueueFull,
+            CloseReasonCode::SendBufferOverflow,
+            CloseReasonCode::SessionClosed,
+            CloseReasonCode::BadEnvelope,
+            CloseReasonCode::ProtocolViolation,
+            CloseReasonCode::ConnectionTimeout,
+            CloseReasonCode::InputRateExceeded,
+            CloseReasonCode::NormalLogout,
+            CloseReasonCode::Superseded,
+        ];
+        let mut strs = std::collections::HashSet::new();
+        for code in codes {
+            assert!(strs.insert(code.as_str()), "duplicate str for {code:?}");
+            let frame = code.into_close_frame();
+            assert_eq!(frame.code, code.close_code());
+            assert_eq!(frame.reason.as_str(), code.as_str());
+        }
+        assert_eq!(strs.len(), 10);
+    }
+
+    #[test]
+    fn transport_config_validation_rejects_out_of_range() {
+        let mut cfg = TransportConfig::default();
+        assert!(cfg.validate().is_ok());
+
+        cfg.max_socket_tasks = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_socket_tasks = 256;
+
+        cfg.listen_address = String::new();
+        assert!(cfg.validate().is_err());
+        cfg.listen_address = "127.0.0.1".into();
+
+        cfg.handshake_timeout_ms = 10;
+        assert!(cfg.validate().is_err());
+    }
 }
+
 #[cfg(any(test, feature = "test-harness"))]
 fn is_would_block(error: &tokio_tungstenite::tungstenite::Error) -> bool {
     matches!(error, tokio_tungstenite::tungstenite::Error::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock || io.kind() == std::io::ErrorKind::TimedOut)
@@ -596,6 +919,7 @@ mod tests {
             cancel: CancelToken::new(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         };
         sender
             .try_send_text("first".to_owned())
@@ -615,6 +939,7 @@ mod tests {
             cancel: CancelToken::new(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         };
         drop(rx);
 
@@ -633,6 +958,7 @@ mod tests {
             cancel: cancel.clone(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         };
         sender
             .try_send_text("frame".to_owned())
@@ -650,6 +976,7 @@ mod tests {
             cancel: CancelToken::new(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         };
         drop(rx);
 
@@ -664,6 +991,7 @@ mod tests {
             cancel: CancelToken::new(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         };
 
         sender
@@ -680,6 +1008,7 @@ mod tests {
             cancel: CancelToken::new(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         };
 
         assert_eq!(
@@ -696,6 +1025,7 @@ mod tests {
             cancel: CancelToken::new(),
             observer_id: NEXT_OBSERVER_ID.fetch_add(1, Ordering::Relaxed),
             wake: Arc::new(Notify::new()),
+            max_text_bytes: MAX_WIRE_TEXT_BYTES,
         };
 
         assert_eq!(

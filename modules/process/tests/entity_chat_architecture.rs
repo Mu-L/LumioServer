@@ -1106,3 +1106,34 @@ fn host_runtime_root() -> PathBuf {
         .expect("modules")
         .join("host-runtime")
 }
+
+#[test]
+fn assert_no_public_tick_advancement_in_production_host() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    for api in [
+        "pub fn drive_kernel",
+        "pub fn admit_input_command",
+        "pub fn run_tick",
+        "pub fn schedule_room_tick",
+    ] {
+        if let Some(pos) = host.find(api) {
+            let prefix = &host[..pos];
+            let cfg_gate = "#[cfg(any(test, feature = \"test-harness\"))]";
+            let last_gate = prefix.rfind(cfg_gate);
+            assert!(
+                last_gate.is_some() && (pos - last_gate.unwrap()) < 200,
+                "{api} must be gated behind {cfg_gate}"
+            );
+        }
+    }
+}
+
+#[test]
+fn assert_no_account_keyed_maps_in_host() {
+    let host = fs::read_to_string(process_root().join("src/entity_chat/host.rs")).expect("host.rs");
+    assert!(
+        !host.contains("account_id: ExpireTarget")
+            && !host.contains("reconnect_targets.insert(session.account_id"),
+        "reconnect_targets and host maps must be keyed by net_entity_id, not account_id (ADR-057 §5)"
+    );
+}
