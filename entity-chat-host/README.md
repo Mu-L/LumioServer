@@ -3,7 +3,7 @@
 CoreCLR managed adapter for Runtime `WorldManager`, `EntityBindingQuery` and `WireCodec`. Entry operations remain `boot`, `enqueue`, `tick`, `drain`, `snapshot` and `restore`; the Rust host owns credential verification, NativeCore timers and transport.
 
 ```sh
-dotnet restore src/Lumio.Server.EntityChat.HostEntry/Lumio.Server.EntityChat.HostEntry.csproj --locked-mode
+dotnet restore src/Lumio.Server.EntityChat.HostEntry/Lumio.Server.EntityChat.HostEntry.csproj
 dotnet build src/Lumio.Server.EntityChat.HostEntry/Lumio.Server.EntityChat.HostEntry.csproj --no-restore -c Release
 ```
 

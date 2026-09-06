@@ -6,7 +6,7 @@ The `contract/` files retain the old `2b7e321` fixture source, not a claim that 
 
 ```sh
 cd account-server
-dotnet restore build.proj --locked-mode
+dotnet restore build.proj
 dotnet build build.proj -c Release --no-restore
 dotnet test tests/Lumio.Server.Account.Tests/Lumio.Server.Account.Tests.csproj -c Release --no-build
 ```

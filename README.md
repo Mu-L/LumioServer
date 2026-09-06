@@ -80,6 +80,7 @@ Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 Vox
 
 ## Source / Compile-Time Dependencies
 
+- 工具链环境：Rust（锁定 `rust-toolchain.toml` 1.98.0 通道）、.NET 10（`net10.0`）、Node 22。全仓验证与构建不依赖 Python。
 - Rust toolchain、网络/IO/日志基础 crates 和平台 SDK。
 - 架构仓 `LumioGameEngine` 的 Native 引擎包与 `engine/abi/native-abi.json` ABI 绑定。
 - `LumioGameRuntime` 稳定 Managed Host；不编译依赖 Client 或 Game 实现源码。

@@ -18,7 +18,7 @@ cargo build -p lumio-server-process --release --locked --bin lumio-ds
 
 Native/Bot 通过 HTTP Upgrade 的 `Authorization: Bearer <admissionCredential>` 提交平台 **Launch** 房间票。普通 `/account` 票为 unbound，不可进入 DS。浏览器适配器是 [connect-ds.mjs](connect-ds.mjs)，使用额外的 `lumio-admission.<credential>` subprotocol offer 承载同一张票；服务端只回应 `lumio.mvp.v0`，不回显凭据。这个 Upgrade 适配器不改变 C-1 Gameplay 编解码。应用需要显式接入 helper；本仓 socket/Node 测试不等于完整浏览器 E2E 已通过。
 
-当前消费 `LumioGameEngine@23401e178fdf346a0361b51a1ff881daf4d42554` 的账号票据格式：签名、期限及六个 allocation 维度一起校验。按该版明确的 bearer replay policy，**不新增 nonce 单次消费表**。同票在期限内重复使用不等于一个免认证 connectionId；每个 socket 都重新验证，并获得服务器生成的私有连接身份。账号接管仍由 Runtime 决定。
+当前消费跟架构仓 main 的账号票据格式：签名、期限及六个 allocation 维度一起校验。按该版明确的 bearer replay policy，**不新增 nonce 单次消费表**。同票在期限内重复使用不等于一个免认证 connectionId；每个 socket 都重新验证，并获得服务器生成的私有连接身份。账号接管仍由 Runtime 决定。
 
 ## 状态与退出
 
@@ -39,12 +39,24 @@ Owner 请求/结果各有 2 秒期限。Watchdog 不向 Owner 排队，直接读
 ## 验证层级
 
 ```sh
-python eng/verify.py --profile rust
-python eng/verify.py --profile managed
-python eng/verify.py --profile integration --inputs /absolute/path/resolved-inputs.json
+# 1. spec 与 lint
+node .spec/tools/spec-lint.mjs
+node --test .spec/tools/spec-lint.test.mjs
+
+# 2. Rust 检查与单元/集成测试（含 test-harness 特性）
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+
+# 3. 托管层构建与测试
+dotnet build entity-chat-host/src/Lumio.Server.EntityChat.HostEntry/Lumio.Server.EntityChat.HostEntry.csproj -c Release
+dotnet test account-server/tests/Lumio.Server.Account.Tests/Lumio.Server.Account.Tests.csproj
+
+# 4. 真实 11 场景跨仓集成（需指向 LumioGame main 检出）
+LUMIO_GAME_ROOT=/path/to/LumioGame cargo test -p lumio-server-process --all-features --locked --test entity_chat_acceptance -- --nocapture
 ```
 
-每次生成准确 source SHA、命令、退出码与完整日志。模块检查必须全部通过；缺工具/环境为 BLOCKED_ENV 且非零退出。集成输入必须列出 Server/Engine/Runtime/Game/Platform 的路径与完整 SHA、制品路径与 SHA256，`LUMIO_GAME_ROOT` 必须指向相同 Game。不要把“已有文件”或某轮旧 manifest 当成这次代码已验证。
+模块检查必须全部通过；缺工具/环境为非零退出。跨仓集成跟各依赖仓 main（ADR-068），不钉 SHA、不维护锁文件。`LUMIO_GAME_ROOT` 必须指向 LumioGame main 检出。不要把“已有文件”或某轮旧 manifest 当成这次代码已验证。
 
 历史 11 场景仍使用显式 harness；S9 按上游 R-00493 使用短窗口真实等待，不能伪称跑过产品五分钟时长。S1 缺错误口令证据不再补通过值。新 DS 的发布证明还需要平台登录→Launch→实际 Browser/Bot→Native/CoreCLR→Runtime 的全链路考卷。
 
