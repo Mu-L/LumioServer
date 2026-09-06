@@ -1519,7 +1519,10 @@ fn write_evidence(out_dir: &Path, evidence: &Value, audit: &str) -> std::io::Res
     let bytes = serde_json::to_vec_pretty(evidence)?;
     let staging = out_dir.join("evidence.json.tmp");
     std::fs::write(&staging, bytes)?;
-    std::fs::File::open(&staging)?.sync_all()?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)?
+        .sync_all()?;
     std::fs::rename(staging, out_dir.join("evidence.json"))
 }
 

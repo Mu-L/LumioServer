@@ -53,10 +53,7 @@ internal sealed class DurableAccountStore : IDisposable
         }
         else if (Directory.EnumerateDirectories(DirectoryPath, "group-*").Any())
         {
-            // A group without its publication pointer has never been committed.
-            // It is not a reason to guess which orphaned group should win.
-            identityPath = Path.Combine(DirectoryPath, IdentityFileName);
-            credentialPath = Path.Combine(DirectoryPath, CredentialFileName);
+            throw new InvalidDataException("account groups exist without a publication pointer; explicit recovery required");
         }
         if (File.Exists(identityPath) != File.Exists(credentialPath))
             throw new InvalidDataException("legacy account files do not form a complete pair");

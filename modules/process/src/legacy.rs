@@ -1,4 +1,5 @@
 //! Hello milestone harness. Not compiled into the default DS library.
+use crate::{sdk_loader, server, wire};
 use std::io::Write as _;
 use std::sync::Arc;
 use std::sync::Mutex;

@@ -122,6 +122,12 @@ impl CheckpointStore {
             return Err(invalid("invalid checkpoint bounds or identity"));
         }
         fs::create_dir_all(root)?;
+        if durability == StorageDurability::PowerLoss {
+            let canonical = root.canonicalize()?;
+            for directory in canonical.ancestors() {
+                durability.sync_directory(directory)?;
+            }
+        }
         durability.sync_directory(root)?;
         let lock = OpenOptions::new()
             .read(true)

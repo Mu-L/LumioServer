@@ -25,12 +25,16 @@ struct Config {
     store_path: PathBuf,
     content_fingerprint: String,
     durability: String,
+    world_profile: String,
     checkpoint_seconds: u64,
     watchdog_timeout_ms: u64,
 }
 impl Config {
     fn validate(&self) -> Result<(Vec<u8>, StorageDurability), String> {
         self.allocation.validate()?;
+        if self.world_profile != "runtime-only" {
+            return Err("this host profile requires runtime-only; Voxel/WAL recovery needs a committed-cut provider".to_owned());
+        }
         if !(1..=3600).contains(&self.checkpoint_seconds)
             || !(100..=60_000).contains(&self.watchdog_timeout_ms)
             || self.content_fingerprint.is_empty()

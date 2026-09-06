@@ -1,14 +1,8 @@
-//! `lumio-server` — MS-00002 Hello World dedicated server process.
+//! Lumio dedicated-server infrastructure.
 //!
-//! Composition root for this milestone: dynamic-port loopback WebSocket
-//! listener, two-session admission, SDK DLL verification, `CoreCLR` runtime
-//! bridge, authoritative tick routing and NDJSON audit. Wire truth is the
-//! architecture repo's `engine/wire/hello-wire-v1.json`, loaded at startup
-//! via `--wire-contract`; process behaviour (readiness, shutdown, exit codes,
-//! audit vocabulary) follows its `process` block.
-//!
-//! Exit codes: 0 normal shutdown, 1 initialization failure, 2 fatal runtime
-//! error, 3 argument error.
+//! `lumio-ds` is the authenticated deployment entry. The historical Hello
+//! composition root is compiled only for tests or the explicit test-harness
+//! feature. Runtime owns all authoritative entity/gameplay semantics.
 
 pub mod audit;
 #[cfg(any(test, feature = "test-harness"))]

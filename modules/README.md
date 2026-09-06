@@ -1,28 +1,17 @@
 # LumioServer 模块
 
-> **公共契约来源**：`LumioGameEngine` 的 `engine/abi/native-abi.json` 与 `engine/wire/*.json`，设计现状见其
-> `.spec/knowledge/features/architecture.md` 与 `ds-server.md`。本仓不保存架构镜像、不复述公共契约字段。
-> **本文定位**：只描述本仓现有 crate 的职责、线程与有界队列现状。没有实现的东西不写在这里。
+公共架构与接口唯一来源仍是 `LumioGameEngine` 的现行 `engine/abi`、`engine/wire` 与 `.spec/knowledge/features/`。此处只描述实际代码，不重建已删除的骨架。
 
-## 现有 crate
+| crate | 依赖和职责 |
+|---|---|
+| [host-runtime](host-runtime/README.md) | 单调时间、有界通道、监督线程、Native 加载与定时适配 |
+| [process](process/README.md) | 默认 `lumio-ds`、认证传输、Owner、托管桥、存储 I/O 和进程关闭 |
+| [lumio-host-testkit](../crates/lumio-host-testkit) | 测试原语，不能作为生产状态真值 |
 
-| crate | 路径 | 职责 |
-| --- | --- | --- |
-| `lumio-host-runtime` | [`modules/host-runtime`](host-runtime) | 宿主运行时原语：单调时钟、有界 MPSC channel、受监督线程、全仓唯一的 Native SDK 加载器与根表、`NativeCore` 定时器 ABI 适配 |
-| `lumio-server-process` | [`modules/process`](process) | 服务器进程组合根：WebSocket 监听与会话准入、SDK DLL 校验、CoreCLR 运行时桥、权威 tick 路由、NDJSON 审计、entity-chat 切片 |
-| `lumio-host-testkit` | [`../crates/lumio-host-testkit`](../crates/lumio-host-testkit) | **dev-only** 确定性测试支撑：测试时钟、故障计划、fixture 加载、有界端口探针。生产 crate 只能经 dev-dependency 或测试目标引用 |
-
-依赖方向单向：`process` → `host-runtime`；`testkit` 只被测试目标引用，不进生产依赖。
-
-## 线程与有界队列现状
-
-- **有界是唯一形态**：`host-runtime` 只导出 `bounded_channel`，没有无界路径。发送失败区分 `SendError::Full`（容量耗尽，值原样返还）与 `SendError::Closed`（接收端已丢弃）；接收失败区分 `RecvError::Empty` 与 `RecvError::Closed`。背压由调用方显式处理，不得静默丢弃或无限缓冲。
-- **线程受监督**：并发一律经 `spawn_supervised` 拿到 `SupervisedTask`，配 `CancelToken` 协作式取消；线程 panic 被捕获并以 `TaskPanicked` 上报，不静默吞掉。生产代码不直接 `std::thread::spawn`。
-- **时间经时钟抽象**：单调时间只从 `HostClock` 取（生产 `SystemMonotonicClock`，测试 `TestMonotonicClock`）；定时器经 `KernelTimer` / `HostTimer`，`NativeAbiKernel` 把引擎 `NativeCore` 定时 ABI 适配进来。生产代码不直接 `sleep` 或轮询。
-- **Native 加载只有一份**：动态库一律经 `host-runtime` 的 `NativeLibrary`（`libloading`，平台无关）装载，根表 `RootApiV1` 全仓只有这一处定义——`CoreCLR` 槽与 `NativeCore` `timer_*` 槽是同一张表的两段。不得再写第二个加载器、第二份根表，也不得用 `cfg` 门代替可移植实现（[ADR 0010](../.spec/decisions/0010-single-cross-platform-native-loader.md)，由 `tests/native_loader_architecture.rs` 机器守住）。
-- **进程生命周期**：`process` 的启动序列是 contract → audit → SDK → CLR host → listener，关闭序列是 sessions closed → bridge shutdown → CLR destroyed → audit flushed。退出码 0 正常关闭、1 初始化失败、2 运行期致命错误、3 参数错误。
+依赖方向为 `process → host-runtime`。`test-harness` 构建才包含 Hello、Replay、账号/浏览器/Bot 启动器和旧 connectionId observer 附着；默认 `lumio-ds` 始终使用认证构造器。
 
 ## 测试面
 
-`modules/process/tests/` 下 `entity_chat_architecture`、`entity_chat_host`、`entity_chat_wire`、`native_loader_architecture` 是必过面，
-`entity_chat_acceptance`（11 场景）需要 Game 侧根目录，CI 中以 `continue-on-error` 单列。
+`eng/verify.py --profile rust` 验证默认构建、显式测试构建、Host/传输/Native 加载结构/文件存储的测试。`--profile managed` 构建实际 HostEntry 并执行账号模块测试。
+
+`--profile integration` 保留原 11 场景考卷，并要求固定仓库和实际制品清单。缺少环境即失败，不再让此任务通过 `continue-on-error` 混入模块绿色状态。它仍是历史切片考卷，不能单独证明新 DS 的完整商业化能力。

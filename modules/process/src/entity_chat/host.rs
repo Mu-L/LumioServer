@@ -48,7 +48,7 @@ pub const MAX_PENDING_WIRE_INPUTS: usize = MAX_PENDING_QUERIES;
 pub const MAX_PENDING_WIRE_INPUT_BYTES: usize = MAX_PENDING_WIRE_INPUTS * MAX_WIRE_TEXT_BYTES;
 const OWNER_CADENCE_MS: u64 = 10;
 
-/// Bounded sink for exact Runtime-admitted input bytes used by external evidence consumers.
+/// Bounded pre-admission ingress probe for test synchronization; not proof of Runtime commit.
 pub type WireInputObserver = Sender<Vec<u8>>;
 
 /// WallClock expire dispatch id (NativeCore slot).
@@ -638,7 +638,9 @@ impl EntityChatHost {
         })
     }
 
-    /// Attaches a bounded observer for exact admitted input bytes.
+    /// Attaches a test synchronization probe for received input bytes.
+    /// Observation precedes Runtime admission and must not count as a commit.
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn attach_wire_input_observer(&self, observer: WireInputObserver) {
         self.on_owner(move |inner| inner.wire_input_observer = Some(observer));
     }
@@ -2223,6 +2225,12 @@ impl Inner {
                 egress,
                 proof,
             } => {
+                if self.admission_verifier.as_ref().is_some_and(|v| {
+                    v.now() > proof.payload.expires_at || v.allocation.room_id != proof.room_id
+                }) {
+                    let _ = egress.try_close();
+                    return;
+                }
                 let result = self.admit_verified(&proof.room_id, &connection_id, &proof.payload);
                 if !result.accepted {
                     let _ = egress.try_close();
