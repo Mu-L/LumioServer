@@ -100,3 +100,39 @@ fn stalled_handshake_cannot_hold_host_drop_open() {
     drop(host);
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
 }
+
+#[test]
+fn browser_upgrade_never_echoes_the_credential_offer() {
+    use tokio_tungstenite::tungstenite::{
+        client::connect, client::IntoClientRequest, http::HeaderValue,
+    };
+    let keys = generate_keys();
+    let allocation = context();
+    let ticket = issue_bound_test_credential(&keys.seed, &allocation, 2000);
+    let verifier = BoundAdmissionVerifier::new(
+        allocation,
+        1,
+        keys.public.to_vec(),
+        SharedClock::test(),
+        1000,
+    )
+    .unwrap();
+    let host = EntityChatHost::new_authenticated(
+        300_000,
+        Box::new(SharedRuntime::new()),
+        Box::new(TestKernel::new()),
+        verifier,
+    )
+    .unwrap();
+    let mut request = host.listen_uri().into_client_request().unwrap();
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_str(&format!("lumio.mvp.v0, lumio-admission.{ticket}")).unwrap(),
+    );
+    let (_socket, response) = connect(request).expect("browser style upgrade");
+    assert_eq!(
+        response.headers().get("Sec-WebSocket-Protocol").unwrap(),
+        "lumio.mvp.v0"
+    );
+    assert!(!format!("{:?}", response.headers()).contains(&ticket));
+}

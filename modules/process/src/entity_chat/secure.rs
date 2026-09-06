@@ -257,7 +257,7 @@ mod tests {
                 Some("admission_binding_mismatch")
             );
         }
-        clock.advance_ms(11_000);
+        assert!(clock.advance_test_clock(11_000));
         assert_eq!(
             verifier.verify(&ticket).err().as_deref(),
             Some("admission_credential_expired")

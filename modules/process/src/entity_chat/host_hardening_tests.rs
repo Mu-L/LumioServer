@@ -16,6 +16,7 @@ use super::*;
 struct Trace {
     inputs: Vec<(String, Vec<u8>)>,
     ticks: Vec<(String, u64)>,
+    next_outcome: Option<ChatOperation>,
 }
 
 struct RecordingRuntime(Arc<Mutex<Trace>>);
@@ -111,7 +112,12 @@ impl RuntimeSurface for RecordingRuntime {
             .expect("trace lock")
             .inputs
             .push((connection.to_owned(), bytes.to_vec()));
-        ChatOperation::admitted()
+        self.0
+            .lock()
+            .expect("trace lock")
+            .next_outcome
+            .take()
+            .unwrap_or_else(ChatOperation::admitted)
     }
 
     fn run_tick(&mut self, room_id: &str, tick_id: u64) -> RuntimeTick {
@@ -181,7 +187,7 @@ impl KernelTimer for TickKernel {
 fn owner() -> (Inner, Arc<Mutex<Trace>>) {
     let trace = Arc::new(Mutex::new(Trace::default()));
     let clock = SharedClock::test();
-    clock.advance_ms(5_000);
+    assert!(clock.advance_test_clock(5_000));
     let inner = Inner {
         health: Arc::new(HealthState::default()),
         admission_clock_origin_ms: clock.now_ms(),
@@ -378,7 +384,7 @@ fn admission_time_advances_without_ticks_from_the_construction_origin() {
     inner.admission_public = keys.public.to_vec();
     let token = issue_admission_credential(&keys.seed, 1, "account", "Player", false, 1_000, 1_001);
     assert_eq!(inner.admission_unix_seconds(), 1_000);
-    inner.clock.advance_ms(2_000);
+    assert!(inner.clock.advance_test_clock(2_000));
     assert_eq!(inner.admission_unix_seconds(), 1_002);
     assert_eq!(inner.tick_id, 0);
     let result = inner.admit("room", "expired", &token);
@@ -413,4 +419,50 @@ fn new_egress_frames_queue_behind_an_existing_backlog() {
     }
     assert!(egresses[0].pending.is_empty());
     assert_eq!(egresses[0].pending_bytes, 0);
+}
+
+#[test]
+fn quiesced_world_rejects_input_and_does_not_advance_cadence() {
+    let (mut inner, trace) = owner();
+    admit(&mut inner, "room", "a");
+    inner.health.draining.store(true, Ordering::Release);
+    input(&mut inner, "a", "must not apply");
+    inner.drive_owner_cadence();
+    assert!(inner.pending_wire_inputs.is_empty());
+    assert!(trace.lock().expect("trace").ticks.is_empty());
+    assert!(
+        !inner
+            .admit_verified(
+                "room",
+                "b",
+                &AdmissionPayload {
+                    key_id: 1,
+                    account_id: "b".into(),
+                    login_name: "bbb".into(),
+                    bot_tool_context: false,
+                    issued_at: 1,
+                    expires_at: 9000
+                }
+            )
+            .accepted
+    );
+}
+
+#[test]
+fn rejected_input_is_counted_and_fatal_input_seals_world() {
+    let (mut inner, trace) = owner();
+    admit(&mut inner, "room", "a");
+    trace.lock().expect("trace").next_outcome = Some(ChatOperation::rejected("bad_envelope"));
+    input(&mut inner, "a", "rejected");
+    assert!(inner.run_tick("room").ok);
+    assert_eq!(inner.health.rejected_inputs.load(Ordering::Relaxed), 1);
+    trace.lock().expect("trace").next_outcome = Some(ChatOperation {
+        kind: ChatOpKind::Fatal,
+        error_code: Some("runtime_failure".into()),
+    });
+    input(&mut inner, "a", "fatal");
+    assert!(!inner.run_tick("room").ok);
+    assert!(inner.health.faulted.load(Ordering::Acquire));
+    assert!(!inner.run_tick("room").ok);
+    assert_eq!(trace.lock().expect("trace").ticks.len(), 1);
 }

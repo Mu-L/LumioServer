@@ -3,7 +3,7 @@
 mod common;
 
 use common::{runtime_wire_chat_input, SharedRuntime, TestKernel, RUNTIME_WIRE_CHAT_INPUT};
-use lumio_host_runtime::{bounded_channel, HostClock, SharedClock};
+use lumio_host_runtime::{bounded_channel, SharedClock};
 use lumio_server_process::entity_chat::{
     generate_keys, issue_admission_credential, AttributeQueryOutcome, AttributeQueryRequest,
     AttributeQueryScope, BoundEntityKind, ChatOpKind, EntityChatHost, QueryResult,
@@ -101,7 +101,7 @@ fn reconnect_within_window_rebinds_entity_a() {
 
     // Rebinding within the retention window must cancel the old expiry. A
     // stale timer must never destroy the live rebound entity.
-    host.clock().advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.clock().advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(host.drive_kernel());
     assert!(runtime.lock().expire_calls().is_empty());
 }
@@ -128,7 +128,7 @@ fn reconnect_missing_welcome_rearms_retained_entity_expiry() {
         credential(&keys, "Bot01", true),
     );
     assert!(pending.accepted && pending.reconnected);
-    host.clock().advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.clock().advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(host.drive_kernel());
     assert!(runtime.lock().expire_calls().is_empty());
 
@@ -137,7 +137,7 @@ fn reconnect_missing_welcome_rearms_retained_entity_expiry() {
         .try_self_lookup("c-bot01-reconnected".to_owned())
         .is_none());
 
-    host.clock().advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(host.clock().advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(host.drive_kernel());
     assert!(runtime
         .lock()
@@ -161,7 +161,7 @@ fn reconnect_error_rearms_retained_entity_expiry() {
     let entity_a = host.must_self("c-bot01").net_entity_id;
     assert!(host.disconnect("c-bot01".to_owned()).expect("disconnect"));
 
-    host.clock().advance_ms(RECONNECT_WINDOW_MS - 1);
+    assert!(host.clock().advance_test_clock(RECONNECT_WINDOW_MS - 1));
     let rejected = host.admit(
         "room-other".to_owned(),
         "c-bot01-wrong-room".to_owned(),
@@ -170,10 +170,10 @@ fn reconnect_error_rearms_retained_entity_expiry() {
     assert!(!rejected.accepted);
     assert_eq!(rejected.error_code.as_deref(), Some("cross_room_reference"));
 
-    host.clock().advance_ms(2);
+    assert!(host.clock().advance_test_clock(2));
     assert!(host.drive_kernel());
     assert!(runtime.lock().expire_calls().is_empty());
-    host.clock().advance_ms(RECONNECT_WINDOW_MS);
+    assert!(host.clock().advance_test_clock(RECONNECT_WINDOW_MS));
     assert!(host.drive_kernel());
     assert!(runtime
         .lock()
@@ -188,8 +188,10 @@ fn production_cadence_is_not_starved_and_drives_pending_expiry_rooms() {
     runtime.lock().enable_async_queries();
     let clock = SharedClock::system();
     let keys = generate_keys();
+    // A real clock cannot be fast-forwarded (ADR-057 §6), so this case reaches
+    // the pending-expiry state with a window short enough to elapse for real.
     let host = Arc::new(EntityChatHost::new(
-        RECONNECT_WINDOW_MS,
+        1,
         clock.clone(),
         Box::new(runtime.clone()),
         Box::new(TestKernel::new()),
@@ -208,7 +210,6 @@ fn production_cadence_is_not_starved_and_drives_pending_expiry_rooms() {
     assert!(host
         .disconnect("c-expiry-only".to_owned())
         .expect("disconnect"));
-    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
 
     let flood = host.clone();
     let worker = std::thread::spawn(move || {
@@ -247,7 +248,7 @@ fn wall_clock_kernel_expire_tombstones_a_and_creates_b() {
     assert!(host
         .disconnect("c-bot01".to_owned())
         .expect("Runtime disconnect"));
-    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(clock.advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(host.drive_kernel());
     assert!(runtime
         .lock()
@@ -297,7 +298,7 @@ fn async_expiry_is_pending_until_owner_tick_and_reports_runtime_error() {
         .accepted
     );
     assert!(host.disconnect("c-bot01".to_owned()).expect("disconnect"));
-    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(clock.advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(host.drive_kernel());
     assert!(host.run_tick("room-main".to_owned()).ok);
 
@@ -311,7 +312,7 @@ fn async_expiry_is_pending_until_owner_tick_and_reports_runtime_error() {
         .accepted
     );
     assert!(host.disconnect("c-bot02".to_owned()).expect("disconnect"));
-    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(clock.advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(host.drive_kernel());
     let tick = host.run_tick("room-main".to_owned());
     assert!(!tick.ok);
@@ -665,7 +666,7 @@ fn expiry_retries_after_query_correlation_capacity_releases() {
     assert!(host
         .disconnect("c-expiry-capacity".to_owned())
         .expect("disconnect"));
-    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(clock.advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(
         !host.drive_kernel(),
         "expiry must report correlation pressure"
@@ -676,7 +677,7 @@ fn expiry_retries_after_query_correlation_capacity_releases() {
     let released = host.query_attribute(requests[0].clone());
     assert_eq!(released.outcome, AttributeQueryOutcome::Ok);
 
-    clock.advance_ms(1);
+    assert!(clock.advance_test_clock(1));
     assert!(
         host.drive_kernel(),
         "retained expiry must retry after release"
@@ -753,7 +754,7 @@ fn runtime_disconnect_failure_preserves_session_and_does_not_schedule_expiry() {
         "disconnect_failed"
     );
     assert!(host.try_self_lookup("c-bot01".to_owned()).is_some());
-    clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+    assert!(clock.advance_test_clock(RECONNECT_WINDOW_MS + 1));
     assert!(host.drive_kernel());
     assert!(runtime.lock().expire_calls().is_empty());
 }
@@ -1456,7 +1457,7 @@ fn repeated_expiry_results_release_runtime_correlations() {
             .accepted
         );
         assert!(host.disconnect(connection).expect("disconnect"));
-        clock.advance_ms(RECONNECT_WINDOW_MS + 1);
+        assert!(clock.advance_test_clock(RECONNECT_WINDOW_MS + 1));
         assert!(host.drive_kernel());
         assert!(host.run_tick("room-main".to_owned()).ok);
         assert_eq!(host.drain_runtime_queries().len(), 1);
@@ -1509,4 +1510,62 @@ fn resolve_requires_canonical_runtime_id() {
         resolved.is_none(),
         "non-canonical Runtime ID {as_u64} must not be normalized by the Server host"
     );
+}
+
+/// R-00493 P0-1（审查退回）：`drive_kernel()` 的布尔**不能**当作「到期已触发」的
+/// 证据——它对空转的 pump 同样返回 `true`。11 场景的 S9 必须观察
+/// `armed_expiry_timers()` 这个真实后果，否则又是一处不可证伪的假绿。
+#[test]
+fn an_idle_pump_reports_success_so_only_pending_expiries_proves_a_firing() {
+    let runtime = SharedRuntime::new();
+    let (host, _keys) = host_with(runtime.clone());
+
+    // 什么都没武装：pump 照样报成功，但没有任何到期。
+    assert_eq!(host.armed_expiry_timers(), 0);
+    assert!(
+        host.drive_kernel(),
+        "an idle wall-clock pump still reports success — this is the trap"
+    );
+    assert!(runtime.lock().expire_calls().is_empty());
+    assert_eq!(
+        host.armed_expiry_timers(),
+        0,
+        "nothing was armed, so nothing can have fired"
+    );
+}
+
+/// R-00493 P0-1：断连武装到期后，`armed_expiry_timers()` 必须从 1 回到 0，且这一
+/// 变化才是 S9 等待的真实信号。
+#[test]
+fn a_disconnect_arms_an_expiry_that_only_clears_once_it_fires() {
+    let runtime = SharedRuntime::new();
+    let (host, keys) = host_with(runtime.clone());
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true),
+        )
+        .accepted
+    );
+    assert!(host.disconnect("c-bot01".to_owned()).expect("disconnect"));
+
+    assert_eq!(
+        host.armed_expiry_timers(),
+        1,
+        "disconnect must arm exactly one reconnect-expiry timer"
+    );
+    // 还没到期：pump 报成功，但计数不变——正是这一点让 drive_kernel 的布尔无用。
+    assert!(host.drive_kernel());
+    assert_eq!(host.armed_expiry_timers(), 1);
+    assert!(runtime.lock().expire_calls().is_empty());
+
+    assert!(host.clock().advance_test_clock(RECONNECT_WINDOW_MS + 1));
+    assert!(host.drive_kernel());
+    assert_eq!(
+        host.armed_expiry_timers(),
+        0,
+        "once the deadline passes the armed timer must be consumed"
+    );
+    assert!(!runtime.lock().expire_calls().is_empty());
 }

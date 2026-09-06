@@ -347,10 +347,10 @@ public static class HostEntry
         ManagerType.GetMethod("Start")!.Invoke(restored, new object?[] { System.Threading.Thread.CurrentThread });
         object? restoredBindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { restored });
         if (restoredBindings is null) return (EntrySuccess, Fail("restore_failed"));
+        if (!string.IsNullOrEmpty(roomId))
+            BindingType.GetMethod("RestoreRoomBindings", BindingFlags.Public | BindingFlags.Instance)!.Invoke(restoredBindings, new object?[] { roomId });
         Manager = restored;
         Bindings = restoredBindings;
-        if (!string.IsNullOrEmpty(roomId))
-            BindingType.GetMethod("RestoreRoomBindings", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Bindings, new object?[] { roomId });
         if (previousManager is IDisposable disposable) disposable.Dispose();
         return (EntrySuccess, Ok());
     }

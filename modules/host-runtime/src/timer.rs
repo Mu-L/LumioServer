@@ -114,7 +114,6 @@ impl HostTimer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clock::HostClock;
     use crate::kernel::KernelError;
     use crate::SharedClock;
 
@@ -236,7 +235,7 @@ mod tests {
         let timer = HostTimer::new(clock.clone(), Box::new(ScriptedKernel::new()));
         timer.schedule_wall_one_shot(100, 7).expect("schedule");
         assert!(timer.pump_wall_clock().expect("pump").is_empty());
-        clock.advance_ms(100);
+        assert!(clock.advance_test_clock(100));
         let fired = timer.pump_wall_clock().expect("pump due");
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].dispatch_id, 7);
@@ -260,7 +259,7 @@ mod tests {
         let timer = HostTimer::new(clock.clone(), Box::new(ScriptedKernel::new()));
         let handle = timer.schedule_wall_one_shot(50, 1).expect("schedule");
         timer.cancel(handle).expect("cancel");
-        clock.advance_ms(50);
+        assert!(clock.advance_test_clock(50));
         assert!(timer.pump_wall_clock().expect("pump").is_empty());
     }
 }

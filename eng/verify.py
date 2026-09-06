@@ -45,7 +45,8 @@ def validate_inputs(manifest_path: Path) -> dict:
         raise ValueError("input manifest must identify the actual SDK/managed artifacts")
     for name, row in artifacts.items():
         path = Path(row["path"])
-        digest = hashlib.file_digest(path.open("rb"), "sha256").hexdigest()
+        with path.open("rb") as source:
+            digest = hashlib.file_digest(source, "sha256").hexdigest()
         if digest != row["sha256"]:
             raise ValueError(f"artifact SHA mismatch: {name}")
     game = Path(repos["LumioGame"]["path"]).resolve()
@@ -58,6 +59,7 @@ def commands(profile: str) -> list[list[str]]:
     if profile == "rust":
         return [
             ["node", ".spec/tools/spec-lint.mjs"],
+            ["node", "--test", "eng/connect-ds.test.mjs"],
             ["node", "--test", ".spec/tools/spec-lint.test.mjs"],
             ["cargo", "fmt", "--all", "--", "--check"],
             ["cargo", "check", "--workspace", "--locked"],

@@ -172,6 +172,8 @@ impl RoomListener {
             executor.block_on(async move {
                 let listener = tokio::net::TcpListener::from_std(socket).expect("async listener");
                 let mut connections = JoinSet::new();
+                let mut admission_window = tokio::time::Instant::now();
+                let mut admissions_in_window = 0_u32;
                 loop {
                     tokio::select! {
                         _ = stopped.changed() => break,
@@ -180,6 +182,12 @@ impl RoomListener {
                         }
                         accepted = listener.accept() => {
                             let (stream, _) = accepted.expect("socket accept failed");
+                            if admission_window.elapsed() >= Duration::from_secs(1) {
+                                admission_window = tokio::time::Instant::now();
+                                admissions_in_window = 0;
+                            }
+                            if admissions_in_window >= 256 { drop(stream); continue; }
+                            admissions_in_window += 1;
                             if connections.len() >= MAX_SOCKET_TASKS { drop(stream); continue; }
                             connections.spawn(run_socket(stream, tx.clone(), stopped.clone(), verifier.clone()));
                         }
@@ -220,6 +228,32 @@ impl Drop for SocketGuard {
     }
 }
 
+fn upgrade_credential(request: &Request) -> Option<&str> {
+    let header_values: Vec<_> = request.headers().get_all("Authorization").iter().collect();
+    if header_values.len() > 1 {
+        return None;
+    }
+    let authorization = header_values
+        .first()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let offers = request
+        .headers()
+        .get("Sec-WebSocket-Protocol")
+        .and_then(|v| v.to_str().ok());
+    let mut tokens = offers
+        .into_iter()
+        .flat_map(|v| v.split(','))
+        .filter_map(|v| v.trim().strip_prefix("lumio-admission."));
+    let browser_token = tokens.next();
+    if tokens.next().is_some()
+        || (request.headers().contains_key("Authorization") && browser_token.is_some())
+    {
+        return None;
+    }
+    authorization.or(browser_token).filter(|v| !v.is_empty())
+}
+
 fn unauthorized() -> ErrorResponse {
     tokio_tungstenite::tungstenite::http::Response::builder()
         .status(401)
@@ -248,12 +282,7 @@ async fn run_socket(
         stream,
         |request: &Request, mut response: Response| {
             if let Some(verifier) = &verifier {
-                let header = request
-                    .headers()
-                    .get("Authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(unauthorized)?;
-                let credential = header.strip_prefix("Bearer ").ok_or_else(unauthorized)?;
+                let credential = upgrade_credential(request).ok_or_else(unauthorized)?;
                 proof = Some(verifier.verify(credential).map_err(|_| unauthorized())?);
             }
             if request

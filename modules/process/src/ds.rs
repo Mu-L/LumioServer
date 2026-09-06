@@ -48,7 +48,7 @@ impl Config {
             );
         }
         let mut key = Vec::with_capacity(32);
-        for pair in self.admission_public_key_hex.as_bytes().chunks_exact(2) {
+        for pair in self.admission_public_key_hex.as_bytes().as_chunks::<2>().0 {
             let text = std::str::from_utf8(pair).map_err(|e| e.to_string())?;
             key.push(u8::from_str_radix(text, 16).map_err(|e| e.to_string())?);
         }
@@ -149,7 +149,12 @@ fn save(host: &EntityChatHost, store: &Mutex<CheckpointStore>, room: &str) -> Re
     Ok(generation)
 }
 
-async fn run(config: Config) -> Result<(), String> {
+struct RunningHost {
+    host: Arc<EntityChatHost>,
+    store: Arc<Mutex<CheckpointStore>>,
+}
+
+fn boot(config: &Config) -> Result<RunningHost, String> {
     let (key, profile) = config.validate()?;
     let identity = StoreIdentity {
         room_id: config.allocation.room_id.clone(),
@@ -192,6 +197,11 @@ async fn run(config: Config) -> Result<(), String> {
         snapshot,
     )?);
     let store = Arc::new(Mutex::new(store));
+    Ok(RunningHost { host, store })
+}
+
+async fn run(config: Config) -> Result<(), String> {
+    let RunningHost { host, store } = boot(&config)?;
     let started = tokio::time::Instant::now();
     let mut heartbeat = tokio::time::interval(Duration::from_millis(100));
     while !host.health().ready {

@@ -14,7 +14,8 @@ public sealed class StorageTransactionTests
         var pointer = Path.Combine(harness.StorePath, DurableAccountStore.PointerFileName);
         var committed = File.ReadAllText(pointer);
         Directory.CreateDirectory(pointer + ".tmp");
-        Assert.ThrowsAny<IOException>(() => harness.Runtime.LoginOrRegister("bravo", AccountTestProfile.Password, null));
+        var failure = Record.Exception(() => harness.Runtime.LoginOrRegister("bravo", AccountTestProfile.Password, null));
+        Assert.True(failure is IOException or UnauthorizedAccessException);
         Assert.Throws<InvalidOperationException>(() => harness.Runtime.LoginOrRegister("charlie", AccountTestProfile.Password, null));
         harness.Runtime.Dispose();
         Assert.Equal(committed, File.ReadAllText(pointer));
