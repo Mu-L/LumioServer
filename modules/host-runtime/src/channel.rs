@@ -68,6 +68,9 @@ impl<T> Sender<T> {
     ///
     /// # Errors
     /// Returns `Full(value)` at the deadline or `Closed(value)` after receiver drop.
+    ///
+    /// # Panics
+    /// Panics if an internal capacity-notification lock is poisoned.
     pub fn send_timeout(&self, mut value: T, timeout: Duration) -> Result<(), SendError<T>> {
         let start = Instant::now();
         let (lock, changed) = &*self.wake;

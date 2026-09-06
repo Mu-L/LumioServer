@@ -19,6 +19,7 @@ use std::time::Duration;
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+#[cfg(any(test, feature = "test-harness"))]
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::{
     frame::coding::CloseCode, CloseFrame, WebSocketConfig,

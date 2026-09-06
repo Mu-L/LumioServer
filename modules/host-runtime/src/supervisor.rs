@@ -26,6 +26,9 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.state.cancelled.load(Ordering::Acquire)
     }
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn cancel(&self) {
         let _guard = self.state.lock.lock().expect("cancel lock");
         self.state.cancelled.store(true, Ordering::Release);
@@ -33,6 +36,9 @@ impl CancelToken {
     }
     /// Waits for cancellation, returning false only when the wait expires.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn wait_timeout(&self, timeout: Duration) -> bool {
         let guard = self.state.lock.lock().expect("cancel lock");
         let _result = self
@@ -78,14 +84,23 @@ impl SupervisedTask {
     pub fn cancel_token(&self) -> CancelToken {
         self.cancel.clone()
     }
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn is_finished(&self) -> bool {
         self.completion.0.lock().expect("task state").done
     }
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn failure(&self) -> Option<TaskPanicked> {
         self.completion
             .0
@@ -106,6 +121,9 @@ impl SupervisedTask {
     ///
     /// # Errors
     /// A timeout retains the handle; the caller must escalate or try again.
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn join_timeout(
         &mut self,
         timeout: Duration,
