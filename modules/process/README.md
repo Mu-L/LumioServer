@@ -19,7 +19,7 @@
 - `entity_chat/secure.rs`：消费架构仓账号凭据格式，校验签名、期限及可信分配上下文。普通账号登录票不能进入房间。
 - `entity_chat/wire.rs`：单个 Tokio reactor、受限连接任务、异步读写、握手/写入超时、尺寸限制、浏览器 Upgrade 适配、明确断连。
 - `entity_chat/clr.rs` 与 `entity-chat-host/`：消费 Runtime；启动时构造解码委托，恢复不回灌旧连接授权。
-- `persistence.rs`：不透明 Runtime/Voxel 检查点成组发布、身份校验、损坏组回退、单写锁、带校验链的提交记录日志。
+- `persistence.rs`：不透明 Runtime 检查点成组发布（draft 目录 → checkpoint 目录 → active 指针）、原子刷盘、成组回退、单写保护（ADR 0013）。
 - `legacy.rs`、`server.rs`、`session.rs`、`world.rs`：仅 Hello 测试构建使用，默认库不暴露旧的无认证 `run`。
 - `entity_chat/{account,bots,browser,discover,suite}.rs`：测试功能构建专用，不能作为默认 DS 启动前置。
 
@@ -35,7 +35,7 @@ Owner 请求入队与结果等待各有 2 秒期限；超时的操作可能已�
 
 `CheckpointStore` 已实现成组文件发布，不生成 ECS/Voxel 变更集。当前默认入口接入的是 **Runtime 检查点模式**。完整 WAL 重放、ECS/Voxel 同切点提供方、真实游戏迁移/长压测仍需跨仓闭环。
 
-账号 fixture 使用独立的成组文件事务与失败封锁；账号权威仍应归 LumioPlatform。退役条件遵循本仓 ADR 0011，不能在平台登录/Launch 与原验收尺子尚未全部打通时删目录。
+账号 fixture 维持最小防护（单门、失败封锁、落盘原子写入，见 ADR 0011 与 R-00502）；账号权威仍应归 LumioPlatform。退役条件遵循本仓 ADR 0011，由 R-00420 整目录退役。
 
 ## 验证
 
@@ -45,4 +45,4 @@ python eng/verify.py --profile managed
 python eng/verify.py --profile integration --inputs /absolute/path/resolved-inputs.json
 ```
 
-前两个是模块验证，不要求外部游戏工作区。第三个要求固定代码与制品清单，缺环境非零退出；通过模块检查不能声称真实跨仓集成完成。详细运行与收尾见 [运行手册](../../eng/DS_RUNBOOK.md)。
+前两个是模块验证，不要求外部游戏工作区。第三个要求固定代码与制品清单，缺环境非零退出；通过模块检查不能声称真实跨仓集成完成。详细运行与收尾见 [运行手册](../../.spec/knowledge/features/ds-runbook.md)。

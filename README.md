@@ -76,7 +76,7 @@ Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 Vox
 
 旧 Hello、Replay 和免认证 observer 附着仅保留在显式 `test-harness` 构建中，不是默认运行路径。当前部署 profile 为 `runtime-only` 检查点模式，不宣称 ECS/Voxel 世界 WAL 已接通。
 
-启动、凭据、浏览器连接、耐久档位和收尾限制见 [DS 运行手册](eng/DS_RUNBOOK.md)。模块及实际调用路径见 [process 模块](modules/process/README.md)。
+启动、凭据、浏览器连接、耐久档位和收尾限制见 [DS 运行手册](.spec/knowledge/features/ds-runbook.md)。模块及实际调用路径见 [process 模块](modules/process/README.md)。
 
 ## Source / Compile-Time Dependencies
 

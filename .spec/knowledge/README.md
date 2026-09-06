@@ -27,6 +27,7 @@ metadata:
 |------|--------|
 | [`features/_TEMPLATE.md`](features/_TEMPLATE.md) | 新功能文档模板——新增功能记录时照此建,放对 领域 / 模块 |
 | [`features/account-server.md`](features/account-server.md) | 独立账号进程 login-or-register、AccountEntity 与准入凭证签发；改账号服或消费 lumio.account-port.v1 时查 |
+| [`features/ds-runbook.md`](features/ds-runbook.md) | LumioServer 独立 Dedicated Server (lumio-ds) 构建、运行、配置、准入与验收手册 |
 | [`features/rust-entity-chat-host.md`](features/rust-entity-chat-host.md) | 切片级最小 Rust host——查 entity-chat 纯托管：Runtime 绑定/查询/快照、NativeCore 定时、Room 网线广播 |
 
 ## lessons(经验教训 · 复发问题暂存区)

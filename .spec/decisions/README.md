@@ -39,3 +39,6 @@
 | [0009](0009-exit-legacy-contract-regime.md) | 退出旧合同制残留，全仓收敛为「消费 SDK 的 Rust 宿主」 | 生效 |
 | [0010](0010-single-cross-platform-native-loader.md) | 全仓只保留一份跨平台 Native 加载器，根表定义收敛到 host-runtime | 生效 |
 | [0011](0011-account-server-retirement-requires-platform-account-port.md) | `account-server/` 退役必须走平台 `/account` 路径，自签凭据短路径不成立 | 生效 |
+| [0012](0012-lumio-ds-entry-and-configuration.md) | `lumio-ds` 默认入口、`server.json` 配置格式与 `test-harness` 门 | 生效 |
+| [0013](0013-checkpoint-profile-durability-and-container-layer-ownership.md) | 检查点 profile、耐久档与「容器层归 Server / 内容层归 Runtime」归属分界 | 生效 |
+| [0014](0014-v1-replay-boundary.md) | v1 重放边界与 Bearer 准入票据生命周期 | 生效 |
