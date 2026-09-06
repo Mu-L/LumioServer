@@ -268,11 +268,10 @@ fn sender_order_is_deterministic_and_each_sender_is_fifo() {
     }
     assert!(inner.run_tick("room").ok);
     let actual = trace.lock().expect("trace lock").inputs.clone();
-    let expected: Vec<(String, Vec<u8>)> =
-        [("a", "a1"), ("a", "a2"), ("b", "b1"), ("b", "b2")]
-            .into_iter()
-            .map(|(connection, text)| (connection.to_owned(), text.as_bytes().to_vec()))
-            .collect();
+    let expected: Vec<(String, Vec<u8>)> = [("a", "a1"), ("a", "a2"), ("b", "b1"), ("b", "b2")]
+        .into_iter()
+        .map(|(connection, text)| (connection.to_owned(), text.as_bytes().to_vec()))
+        .collect();
     assert_eq!(actual, expected);
 }
 
@@ -295,7 +294,13 @@ fn budget_keeps_the_remainder_and_its_byte_accounting() {
     assert_eq!(inner.pending_wire_input_bytes, b"remaining".len());
     assert!(inner.run_tick("room").ok);
     assert_eq!(
-        trace.lock().expect("trace lock").inputs.last().expect("last").1,
+        trace
+            .lock()
+            .expect("trace lock")
+            .inputs
+            .last()
+            .expect("last")
+            .1,
         b"remaining"
     );
     assert!(inner.pending_wire_inputs.is_empty());
@@ -367,9 +372,7 @@ fn admission_time_advances_without_ticks_from_the_construction_origin() {
     let (mut inner, _) = owner();
     let keys = generate_keys();
     inner.admission_public = keys.public.to_vec();
-    let token = issue_admission_credential(
-        &keys.seed, 1, "account", "Player", false, 1_000, 1_001,
-    );
+    let token = issue_admission_credential(&keys.seed, 1, "account", "Player", false, 1_000, 1_001);
     assert_eq!(inner.admission_unix_seconds(), 1_000);
     inner.clock.advance_ms(2_000);
     assert_eq!(inner.admission_unix_seconds(), 1_002);
@@ -394,7 +397,11 @@ fn new_egress_frames_queue_behind_an_existing_backlog() {
         deliver_to_egresses(&mut egresses, b"third"),
         Delivery::Backpressured
     );
-    for expected in [b"first".as_slice(), b"second".as_slice(), b"third".as_slice()] {
+    for expected in [
+        b"first".as_slice(),
+        b"second".as_slice(),
+        b"third".as_slice(),
+    ] {
         assert!(
             matches!(rx.try_recv().expect("queued frame"), WireOut::Text(bytes) if bytes == expected)
         );

@@ -1003,8 +1003,7 @@ impl Inner {
         if self.pending_admissions.contains_key(connection_id) {
             return RoomAdmitResult::reject("admission_pending");
         }
-        if !self.active_rooms.contains(room_id)
-            && self.active_rooms.len() >= MAX_PENDING_ADMISSIONS
+        if !self.active_rooms.contains(room_id) && self.active_rooms.len() >= MAX_PENDING_ADMISSIONS
         {
             return RoomAdmitResult::reject("admission_capacity");
         }
