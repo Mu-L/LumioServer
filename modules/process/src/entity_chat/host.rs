@@ -1,6 +1,10 @@
 //! Consume-only Room host: session table + Runtime forward + NativeCore timers + wire.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use lumio_host_runtime::{
@@ -9,11 +13,12 @@ use lumio_host_runtime::{
 };
 
 use super::admission::{is_bot_namespace, verify_admission, AdmissionPayload};
-use super::runtime::BoundEntityKind;
 use super::runtime::{
     AttributeQueryScope, ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeBinding,
     RuntimeFrame, RuntimeQuery, RuntimeQueryRecord, RuntimeSurface, RuntimeTick,
 };
+use super::runtime::{BoundEntityKind, ChatOpKind};
+use super::secure::BoundAdmissionVerifier;
 use super::wire::{RoomListener, WireEvent, WireSendError, WireSender, MAX_WIRE_TEXT_BYTES};
 use super::{INGRESS_QUEUE_PER_CONNECTION, MAX_CHAT_INPUTS_PER_TICK};
 
@@ -43,7 +48,7 @@ pub const MAX_PENDING_WIRE_INPUTS: usize = MAX_PENDING_QUERIES;
 pub const MAX_PENDING_WIRE_INPUT_BYTES: usize = MAX_PENDING_WIRE_INPUTS * MAX_WIRE_TEXT_BYTES;
 const OWNER_CADENCE_MS: u64 = 10;
 
-/// Bounded sink for exact Runtime-admitted input bytes used by external evidence consumers.
+/// Bounded pre-admission ingress probe for test synchronization; not proof of Runtime commit.
 pub type WireInputObserver = Sender<Vec<u8>>;
 
 /// WallClock expire dispatch id (NativeCore slot).
@@ -210,12 +215,37 @@ enum PendingQueryKey {
     },
 }
 
+#[derive(Default)]
+struct HealthState {
+    ready: AtomicBool,
+    faulted: AtomicBool,
+    draining: AtomicBool,
+    heartbeat_ms: AtomicU64,
+    rejected_inputs: AtomicU64,
+}
+
+/// Snapshot of bounded host diagnostics, never component state or credentials.
+#[derive(Debug, Clone, Copy)]
+pub struct HostHealth {
+    pub ready: bool,
+    pub faulted: bool,
+    pub draining: bool,
+    pub heartbeat_age_ms: u64,
+    pub rejected_inputs: u64,
+}
+
 struct Inner {
+    health: Arc<HealthState>,
     clock: SharedClock,
     reconnect_window_ms: u64,
     admission_key_id: u8,
     admission_public: Vec<u8>,
     unix_seconds: u64,
+    admission_clock_origin_ms: u64,
+    admission_verifier: Option<BoundAdmissionVerifier>,
+    // Activated Runtime rooms live until this host is destroyed, not until the
+    // last socket disappears. Bound this registry at the admission boundary.
+    active_rooms: BTreeSet<String>,
     runtime: Box<dyn RuntimeSurface>,
     kernel: Box<dyn KernelTimer>,
     sessions: HashMap<String, Session>,
@@ -234,6 +264,7 @@ struct Inner {
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
     retired_connections: HashSet<String>,
     tick_id: u64,
+    last_committed_tick: u64,
     wire_chat_pending: u64,
     pending_wire_inputs: Vec<PendingWireInput>,
     pending_wire_input_bytes: usize,
@@ -260,8 +291,26 @@ fn deliver_to_egresses(egresses: &mut Vec<ObserverEgress>, bytes: &[u8]) -> Deli
     let mut invalid = false;
     let mut overflow = false;
     egresses.retain_mut(|egress| {
-        if matches!(flush_observer_egress(egress), Delivery::Unavailable) {
-            return false;
+        match flush_observer_egress(egress) {
+            Delivery::Unavailable => return false,
+            Delivery::Invalid => {
+                invalid = true;
+                return false;
+            }
+            Delivery::Backpressured => {
+                if egress.pending.len() >= MAX_DEFERRED_FRAMES_PER_CONNECTION
+                    || egress.pending_bytes.saturating_add(bytes.len())
+                        > MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION
+                {
+                    overflow = true;
+                } else {
+                    egress.pending.push_back(bytes.to_vec());
+                    egress.pending_bytes = egress.pending_bytes.saturating_add(bytes.len());
+                    backpressured = true;
+                }
+                return true;
+            }
+            Delivery::Delivered | Delivery::Overflow => {}
         }
         match egress.sender.try_send_bytes(bytes) {
             Ok(()) => {
@@ -302,6 +351,9 @@ fn deliver_to_egresses(egresses: &mut Vec<ObserverEgress>, bytes: &[u8]) -> Deli
 }
 
 fn flush_observer_egress(egress: &mut ObserverEgress) -> Delivery {
+    if egress.sender.is_closed() {
+        return Delivery::Unavailable;
+    }
     loop {
         let Some(bytes) = egress.pending.front() else {
             if egress.close_requested && !egress.close_enqueued {
@@ -344,10 +396,11 @@ fn flush_observer_egresses(egresses: &mut Vec<ObserverEgress>) -> bool {
 
 /// Slice-scoped Room host. All authoritative work runs on one owner thread.
 pub struct EntityChatHost {
+    health: Arc<HealthState>,
     tx: Sender<OwnerWork>,
-    _listener: RoomListener,
-    _forward: SupervisedTask,
-    _owner: SupervisedTask,
+    listener: RoomListener,
+    forward: SupervisedTask,
+    owner: SupervisedTask,
     listen_uri: String,
     clock: SharedClock,
 }
@@ -355,6 +408,7 @@ pub struct EntityChatHost {
 impl EntityChatHost {
     /// Builds a consume-only host. Kernel due-decision stays in NativeCore ABI.
     #[must_use]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn new(
         reconnect_window_ms: u64,
         clock: SharedClock,
@@ -364,26 +418,130 @@ impl EntityChatHost {
         admission_public: Vec<u8>,
         unix_seconds: u64,
     ) -> Self {
+        Self::build(
+            (
+                reconnect_window_ms,
+                clock,
+                admission_key_id,
+                admission_public,
+                unix_seconds,
+            ),
+            runtime,
+            kernel,
+            None,
+            None,
+        )
+        .expect("test host startup")
+    }
+
+    /// Secure Host entry. Public clients cannot select an existing connection identity.
+    pub fn new_authenticated(
+        reconnect_window_ms: u64,
+        runtime: Box<dyn RuntimeSurface>,
+        kernel: Box<dyn KernelTimer>,
+        verifier: BoundAdmissionVerifier,
+    ) -> Result<Self, String> {
+        Self::build(
+            (
+                reconnect_window_ms,
+                verifier.clock.clone(),
+                verifier.key_id,
+                verifier.public_key.clone(),
+                verifier.unix_origin,
+            ),
+            runtime,
+            kernel,
+            Some(verifier),
+            None,
+        )
+    }
+
+    /// Restores before publishing Ready or consuming any socket work.
+    pub fn new_authenticated_restored(
+        reconnect_window_ms: u64,
+        runtime: Box<dyn RuntimeSurface>,
+        kernel: Box<dyn KernelTimer>,
+        verifier: BoundAdmissionVerifier,
+        snapshot: Option<(u64, PersistRecord)>,
+    ) -> Result<Self, String> {
+        let initial =
+            snapshot.map(|(tick, bytes)| (verifier.allocation.room_id.clone(), tick, bytes));
+        Self::build(
+            (
+                reconnect_window_ms,
+                verifier.clock.clone(),
+                verifier.key_id,
+                verifier.public_key.clone(),
+                verifier.unix_origin,
+            ),
+            runtime,
+            kernel,
+            Some(verifier),
+            initial,
+        )
+    }
+
+    fn build(
+        config: (u64, SharedClock, u8, Vec<u8>, u64),
+        runtime: Box<dyn RuntimeSurface>,
+        kernel: Box<dyn KernelTimer>,
+        admission_verifier: Option<BoundAdmissionVerifier>,
+        initial_snapshot: Option<(String, u64, PersistRecord)>,
+    ) -> Result<Self, String> {
+        let (reconnect_window_ms, clock, admission_key_id, admission_public, unix_seconds) = config;
+
+        let health = Arc::new(HealthState::default());
+        health.heartbeat_ms.store(clock.now_ms(), Ordering::Release);
+        let owner_health = health.clone();
         let (tx, rx) = bounded_channel(256);
         let (wire_tx, wire_rx) = bounded_channel(256);
-        let listener = RoomListener::bind(wire_tx).expect("room wire bind");
+        let listener = match admission_verifier.clone() {
+            Some(verifier) => RoomListener::bind_authenticated(wire_tx, verifier)?,
+            None => {
+                #[cfg(any(test, feature = "test-harness"))]
+                {
+                    RoomListener::bind(wire_tx)?
+                }
+                #[cfg(not(any(test, feature = "test-harness")))]
+                {
+                    return Err("test-harness transport is unavailable".to_owned());
+                }
+            }
+        };
         let listen_uri = listener.uri();
         let forward_tx = tx.clone();
-        let forward = spawn_supervised("lumio-entity-chat-wire-fwd", move |_| {
-            while let Ok(event) = wire_rx.recv() {
-                if forward_tx.send(OwnerWork::Wire(event)).is_err() {
-                    break;
+        let forward = spawn_supervised("lumio-entity-chat-wire-fwd", move |cancel| {
+            while !cancel.is_cancelled() {
+                match wire_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(event) => {
+                        if forward_tx
+                            .send_timeout(OwnerWork::Wire(event), Duration::from_secs(2))
+                            .is_err()
+                        {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
+                            panic!("owner forwarding deadline exceeded or owner closed");
+                        }
+                    }
+                    Err(lumio_host_runtime::RecvError::Empty) => {}
+                    Err(lumio_host_runtime::RecvError::Closed) => break,
                 }
             }
         });
         let owner_clock = clock.clone();
-        let owner = spawn_supervised("lumio-entity-chat-owner", move |_cancel| {
+        let admission_clock_origin_ms = clock.now_ms();
+        let owner = spawn_supervised("lumio-entity-chat-owner", move |cancel| {
             let mut inner = Inner {
+                health: owner_health,
                 clock: owner_clock,
                 reconnect_window_ms,
+                admission_verifier,
                 admission_key_id,
                 admission_public,
                 unix_seconds,
+                admission_clock_origin_ms,
+                active_rooms: BTreeSet::new(),
                 runtime,
                 kernel,
                 sessions: HashMap::new(),
@@ -402,11 +560,16 @@ impl EntityChatHost {
                 deferred_frames: HashMap::new(),
                 retired_connections: HashSet::new(),
                 tick_id: 0,
+                last_committed_tick: 0,
                 wire_chat_pending: 0,
                 pending_wire_inputs: Vec::new(),
                 pending_wire_input_bytes: 0,
                 wire_input_observer: None,
             };
+            if inner.runtime.initialize().is_err() {
+                inner.health.faulted.store(true, Ordering::Release);
+                return;
+            }
             if inner
                 .kernel
                 .schedule_repeating(TimerMode::TickFrame, 1, 1, DISPATCH_TICK)
@@ -414,25 +577,49 @@ impl EntityChatHost {
             {
                 return;
             }
+            if let Some((room, tick, bytes)) = initial_snapshot {
+                if inner.runtime.restore(&room, &bytes.bytes).is_err() {
+                    inner.health.faulted.store(true, Ordering::Release);
+                    return;
+                }
+                inner.last_committed_tick = tick;
+            }
+            if let Some(verifier) = &inner.admission_verifier {
+                inner
+                    .active_rooms
+                    .insert(verifier.allocation.room_id.clone());
+            }
+            inner.health.ready.store(true, Ordering::Release);
             let self_drive = !inner.clock.is_deterministic();
             let mut last_cadence_ms = inner.clock.now_ms();
             loop {
-                let work = if self_drive {
-                    rx.recv_timeout(Duration::from_millis(OWNER_CADENCE_MS))
-                } else {
-                    rx.recv().map_err(|_| lumio_host_runtime::RecvError::Closed)
-                };
+                if cancel.is_cancelled() || inner.health.faulted.load(Ordering::Acquire) {
+                    inner.health.ready.store(false, Ordering::Release);
+                    break;
+                }
+                inner
+                    .health
+                    .heartbeat_ms
+                    .store(inner.clock.now_ms(), Ordering::Release);
+                let work = rx.recv_timeout(Duration::from_millis(OWNER_CADENCE_MS));
                 match work {
                     Ok(OwnerWork::Run(work)) => work(&mut inner),
                     Ok(OwnerWork::Wire(event)) => inner.on_wire(event),
-                    Err(lumio_host_runtime::RecvError::Empty) if self_drive => {
+                    Err(lumio_host_runtime::RecvError::Empty)
+                        if self_drive && !inner.health.draining.load(Ordering::Acquire) =>
+                    {
                         inner.drive_owner_cadence();
                         last_cadence_ms = inner.clock.now_ms();
                     }
                     Err(lumio_host_runtime::RecvError::Empty) => {}
                     Err(lumio_host_runtime::RecvError::Closed) => break,
                 }
+                inner
+                    .health
+                    .heartbeat_ms
+                    .store(inner.clock.now_ms(), Ordering::Release);
                 if self_drive
+                    && !inner.health.draining.load(Ordering::Acquire)
                     && inner.clock.now_ms().saturating_sub(last_cadence_ms) >= OWNER_CADENCE_MS
                 {
                     inner.drive_owner_cadence();
@@ -440,17 +627,20 @@ impl EntityChatHost {
                 }
             }
         });
-        Self {
+        Ok(Self {
+            health,
             tx,
-            _listener: listener,
-            _forward: forward,
-            _owner: owner,
+            listener,
+            forward,
+            owner,
             listen_uri,
             clock,
-        }
+        })
     }
 
-    /// Attaches a bounded observer for exact admitted input bytes.
+    /// Attaches a test synchronization probe for received input bytes.
+    /// Observation precedes Runtime admission and must not count as a commit.
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn attach_wire_input_observer(&self, observer: WireInputObserver) {
         self.on_owner(move |inner| inner.wire_input_observer = Some(observer));
     }
@@ -462,11 +652,68 @@ impl EntityChatHost {
     {
         let (tx, rx) = bounded_channel(1);
         self.tx
-            .send(OwnerWork::Run(Box::new(move |inner| {
-                let _ = tx.send(work(inner));
-            })))
-            .unwrap_or_else(|_| panic!("entity-chat owner thread closed"));
-        rx.recv().expect("entity-chat owner result")
+            .send_timeout(
+                OwnerWork::Run(Box::new(move |inner| {
+                    let _ = tx.try_send(work(inner));
+                })),
+                Duration::from_secs(2),
+            )
+            .unwrap_or_else(|_| {
+                self.health.faulted.store(true, Ordering::Release);
+                panic!("entity-chat owner thread closed or queue deadline exceeded")
+            });
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+            self.health.faulted.store(true, Ordering::Release);
+            panic!("entity-chat owner result deadline: outcome may be indeterminate")
+        })
+    }
+
+    /// Nonblocking process-supervision probe. Does not enqueue work to a stuck owner.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        !self.health.faulted.load(Ordering::Acquire)
+            && !self.owner.is_finished()
+            && self.owner.failure().is_none()
+            && !self.forward.is_finished()
+            && self.forward.failure().is_none()
+            && self.listener.is_healthy()
+    }
+
+    /// Reads health without marshalling to the potentially stalled owner.
+    #[must_use]
+    pub fn health(&self) -> HostHealth {
+        HostHealth {
+            ready: self.health.ready.load(Ordering::Acquire)
+                && !self.health.draining.load(Ordering::Acquire)
+                && self.is_healthy(),
+            faulted: self.health.faulted.load(Ordering::Acquire) || !self.is_healthy(),
+            draining: self.health.draining.load(Ordering::Acquire),
+            heartbeat_age_ms: self
+                .clock
+                .now_ms()
+                .saturating_sub(self.health.heartbeat_ms.load(Ordering::Acquire)),
+            rejected_inputs: self.health.rejected_inputs.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Freezes this room at an owner barrier, refusing new admission/input.
+    /// Does not claim any data is durable; the caller must publish the snapshot.
+    pub fn quiesce(&self) {
+        self.on_owner(|inner| inner.health.draining.store(true, Ordering::Release));
+    }
+
+    /// Snapshot and tick metadata are captured in the same owner callback.
+    /// File I/O is intentionally performed by the caller, not the owner.
+    pub fn checkpoint(&self, room_id: String) -> Result<(u64, PersistRecord), String> {
+        self.on_owner(move |inner| {
+            if inner.health.faulted.load(Ordering::Acquire) {
+                return Err("world_faulted".to_owned());
+            }
+            inner
+                .runtime
+                .persist(&room_id)
+                .map(|bytes| (inner.last_committed_tick, bytes))
+        })
     }
 
     /// Loopback Room wire URI.
@@ -500,6 +747,7 @@ impl EntityChatHost {
 
     /// Admits an already-verified payload (suite path after local verify).
     #[must_use]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn admit_verified(
         &self,
         room_id: String,
@@ -598,6 +846,7 @@ impl EntityChatHost {
 
     /// Crate-internal suite pacing state; not part of the public HostEntry API.
     #[must_use]
+    #[cfg(any(test, feature = "test-harness"))]
     pub(crate) fn pending_wire_chat_inputs(&self) -> usize {
         self.on_owner(move |inner| usize::try_from(inner.wire_chat_pending).unwrap_or(usize::MAX))
     }
@@ -610,6 +859,7 @@ impl EntityChatHost {
 
     /// Crate-internal suite synchronization; not part of the public HostEntry API.
     #[must_use]
+    #[cfg(any(test, feature = "test-harness"))]
     pub(crate) fn wire_observer_count(&self, connection_id: String) -> usize {
         self.on_owner(move |inner| {
             inner
@@ -643,7 +893,24 @@ impl EntityChatHost {
         room_id: String,
         snapshot: PersistRecord,
     ) -> Result<(), String> {
-        self.on_owner(move |inner| inner.runtime.restore(&room_id, &snapshot.bytes))
+        self.on_owner(move |inner| {
+            if !inner.active_rooms.contains(&room_id)
+                && inner.active_rooms.len() >= MAX_PENDING_ADMISSIONS
+            {
+                return Err("admission_capacity".to_owned());
+            }
+            inner.runtime.restore(&room_id, &snapshot.bytes)?;
+            inner.active_rooms.insert(room_id);
+            Ok(())
+        })
+    }
+}
+
+impl Drop for EntityChatHost {
+    fn drop(&mut self) {
+        self.listener.shutdown();
+        self.forward.cancel();
+        self.owner.cancel();
     }
 }
 
@@ -940,12 +1207,33 @@ impl Inner {
         }
     }
 
+    fn admission_unix_seconds(&self) -> u64 {
+        // The supplied Unix reading is anchored to the monotonic reading at
+        // construction. It must advance on every verification, independently
+        // of simulation ticks (including an idle or disconnected room).
+        self.unix_seconds.saturating_add(
+            self.clock
+                .now_ms()
+                .saturating_sub(self.admission_clock_origin_ms)
+                / 1_000,
+        )
+    }
+
     fn admit(&mut self, room_id: &str, connection_id: &str, credential: &str) -> RoomAdmitResult {
+        if let Some(verifier) = &self.admission_verifier {
+            if room_id != verifier.allocation.room_id {
+                return RoomAdmitResult::reject("admission_binding_mismatch");
+            }
+            return match verifier.verify(credential) {
+                Ok(proof) => self.admit_verified(room_id, connection_id, &proof.payload),
+                Err(code) => RoomAdmitResult::reject(&code),
+            };
+        }
         match verify_admission(
             credential,
             self.admission_key_id,
             &self.admission_public,
-            self.unix_seconds,
+            self.admission_unix_seconds(),
         ) {
             Ok(payload) => self.admit_verified(room_id, connection_id, &payload),
             Err(code) => RoomAdmitResult::reject(&code),
@@ -958,6 +1246,11 @@ impl Inner {
         connection_id: &str,
         payload: &AdmissionPayload,
     ) -> RoomAdmitResult {
+        if self.health.faulted.load(Ordering::Acquire)
+            || self.health.draining.load(Ordering::Acquire)
+        {
+            return RoomAdmitResult::reject("session_closed");
+        }
         if room_id.is_empty()
             || connection_id.is_empty()
             || payload.account_id.is_empty()
@@ -973,6 +1266,10 @@ impl Inner {
         }
         if self.pending_admissions.contains_key(connection_id) {
             return RoomAdmitResult::reject("admission_pending");
+        }
+        if !self.active_rooms.contains(room_id) && self.active_rooms.len() >= MAX_PENDING_ADMISSIONS
+        {
+            return RoomAdmitResult::reject("admission_capacity");
         }
         if self.pending_admissions.len() >= MAX_PENDING_ADMISSIONS {
             self.clear_pending_admission(connection_id);
@@ -1070,6 +1367,7 @@ impl Inner {
         reconnected: bool,
         takeover: bool,
     ) -> RoomAdmitResult {
+        self.active_rooms.insert(room_id.to_owned());
         let pending = PendingAdmission {
             room_id: room_id.to_owned(),
             payload: payload.clone(),
@@ -1496,6 +1794,11 @@ impl Inner {
     }
 
     fn admit_input_command(&mut self, connection_id: &str, envelope_bytes: &[u8]) -> ChatOperation {
+        if self.health.faulted.load(Ordering::Acquire)
+            || self.health.draining.load(Ordering::Acquire)
+        {
+            return ChatOperation::rejected("session_closed");
+        }
         if envelope_bytes.len() > MAX_WIRE_TEXT_BYTES {
             return ChatOperation::rejected("bad_envelope");
         }
@@ -1540,9 +1843,9 @@ impl Inner {
             self.pending_wire_input_bytes = self
                 .pending_wire_input_bytes
                 .saturating_sub(pending.envelope_bytes.len());
-            selected.push(pending);
+            selected.push((index, pending));
         }
-        selected.sort_by(|left, right| {
+        selected.sort_by(|(left_index, left), (right_index, right)| {
             let left_sender = self
                 .sessions
                 .get(&left.connection_id)
@@ -1555,16 +1858,36 @@ impl Inner {
                 .unwrap_or_default();
             left_sender
                 .cmp(right_sender)
-                .then(left.connection_id.cmp(&right.connection_id))
+                .then(left_index.cmp(right_index))
         });
-        for pending in selected {
-            let _ = self.admit_input_command(&pending.connection_id, &pending.envelope_bytes);
+        for (_, pending) in selected {
+            let outcome = self.admit_input_command(&pending.connection_id, &pending.envelope_bytes);
+            match outcome.kind {
+                ChatOpKind::Admitted | ChatOpKind::Committed => {}
+                ChatOpKind::Rejected => {
+                    self.health.rejected_inputs.fetch_add(1, Ordering::Relaxed);
+                    if outcome.error_code.as_deref() == Some("runtime_failure") {
+                        self.health.faulted.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+                ChatOpKind::Fatal => {
+                    self.health.faulted.store(true, Ordering::Release);
+                    break;
+                }
+            }
         }
         self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
     }
 
     fn run_tick(&mut self, room_id: &str) -> RuntimeTick {
+        if self.health.faulted.load(Ordering::Acquire) {
+            return RuntimeTick::failed("runtime_failure");
+        }
         self.flush_pending_wire_inputs(room_id);
+        if self.health.faulted.load(Ordering::Acquire) {
+            return RuntimeTick::failed("runtime_failure");
+        }
         self.tick_id = self.tick_id.saturating_add(1);
         let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
             self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
@@ -1581,6 +1904,9 @@ impl Inner {
         self.flush_pending_observers();
         let expected_queries = self.pending_request_ids_for_tick();
         let tick = self.runtime.run_tick(room_id, self.tick_id);
+        if tick.ok {
+            self.last_committed_tick = tick.applied_tick;
+        }
         let completed = self.absorb_runtime_queries();
         for request_id in expected_queries {
             let still_pending = self
@@ -1624,16 +1950,27 @@ impl Inner {
     /// Tests with deterministic clocks retain explicit control through the
     /// public `run_tick`/`drive_kernel` probes.
     fn drive_owner_cadence(&mut self) {
-        let _ = self.drive_wall();
+        if self.health.faulted.load(Ordering::Acquire)
+            || self.health.draining.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if !self.drive_wall() {
+            self.health.faulted.store(true, Ordering::Release);
+            return;
+        }
         self.flush_pending_observers();
         self.tick_id = self.tick_id.saturating_add(1);
         let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
+            self.health.faulted.store(true, Ordering::Release);
             return;
         };
         if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
             return;
         }
-        let mut rooms = HashSet::new();
+        // Stable visitation order, independent of HashMap/HashSet seed and
+        // socket presence. A disconnected room continues simulation.
+        let mut rooms = self.active_rooms.clone();
         rooms.extend(
             self.sessions
                 .values()
@@ -1661,7 +1998,11 @@ impl Inner {
         );
         for room_id in rooms {
             self.flush_pending_wire_inputs(&room_id);
-            let _ = self.run_tick_after_advance(&room_id);
+            let outcome = self.run_tick_after_advance(&room_id);
+            if !outcome.ok && outcome.code.as_deref() == Some("runtime_failure") {
+                self.health.faulted.store(true, Ordering::Release);
+                break;
+            }
         }
     }
 
@@ -1728,7 +2069,10 @@ impl Inner {
     fn flush_pending_observers(&mut self) {
         let mut invalid_sessions = Vec::new();
         for (connection, session) in &mut self.sessions {
-            if !flush_observer_egresses(&mut session.egresses) {
+            let had_socket = !session.egresses.is_empty();
+            if !flush_observer_egresses(&mut session.egresses)
+                || (had_socket && session.egresses.is_empty())
+            {
                 invalid_sessions.push(connection.clone());
             }
         }
@@ -1864,11 +2208,50 @@ impl Inner {
 
     fn on_wire(&mut self, event: WireEvent) {
         self.flush_pending_observers();
+        if self.health.draining.load(Ordering::Acquire)
+            || self.health.faulted.load(Ordering::Acquire)
+        {
+            match event {
+                WireEvent::Authenticated { egress, .. } | WireEvent::Attached { egress, .. } => {
+                    let _ = egress.try_close();
+                }
+                WireEvent::Input { .. } | WireEvent::Closed { .. } => {}
+            }
+            return;
+        }
         match event {
+            WireEvent::Authenticated {
+                connection_id,
+                egress,
+                proof,
+            } => {
+                if self.admission_verifier.as_ref().is_some_and(|v| {
+                    v.now() > proof.payload.expires_at || v.allocation.room_id != proof.room_id
+                }) {
+                    let _ = egress.try_close();
+                    return;
+                }
+                let result = self.admit_verified(&proof.room_id, &connection_id, &proof.payload);
+                if !result.accepted {
+                    let _ = egress.try_close();
+                    return;
+                }
+                if let Some(session) = self.sessions.get_mut(&connection_id) {
+                    session.egresses.push(ObserverEgress::new(egress));
+                } else {
+                    self.pending_egress
+                        .insert(connection_id.clone(), vec![ObserverEgress::new(egress)]);
+                }
+                self.flush_deferred(&connection_id);
+            }
             WireEvent::Attached {
                 connection_id,
                 egress,
             } => {
+                if self.admission_verifier.is_some() {
+                    egress.abort();
+                    return;
+                }
                 if self.sessions.contains_key(&connection_id) {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
                         if session.egresses.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
@@ -1903,8 +2286,18 @@ impl Inner {
             }
             WireEvent::Input {
                 connection_id,
+                observer_id,
                 text,
             } => {
+                if self.admission_verifier.is_some()
+                    && !self.sessions.get(&connection_id).is_some_and(|session| {
+                        session.egresses.iter().any(|egress| {
+                            egress.sender.observer_id() == observer_id && !egress.sender.is_closed()
+                        })
+                    })
+                {
+                    return;
+                }
                 if text.as_bytes().len() > MAX_WIRE_TEXT_BYTES {
                     let _ = self.fail_connection(&connection_id);
                     return;
@@ -1950,16 +2343,8 @@ impl Inner {
                         .map_or(0, |pending| pending.envelope_bytes.len()),
                 );
                 self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
-                // Preserve the bounded-ingress behavior for a single noisy
-                // connection. Multi-connection traffic is held for the next
-                // owner tick so it can be sorted deterministically.
-                if self.pending_wire_inputs.len() >= MAX_CHAT_INPUTS_PER_TICK
-                    && self.pending_wire_inputs.iter().all(|pending| {
-                        pending.room_id == room_id && pending.connection_id == connection_id
-                    })
-                {
-                    let _ = self.run_tick(&room_id);
-                }
+                // Ingress never advances logical time. Only the owner cadence
+                // (or an explicit deterministic test tick) drains this budget.
             }
             WireEvent::Closed {
                 connection_id,
@@ -2174,3 +2559,7 @@ mod tests {
         assert!(matches!(rx.recv().expect("close"), WireOut::Close));
     }
 }
+
+#[cfg(test)]
+#[path = "host_hardening_tests.rs"]
+mod hardening_tests;

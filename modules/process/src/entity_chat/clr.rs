@@ -16,7 +16,8 @@ use super::runtime::{
 use super::wire::MAX_WIRE_TEXT_BYTES;
 
 /// Files needed to create the CoreCLR Runtime consume host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClrGameplayConfig {
     pub engine_native: PathBuf,
     pub hostfxr: PathBuf,
@@ -661,6 +662,16 @@ fn error_from_frames(frames: &[RuntimeFrame]) -> Option<String> {
 }
 
 impl RuntimeSurface for ClrGameplay {
+    fn initialize(&mut self) -> Result<(), String> {
+        // Forces actual boot/signature checks before the host publishes Ready.
+        let response = self.call(json!({"op":"drain"}))?;
+        if response.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err("runtime_initialization_failed".to_owned())
+        }
+    }
+
     fn admit(
         &mut self,
         connection: &str,

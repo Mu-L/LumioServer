@@ -31,8 +31,8 @@ public sealed class CredentialIsolationTests
         Assert.True(created.Accepted, created.Code + " " + created.Detail);
         harness.Runtime.Flush();
 
-        var identityPath = Path.Combine(harness.StorePath, DurableAccountStore.IdentityFileName);
-        var credentialPath = Path.Combine(harness.StorePath, DurableAccountStore.CredentialFileName);
+        var identityPath = Path.Combine(harness.Runtime.Store.ActiveDirectory, DurableAccountStore.IdentityFileName);
+        var credentialPath = Path.Combine(harness.Runtime.Store.ActiveDirectory, DurableAccountStore.CredentialFileName);
         Assert.True(File.Exists(identityPath));
         Assert.True(File.Exists(credentialPath));
 

@@ -1,123 +1,206 @@
-//! Named supervised threads. Panic is captured and surfaced; it is not silent.
-
+//! Cooperative cancellation and bounded, observable task supervision.
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-/// Cooperative cancel flag shared with a supervised thread.
-#[derive(Clone, Debug, Default)]
-pub struct CancelToken {
-    cancelled: Arc<AtomicBool>,
+#[derive(Debug, Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    lock: Mutex<()>,
+    changed: Condvar,
 }
 
+/// Shared cancellation with a wakeable wait for blocking adapters.
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken {
+    state: Arc<CancelState>,
+}
 impl CancelToken {
-    /// Creates an open token.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
-
-    /// True after [`Self::cancel`].
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+        self.state.cancelled.load(Ordering::Acquire)
     }
-
-    /// Requests cooperative stop. Idempotent.
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        let _guard = self.state.lock.lock().expect("cancel lock");
+        self.state.cancelled.store(true, Ordering::Release);
+        self.state.changed.notify_all();
+    }
+    /// Waits for cancellation, returning false only when the wait expires.
+    #[must_use]
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
+    pub fn wait_timeout(&self, timeout: Duration) -> bool {
+        let guard = self.state.lock.lock().expect("cancel lock");
+        let _result = self
+            .state
+            .changed
+            .wait_timeout_while(guard, timeout, |()| !self.is_cancelled())
+            .expect("cancel wait");
+        self.is_cancelled()
     }
 }
 
-/// Panic captured from a supervised thread.
+/// Panic reported independently of join, allowing an owner to react immediately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskPanicked {
-    /// Thread name supplied at spawn.
     pub name: String,
-    /// `Display` of the panic payload when it was a string.
     pub detail: String,
 }
 
-/// Join handle for a supervised named thread.
+#[derive(Default)]
+struct Completion {
+    done: bool,
+    failure: Option<TaskPanicked>,
+}
+
+/// A timeout is not a claim that the underlying thread stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskJoinTimedOut {
+    pub name: String,
+}
+
 pub struct SupervisedTask {
     name: String,
     cancel: CancelToken,
-    join: Option<JoinHandle<Option<TaskPanicked>>>,
+    join: Option<JoinHandle<()>>,
+    completion: Arc<(Mutex<Completion>, Condvar)>,
 }
-
 impl SupervisedTask {
-    /// The name passed to [`spawn_supervised`].
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
-
-    /// Cancel token observed by the thread body.
     #[must_use]
     pub fn cancel_token(&self) -> CancelToken {
         self.cancel.clone()
     }
-
-    /// Requests stop. The thread still has to observe the token or channel close.
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
     pub fn cancel(&self) {
         self.cancel.cancel();
     }
-
-    /// Joins the thread and returns a panic event when the body unwound.
-    pub fn join(&mut self) -> Option<TaskPanicked> {
-        self.cancel.cancel();
-        self.join
-            .take()
-            .and_then(|handle| handle.join().ok().flatten())
+    #[must_use]
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
+    pub fn is_finished(&self) -> bool {
+        self.completion.0.lock().expect("task state").done
     }
-}
-
-impl Drop for SupervisedTask {
-    fn drop(&mut self) {
-        self.cancel.cancel();
+    #[must_use]
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
+    pub fn failure(&self) -> Option<TaskPanicked> {
+        self.completion
+            .0
+            .lock()
+            .expect("task state")
+            .failure
+            .clone()
+    }
+    /// Explicit unbounded join. Use `join_timeout` for host shutdown.
+    pub fn join(&mut self) -> Option<TaskPanicked> {
+        self.cancel();
         if let Some(handle) = self.join.take() {
             let _ = handle.join();
+        }
+        self.failure()
+    }
+    /// Cancels and joins only within the supplied deadline.
+    ///
+    /// # Errors
+    /// A timeout retains the handle; the caller must escalate or try again.
+    ///
+    /// # Panics
+    /// Panics if an internal supervision lock is poisoned.
+    pub fn join_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<TaskPanicked>, TaskJoinTimedOut> {
+        self.cancel();
+        let state = self.completion.0.lock().expect("task state");
+        let (state, _) = self
+            .completion
+            .1
+            .wait_timeout_while(state, timeout, |state| !state.done)
+            .expect("task completion wait");
+        if !state.done {
+            return Err(TaskJoinTimedOut {
+                name: self.name.clone(),
+            });
+        }
+        drop(state);
+        Ok(self.join())
+    }
+}
+impl Drop for SupervisedTask {
+    fn drop(&mut self) {
+        match self.join_timeout(Duration::from_secs(2)) {
+            Ok(Some(failure)) => eprintln!(
+                "supervised task failed: {}: {}",
+                failure.name, failure.detail
+            ),
+            Err(timeout) => {
+                eprintln!("supervised task did not stop before deadline: {} (process escalation required)", timeout.name);
+                // Rust cannot safely terminate an arbitrary thread. Detach rather
+                // than deadlock Drop; owned resources stay alive in that thread.
+                drop(self.join.take());
+            }
+            Ok(None) => {}
         }
     }
 }
 
-/// Spawns a named thread. Panic is caught and returned from [`SupervisedTask::join`].
+/// Starts a named thread; all panics are latched before completion is signalled.
 ///
 /// # Panics
-///
-/// Panics when the OS refuses to create the thread.
+/// Panics if the OS refuses thread creation.
 pub fn spawn_supervised<F>(name: &str, body: F) -> SupervisedTask
 where
     F: FnOnce(CancelToken) + Send + 'static,
 {
     let cancel = CancelToken::new();
-    let thread_cancel = cancel.clone();
-    let thread_name = name.to_owned();
+    let token = cancel.clone();
+    let completion = Arc::new((Mutex::new(Completion::default()), Condvar::new()));
+    let completed = completion.clone();
+    let task_name = name.to_owned();
     let join = thread::Builder::new()
-        .name(thread_name.clone())
+        .name(task_name.clone())
         .spawn(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| body(thread_cancel.clone())));
-            match result {
-                Ok(()) => None,
-                Err(payload) => Some(TaskPanicked {
-                    name: thread_name,
+            let failure = panic::catch_unwind(AssertUnwindSafe(|| body(token)))
+                .err()
+                .map(|payload| TaskPanicked {
+                    name: task_name,
                     detail: panic_detail(payload.as_ref()),
-                }),
-            }
+                });
+            let mut state = completed.0.lock().expect("task state");
+            state.failure = failure;
+            state.done = true;
+            completed.1.notify_all();
         })
         .unwrap_or_else(|error| panic!("failed to spawn supervised thread `{name}`: {error}"));
     SupervisedTask {
         name: name.to_owned(),
         cancel,
         join: Some(join),
+        completion,
     }
 }
-
 fn panic_detail(payload: &(dyn std::any::Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
-        .map(|value| (*value).to_owned())
+        .map(|v| (*v).to_owned())
         .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic payload".to_owned())
 }
@@ -163,5 +246,37 @@ mod tests {
         task.cancel();
         drop(tx);
         assert!(task.join().is_none());
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+    #[test]
+    fn cancellation_wakes_waiters() {
+        let token = CancelToken::new();
+        let other = token.clone();
+        let worker = std::thread::spawn(move || other.wait_timeout(Duration::from_secs(30)));
+        token.cancel();
+        assert!(worker.join().expect("join"));
+    }
+    #[test]
+    fn panic_is_queryable_without_consuming_join() {
+        let mut task = spawn_supervised("failure", |_| panic!("expected failure"));
+        assert!(task
+            .join_timeout(Duration::from_secs(2))
+            .expect("join")
+            .is_some());
+        assert_eq!(task.failure().expect("latched").detail, "expected failure");
+    }
+    #[test]
+    fn join_deadline_preserves_the_handle_for_retry() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut task = spawn_supervised("blocked", move |_| {
+            let _ = rx.recv();
+        });
+        assert!(task.join_timeout(Duration::ZERO).is_err());
+        tx.send(()).expect("unblock");
+        assert!(task.join_timeout(Duration::from_secs(2)).is_ok());
     }
 }

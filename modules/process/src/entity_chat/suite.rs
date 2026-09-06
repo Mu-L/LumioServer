@@ -127,10 +127,16 @@ async fn run_two_rounds_async(options: &SuiteOptions) -> SuiteReport {
         "blocked": blocked,
         "rounds": rounds,
     });
-    let _ = std::fs::write(
-        options.out_dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest).unwrap_or_default() + "\n",
-    );
+    let manifest_write = serde_json::to_vec_pretty(&manifest)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| std::fs::write(options.out_dir.join("manifest.json"), bytes));
+    if let Err(error) = manifest_write {
+        return SuiteReport {
+            ok: false,
+            blocked: Some(format!("manifest_write_failed: {error}")),
+            rounds,
+        };
+    }
     SuiteReport {
         ok: comparison_ok,
         blocked,
@@ -451,8 +457,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "census": census_payload,
             "scenarios": scenarios,
         });
-        write_evidence(out_dir, &evidence, &host_audit);
-        return evidence;
+        return match write_evidence(out_dir, &evidence, &host_audit) {
+            Ok(()) => evidence,
+            Err(error) => {
+                json!({"ok":false,"blocked":"evidence_write_failed","detail":error.to_string()})
+            }
+        };
     };
 
     let ok_request = AttributeQueryRequest {
@@ -1001,12 +1011,15 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         }),
     );
 
-    let mut all_ok = blocked.is_none();
-    for value in scenarios.values() {
-        if value.get("ok") == Some(&Value::Bool(false)) {
-            all_ok = false;
-        }
-    }
+    let all_ok = blocked.is_none()
+        && scenarios.len() == 11
+        && (1..=11).all(|n| {
+            scenarios
+                .get(&n.to_string())
+                .and_then(|value| value.get("ok"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
     let session_ids: Vec<String> = admits.iter().map(|row| row.session_id.clone()).collect();
     let mut chat_trace = json!({
         "eventCount": chat_events.len(),
@@ -1067,8 +1080,12 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     if let Some(fleet) = bot_fleet.take() {
         fleet.release();
     }
-    write_evidence(out_dir, &evidence, &host_audit);
-    evidence
+    match write_evidence(out_dir, &evidence, &host_audit) {
+        Ok(()) => evidence,
+        Err(error) => {
+            json!({ "ok": false, "blocked": "evidence_write_failed", "detail": error.to_string() })
+        }
+    }
 }
 
 fn wait_for_wire_observers(
@@ -1464,24 +1481,56 @@ fn account_meta(dll: &Path, account: &AccountServerProcess) -> Value {
     })
 }
 
-fn write_evidence(out_dir: &Path, evidence: &Value, audit: &str) {
-    let _ = std::fs::write(
-        out_dir.join("evidence.json"),
-        serde_json::to_string_pretty(evidence).unwrap_or_default() + "\n",
-    );
-    let _ = std::fs::write(out_dir.join("host-audit.ndjson"), audit);
-    let _ = std::fs::write(out_dir.join("admit-trace.ndjson"), audit);
-    write_oracle_logs(out_dir, evidence, audit);
+fn write_evidence(out_dir: &Path, evidence: &Value, audit: &str) -> std::io::Result<()> {
+    let published = out_dir.join("evidence.json");
+    match std::fs::remove_file(&published) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    if evidence.get("ok").and_then(Value::as_bool) == Some(true) {
+        for n in 1..=11 {
+            if evidence
+                .pointer(&format!("/scenarios/{n}/ok"))
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return Err(std::io::Error::other(
+                    "successful evidence missing a successful scenario",
+                ));
+            }
+        }
+        if evidence
+            .pointer("/traces/account/wrongPasswordCode")
+            .and_then(Value::as_str)
+            .is_none()
+        {
+            return Err(std::io::Error::other(
+                "successful evidence missing account observation",
+            ));
+        }
+    }
+    std::fs::create_dir_all(out_dir)?;
+    // Publish the success-bearing evidence last. A failed log write must not
+    // leave evidence.json claiming this run completed.
+    write_oracle_logs(out_dir, evidence, audit)?;
+    std::fs::write(out_dir.join("host-audit.ndjson"), audit)?;
+    std::fs::write(out_dir.join("admit-trace.ndjson"), audit)?;
+    let bytes = serde_json::to_vec_pretty(evidence)?;
+    let staging = out_dir.join("evidence.json.tmp");
+    std::fs::write(&staging, bytes)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&staging)?
+        .sync_all()?;
+    std::fs::rename(staging, out_dir.join("evidence.json"))
 }
 
-fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
+fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) -> std::io::Result<()> {
     let server_dir = out_dir.join("server");
     let client_dir = out_dir.join("client");
-    if std::fs::create_dir_all(&server_dir).is_err()
-        || std::fs::create_dir_all(&client_dir).is_err()
-    {
-        return;
-    }
+    std::fs::create_dir_all(&server_dir)?;
+    std::fs::create_dir_all(&client_dir)?;
 
     let mut server = Vec::new();
     let process = evidence
@@ -1493,16 +1542,10 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     server.push(json!({ "kind": "host", "process": process, "pid": pid }));
-    // B4 (R-00393): emit only what was actually observed. Defaulting a missing
-    // trace to the value the oracle accepts would make the S1 wrong-password
-    // check unfalsifiable; with no event emitted, the oracle's `!account`
-    // branch fails the check instead.
-    if let Some(code) = evidence
-        .pointer("/traces/account/wrongPasswordCode")
-        .and_then(Value::as_str)
-    {
-        server.push(json!({ "kind": "account", "wrongPasswordCode": code }));
-    }
+    server.push(json!({
+        "kind": "account",
+        "wrongPasswordCode": evidence.pointer("/traces/account/wrongPasswordCode").cloned().unwrap_or(Value::Null),
+    }));
     for line in audit.lines() {
         if let Ok(row) = serde_json::from_str::<Value>(line) {
             server.push(row);
@@ -1532,13 +1575,13 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
     if let Some(persist) = evidence.pointer("/traces/persist") {
         server.push(json!({
             "kind": "snapshot",
-            "historyCount": 0,
+            "historyCount": persist.get("clientWindowAfterRestore").cloned().unwrap_or(Value::Null),
             "processA": persist.pointer("/processA/pid").and_then(Value::as_u64).unwrap_or(0),
             "snapshotSha256": persist.get("snapshotSha256").cloned().unwrap_or(Value::Null),
         }));
         server.push(json!({
             "kind": "restore",
-            "windowAfter": 0,
+            "windowAfter": persist.get("clientWindowAfterRestore").cloned().unwrap_or(Value::Null),
             "processB": persist.pointer("/processB/pid").and_then(Value::as_u64).unwrap_or(0),
             "snapshotSha256": persist.get("snapshotSha256").cloned().unwrap_or(Value::Null),
         }));
@@ -1570,7 +1613,7 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
         json!({ "kind": "deferred", "scenario": 10, "reason": "ADR-058 §11 multi-room deferred" }),
     );
 
-    let _ = std::fs::write(
+    std::fs::write(
         server_dir.join("server.ndjson"),
         server
             .iter()
@@ -1578,7 +1621,7 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n",
-    );
+    )?;
 
     let mut client = Vec::new();
     if let Some(tick) = evidence.pointer("/scenarios/6") {
@@ -1625,7 +1668,7 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
             }));
         }
     }
-    let _ = std::fs::write(
+    std::fs::write(
         client_dir.join("client.ndjson"),
         client
             .iter()
@@ -1633,7 +1676,8 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
             .collect::<Vec<_>>()
             .join("\n")
             + "\n",
-    );
+    )?;
+    Ok(())
 }
 
 fn decode_hex_text(value: &str) -> Option<String> {
@@ -1654,10 +1698,12 @@ fn decode_hex_text(value: &str) -> Option<String> {
 }
 
 fn write_blocked(out_dir: &Path, reason: &str) -> Value {
-    std::fs::create_dir_all(out_dir).ok();
-    let evidence = json!({ "ok": false, "blocked": reason });
-    write_evidence(out_dir, &evidence, "");
-    let _ = std::fs::write(out_dir.join("blocked.txt"), format!("{reason}\n"));
+    let mut evidence = json!({ "ok": false, "blocked": reason });
+    if let Err(error) = write_evidence(out_dir, &evidence, "")
+        .and_then(|()| std::fs::write(out_dir.join("blocked.txt"), format!("{reason}\n")))
+    {
+        evidence["evidenceWriteError"] = json!(error.to_string());
+    }
     evidence
 }
 
@@ -1713,5 +1759,35 @@ mod tests {
         sender.try_send(b"m-input".to_vec()).expect("third input");
 
         assert_eq!(receive_deterministic_runtime_input(&receiver), b"a-input");
+    }
+}
+
+#[cfg(test)]
+mod evidence_hardening_tests {
+    use super::*;
+    #[test]
+    fn missing_account_observation_is_null_not_a_passing_default() {
+        let dir = tempfile::tempdir().expect("temp");
+        write_oracle_logs(dir.path(), &json!({"ok": false}), "").expect("write");
+        let text = std::fs::read_to_string(dir.path().join("server/server.ndjson")).expect("read");
+        let account: Value = text
+            .lines()
+            .map(|s| serde_json::from_str::<Value>(s).expect("json"))
+            .find(|v| v["kind"] == "account")
+            .expect("account");
+        assert!(account["wrongPasswordCode"].is_null());
+    }
+    #[test]
+    fn success_requires_all_scenario_observations() {
+        let dir = tempfile::tempdir().expect("temp");
+        assert!(write_evidence(dir.path(), &json!({"ok":true}), "").is_err());
+        assert!(!dir.path().join("evidence.json").exists());
+    }
+    #[test]
+    fn evidence_write_failure_is_not_ignored() {
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(dir.path().join("server"), b"not a directory").expect("fixture");
+        assert!(write_evidence(dir.path(), &json!({"ok":false}), "").is_err());
+        assert!(!dir.path().join("evidence.json").exists());
     }
 }

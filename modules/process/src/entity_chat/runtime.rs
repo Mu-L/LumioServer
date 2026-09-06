@@ -347,6 +347,11 @@ pub struct PersistRecord {
 
 /// Runtime public surface consumed by the host. The host does not implement it.
 pub trait RuntimeSurface: Send {
+    /// Owner-thread startup validation. Doubles need no external initialization.
+    fn initialize(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     fn admit(
         &mut self,
         connection: &str,

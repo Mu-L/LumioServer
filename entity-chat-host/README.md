@@ -1,12 +1,16 @@
 # entity-chat-host
 
-Slice-scoped CoreCLR managed entry for R-00408. It loads Runtime `WorldManager`, `EntityBindingQuery`, and `WireCodec`, then exposes exactly `enqueue`, `tick`, `drain`, `snapshot`, and `restore` (plus `boot`). Lifecycle controls and opaque input envelopes are enqueued and committed by the Runtime owner thread; the Rust host owns admission verification, NativeCore timer drain, and Room WebSocket transport.
+CoreCLR managed adapter for Runtime `WorldManager`, `EntityBindingQuery` and `WireCodec`. Entry operations remain `boot`, `enqueue`, `tick`, `drain`, `snapshot` and `restore`; the Rust host owns credential verification, NativeCore timers and transport.
 
-```text
-cd entity-chat-host
-dotnet build src/Lumio.Server.EntityChat.HostEntry/Lumio.Server.EntityChat.HostEntry.csproj
+```sh
+dotnet restore src/Lumio.Server.EntityChat.HostEntry/Lumio.Server.EntityChat.HostEntry.csproj --locked-mode
+dotnet build src/Lumio.Server.EntityChat.HostEntry/Lumio.Server.EntityChat.HostEntry.csproj --no-restore -c Release
 ```
 
-Boot JSON must include `replicationAssembly` and `ecsAssembly` paths (from `LUMIO_RUNTIME_REPLICATION_DLL` / `LUMIO_RUNTIME_ECS_DLL`). A generated gameplay registry assembly is also required; pass it as `registryAssembly` or set `LUMIO_RUNTIME_GAMEPLAY_DLL`. Missing artifacts are BLOCKED.
+Boot requires explicit replication/ECS/registry assemblies. The input span decoder and identity accessors are bound once at boot rather than creating DynamicMethod on every input. Sibling assemblies load in deterministic order, and load failures are not silently ignored. BufferTooSmall retries retain the original response rather than repeating destructive operations.
 
-Entry: `Lumio.Server.EntityChat.HostEntry.HostEntry, Lumio.Server.EntityChat.HostEntry` / `LumioEntityChatEntry`.
+Restore constructs the replacement manager and binding view before activation, does not transfer old socket authorization, and disposes the previous manager when its public interface supports disposal.
+
+**Remaining boundary:** this adapter still has one process-scoped static managed context under the existing entry contract. Explicit multi-context handles, fully typed/generated Runtime bindings and real Native/Runtime lifecycle integration are not claimed complete. The default DS profile is one process, one room; do not infer multi-slot or hot-reload support from this adapter.
+
+Entry type: `Lumio.Server.EntityChat.HostEntry.HostEntry, Lumio.Server.EntityChat.HostEntry`; method: `LumioEntityChatEntry`.

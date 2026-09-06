@@ -1,25 +1,33 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 
 namespace Lumio.Server.Account;
 
-internal sealed class DurableAccountStore
+internal sealed class DurableAccountStore : IDisposable
 {
     public const string IdentityFileName = "account-identities.json";
     public const string CredentialFileName = "account-credentials.json";
 
     private const int IdentityVersion = 1;
     private const int CredentialVersion = 1;
-    private readonly string identityPath;
-    private readonly string credentialPath;
+    private string identityPath;
+    private string credentialPath;
+    private readonly FileStream writerLease;
+    private readonly string pointerPath;
+    private bool poisoned;
+    public const string PointerFileName = "active-account-group";
+    public string ActiveDirectory => Path.GetDirectoryName(identityPath)!;
 
     public DurableAccountStore(string directory)
     {
         ArgumentException.ThrowIfNullOrEmpty(directory);
         DirectoryPath = Path.GetFullPath(directory);
         Directory.CreateDirectory(DirectoryPath);
+        pointerPath = Path.Combine(DirectoryPath, PointerFileName);
+        writerLease = new FileStream(Path.Combine(DirectoryPath, "account-writer.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
         identityPath = Path.Combine(DirectoryPath, IdentityFileName);
         credentialPath = Path.Combine(DirectoryPath, CredentialFileName);
     }
@@ -31,10 +39,34 @@ internal sealed class DurableAccountStore
         ArgumentNullException.ThrowIfNull(world);
         ArgumentNullException.ThrowIfNull(credentials);
 
+        if (File.Exists(pointerPath))
+        {
+            var group = File.ReadAllText(pointerPath).Trim();
+            if (!group.StartsWith("group-", StringComparison.Ordinal) || group.Length != 38
+                || !Guid.TryParseExact(group[6..], "N", out _))
+                throw new InvalidDataException("invalid account group pointer");
+            var active = Path.Combine(DirectoryPath, group);
+            identityPath = Path.Combine(active, IdentityFileName);
+            credentialPath = Path.Combine(active, CredentialFileName);
+            if (!File.Exists(identityPath) || !File.Exists(credentialPath))
+                throw new InvalidDataException("committed account group is incomplete");
+        }
+        else if (Directory.EnumerateDirectories(DirectoryPath, "group-*").Any())
+        {
+            throw new InvalidDataException("account groups exist without a publication pointer; explicit recovery required");
+        }
+        if (File.Exists(identityPath) != File.Exists(credentialPath))
+            throw new InvalidDataException("legacy account files do not form a complete pair");
+        foreach (var path in new[] { identityPath, credentialPath })
+            if (File.Exists(path) && new FileInfo(path).Length > 64 * 1024 * 1024)
+                throw new InvalidDataException("account file exceeds bounded import size");
+
         if (File.Exists(identityPath))
         {
             using var document = JsonDocument.Parse(File.ReadAllBytes(identityPath));
             var root = document.RootElement;
+            if (!root.TryGetProperty("version", out var version) || version.GetInt32() != 1)
+                throw new InvalidDataException("unsupported account store version");
             if (!root.TryGetProperty("entities", out var entities) || entities.ValueKind != JsonValueKind.Array)
             {
                 throw new InvalidDataException("identity store missing entities");
@@ -55,6 +87,8 @@ internal sealed class DurableAccountStore
         {
             using var document = JsonDocument.Parse(File.ReadAllBytes(credentialPath));
             var root = document.RootElement;
+            if (!root.TryGetProperty("version", out var version) || version.GetInt32() != 1)
+                throw new InvalidDataException("unsupported account store version");
             if (!root.TryGetProperty("hashes", out var hashes) || hashes.ValueKind != JsonValueKind.Array)
             {
                 throw new InvalidDataException("credential store missing hashes");
@@ -69,6 +103,10 @@ internal sealed class DurableAccountStore
                 credentials.Put(accountId, encoded);
             }
         }
+        var identityIds = world.Snapshot().Select(row => row.AccountId).ToHashSet(StringComparer.Ordinal);
+        var credentialIds = credentials.Snapshot().Select(row => row.Key).ToHashSet(StringComparer.Ordinal);
+        if (!identityIds.SetEquals(credentialIds))
+            throw new InvalidDataException("account identity/credential cohort mismatch");
     }
 
     public void Save(AccountWorld world, CredentialStore credentials)
@@ -76,6 +114,16 @@ internal sealed class DurableAccountStore
         ArgumentNullException.ThrowIfNull(world);
         ArgumentNullException.ThrowIfNull(credentials);
 
+        if (poisoned) throw new InvalidOperationException("account writer requires reopen after a failed transaction");
+        var previousDirectory = ActiveDirectory;
+        var groupName = "group-" + Guid.NewGuid().ToString("N");
+        var stagingDirectory = Path.Combine(DirectoryPath, "draft-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(stagingDirectory);
+        var stagedIdentityPath = Path.Combine(stagingDirectory, IdentityFileName);
+        var stagedCredentialPath = Path.Combine(stagingDirectory, CredentialFileName);
+        // Until publication succeeds, even an exception in serialization seals
+        // the writer; Dispose must never publish this partially mutated world.
+        poisoned = true;
         var identities = world.Snapshot();
         using (var stream = new MemoryStream())
         {
@@ -98,7 +146,7 @@ internal sealed class DurableAccountStore
                 writer.WriteEndObject();
             }
 
-            AtomicWrite(identityPath, stream.ToArray());
+            AtomicWrite(stagedIdentityPath, stream.ToArray());
         }
 
         var hashes = credentials.Snapshot();
@@ -121,14 +169,32 @@ internal sealed class DurableAccountStore
                 writer.WriteEndObject();
             }
 
-            AtomicWrite(credentialPath, stream.ToArray());
+            AtomicWrite(stagedCredentialPath, stream.ToArray());
         }
+        var publishedDirectory = Path.Combine(DirectoryPath, groupName);
+        Directory.Move(stagingDirectory, publishedDirectory);
+        AtomicWrite(pointerPath, System.Text.Encoding.UTF8.GetBytes(groupName));
+        identityPath = Path.Combine(publishedDirectory, IdentityFileName);
+        credentialPath = Path.Combine(publishedDirectory, CredentialFileName);
+        poisoned = false;
+        // Keep the current and previous complete groups. Orphan draft groups
+        // are ignored by recovery and may be removed by explicit maintenance.
+        foreach (var old in Directory.EnumerateDirectories(DirectoryPath, "group-*"))
+            if (!string.Equals(old, publishedDirectory, StringComparison.Ordinal)
+                && !string.Equals(old, previousDirectory, StringComparison.Ordinal))
+                Directory.Delete(old, recursive: true);
     }
+
+    public void Dispose() => writerLease.Dispose();
 
     private static void AtomicWrite(string path, byte[] bytes)
     {
         var temp = path + ".tmp";
-        File.WriteAllBytes(temp, bytes);
+        using (var stream = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            stream.Write(bytes);
+            stream.Flush(flushToDisk: true);
+        }
         if (File.Exists(path))
         {
             File.Replace(temp, path, destinationBackupFileName: null);

@@ -9,18 +9,23 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: repository-policy-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   readme:
     name: README policy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate LumioAgent specification
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Validate specification and repository boundary
         run: |
           node .spec/tools/spec-lint.mjs
           node --test .spec/tools/spec-lint.test.mjs
-      - name: Validate repository boundary documentation
-        run: |
           test -s README.md
           test -s LICENSE
           test -s .gitattributes
@@ -32,39 +37,97 @@ jobs:
           grep -q '^## 子模块' README.md
           grep -q '^## 当前阶段与开发节奏$' README.md
 
-  cargo-entity-chat:
-    # R-00484 (Owner ruling D24): one portable loader, so both platforms are
-    # required. Neither leg is allowed to fail.
-    name: Cargo entity-chat acceptance (${{ matrix.os }})
+  rust:
+    name: Rust unit and socket checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-latest]
-    env:
-      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        run: rustup show
-      - name: Cargo fmt
-        run: cargo fmt --all -- --check
-      - name: Cargo clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Cargo test lumio-host-runtime
-        run: cargo test -p lumio-host-runtime --locked
-      - name: Cargo test lumio-server-process excluding 11-scenario
-        run: cargo test -p lumio-server-process --locked --lib --bins --test entity_chat_architecture --test entity_chat_wire --test native_loader_architecture --test entity_chat_host
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile production and test-harness profiles
+        run: python eng/verify.py --profile rust
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-verification-${{ matrix.os }}
+          path: artifacts/verification
+          if-no-files-found: error
 
-  cargo-entity-chat-eleven:
-    name: Cargo entity-chat 11-scenario
-    runs-on: windows-latest
-    continue-on-error: true
+  managed:
+    name: Managed build and account tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        run: rustup show
-      - name: Run 11-scenario (BLOCKED without Game root, never skip)
-        run: cargo test -p lumio-server-process --locked --test entity_chat_acceptance -- --nocapture
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Build managed bridge and run account tests
+        run: python eng/verify.py --profile managed
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: managed-verification-${{ matrix.os }}
+          path: artifacts/verification
+          if-no-files-found: error
+
+  required-gate:
+    name: Required module gate (not release certification)
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [readme, rust, managed]
+    env:
+      README_RESULT: ${{ needs.readme.result }}
+      RUST_RESULT: ${{ needs.rust.result }}
+      MANAGED_RESULT: ${{ needs.managed.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: No skipped, blocked, cancelled or failed required checks
+        run: |
+          test "$README_RESULT" = success
+          test "$RUST_RESULT" = success
+          test "$MANAGED_RESULT" = success
+          echo 'Module checks passed. Native/CoreCLR/Game/Platform integration and release validation are NOT implied.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Package the exact reviewed source and patch
+        if: always()
         env:
-          CARGO_TERM_COLOR: always
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p artifacts/delivery
+          git archive --format=zip -o artifacts/delivery/LumioServer-source.zip HEAD
+          git rev-parse HEAD > artifacts/delivery/source-sha.txt
+          if test -n "$BASE_SHA"; then
+            git diff --binary "$BASE_SHA" HEAD > artifacts/delivery/LumioServer-PR.patch
+            printf '%s\n' "$BASE_SHA" > artifacts/delivery/base-sha.txt
+          fi
+          cp eng/PR38_HANDOFF.md eng/DS_RUNBOOK.md artifacts/delivery/
+          printf 'readme=%s\nrust=%s\nmanaged=%s\n' "$README_RESULT" "$RUST_RESULT" "$MANAGED_RESULT" > artifacts/delivery/check-results.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: LumioServer-reviewed-source
+          path: artifacts/delivery
+          if-no-files-found: error

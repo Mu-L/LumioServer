@@ -72,9 +72,11 @@ Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 Vox
 
 ## 线程、队列与资源治理
 
-并发原语全部来自 `host-runtime`：线程经 `spawn_supervised` 受监督创建并配 `CancelToken` 协作式取消，panic 以 `TaskPanicked` 上报；队列只有 `bounded_channel` 一种形态，满载与关闭是显式错误（`SendError::Full` / `SendError::Closed`），没有无界路径；单调时间只从 `HostClock` 取，定时经 `KernelTimer` / `HostTimer` 与 `NativeAbiKernel`。生产代码不直接 `spawn`、`sleep` 或轮询。
+默认候选入口是 `lumio-ds`：单个异步网络 Reactor、单 Owner 逻辑驱动、有界队列与有期限关闭。网络流量不驱动 Tick；线程和队列原语来自 `host-runtime`。生产单调钟不可快进。
 
-可靠积压超阈值时降级或断开，不能无限增长；Native Completion 只在 Tick Barrier 应用。当前每进程一个 active WorldSlot；OOM、CoreCLR 崩溃和 Native UB 按进程级故障处理。
+旧 Hello、Replay 和免认证 observer 附着仅保留在显式 `test-harness` 构建中，不是默认运行路径。当前部署 profile 为 `runtime-only` 检查点模式，不宣称 ECS/Voxel 世界 WAL 已接通。
+
+启动、凭据、浏览器连接、耐久档位和收尾限制见 [DS 运行手册](eng/DS_RUNBOOK.md)。模块及实际调用路径见 [process 模块](modules/process/README.md)。
 
 ## Source / Compile-Time Dependencies
 

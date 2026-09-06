@@ -27,6 +27,11 @@ public static class HostEntry
     private static Type? EcsRegistryType;
     private static object? Bindings;
     private static object? Manager;
+    private static InputDecodeBridge? CachedInputDecoder;
+    private static Type? CachedNetEntityIdType;
+    private static MethodInfo? CachedParseNetEntityId;
+    private static PropertyInfo? CachedInstanceId;
+    private static PropertyInfo? CachedCounter;
     // A BufferTooSmall response must be replayed without executing the operation
     // again. DrainOutbox and CaptureSnapshot are destructive/read-once calls.
     private static byte[]? PendingResponse;
@@ -138,6 +143,12 @@ public static class HostEntry
         if (!HasPublicStaticMethod(WireCodecType, "DecodeInput") || !HasPublicStaticMethod(WireCodecType, "EncodePack")) return (EntrySuccess, Fail("boot_failed"));
         object? registry = EcsRegistryType.GetProperty("Current", BindingFlags.Public | BindingFlags.Static)?.GetValue(null) ?? FindGeneratedRegistry();
         if (registry is null) return (EntrySuccess, Fail("registry_required"));
+        CachedNetEntityIdType = Ecs.GetType("Lumio.GameRuntime.Ecs.NetEntityId", throwOnError: true)!;
+        CachedParseNetEntityId = CachedNetEntityIdType.GetMethod("Parse", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null)
+            ?? throw new MissingMethodException(CachedNetEntityIdType.FullName, "Parse(string)");
+        CachedInstanceId = CachedNetEntityIdType.GetProperty("InstanceId") ?? throw new MissingMemberException("NetEntityId.InstanceId");
+        CachedCounter = CachedNetEntityIdType.GetProperty("Counter") ?? throw new MissingMemberException("NetEntityId.Counter");
+        CachedInputDecoder = BuildInputDecoder(CachedNetEntityIdType);
         ulong instanceId = root.TryGetProperty("instanceId", out JsonElement id) && id.TryGetUInt64(out ulong supplied) ? supplied : 1UL;
         Manager = ManagerType.GetMethod("Create", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { registry, instanceId });
         ManagerType.GetMethod("Start", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
@@ -168,7 +179,9 @@ public static class HostEntry
     private static void LoadSiblingAssemblies(string? directory)
     {
         if (string.IsNullOrEmpty(directory) || !Directory.Exists(directory)) return;
-        foreach (string path in Directory.GetFiles(directory, "Lumio.GameRuntime.*.dll")) try { Assembly.LoadFrom(path); } catch (Exception) { }
+        string[] paths = Directory.GetFiles(directory, "Lumio.GameRuntime.*.dll");
+        Array.Sort(paths, StringComparer.Ordinal);
+        foreach (string path in paths) Assembly.LoadFrom(path);
     }
 
     private static bool HasPublicStaticMethod(Type type, string name)
@@ -249,9 +262,9 @@ public static class HostEntry
         string senderText = RequiredString(root, "senderNetEntityId");
         string encoded = RequiredString(root, "envelopeBase64");
         byte[] envelope = Convert.FromBase64String(encoded);
-        Type netEntityIdType = Ecs!.GetType("Lumio.GameRuntime.Ecs.NetEntityId")!;
-        object sender = netEntityIdType.GetMethod("Parse", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { senderText })!;
-        Type messageType = Ecs.GetType("Lumio.GameRuntime.Ecs.InputCommandMessage")!;
+        Type netEntityIdType = CachedNetEntityIdType ?? throw new InvalidOperationException("host not booted");
+        object sender = CachedParseNetEntityId!.Invoke(null, new object?[] { senderText })!;
+        Type messageType = Ecs!.GetType("Lumio.GameRuntime.Ecs.InputCommandMessage")!;
         object message = DecodeInput(envelope, sender, netEntityIdType, messageType);
         if (Read(root, "connection") is string connection)
             messageType.GetProperty("Connection")?.SetValue(message, connection);
@@ -259,6 +272,16 @@ public static class HostEntry
     }
 
     private static object DecodeInput(byte[] envelope, object sender, Type netEntityIdType, Type messageType)
+    {
+        _ = netEntityIdType;
+        _ = messageType;
+        InputDecodeBridge bridge = CachedInputDecoder ?? throw new InvalidOperationException("decoder not initialized");
+        ulong instance = Convert.ToUInt64(CachedInstanceId!.GetValue(sender), System.Globalization.CultureInfo.InvariantCulture);
+        ulong counter = Convert.ToUInt64(CachedCounter!.GetValue(sender), System.Globalization.CultureInfo.InvariantCulture);
+        return bridge(envelope, instance, counter);
+    }
+
+    private static InputDecodeBridge BuildInputDecoder(Type netEntityIdType)
     {
         MethodInfo decode = WireCodecType!.GetMethod(
             "DecodeInput",
@@ -280,10 +303,7 @@ public static class HostEntry
         il.Emit(OpCodes.Newobj, netEntityIdType.GetConstructor(new[] { typeof(ulong), typeof(ulong) })!);
         il.Emit(OpCodes.Call, decode);
         il.Emit(OpCodes.Ret);
-        InputDecodeBridge bridge = (InputDecodeBridge)method.CreateDelegate(bridgeType);
-        ulong instance = Convert.ToUInt64(netEntityIdType.GetProperty("InstanceId")!.GetValue(sender), System.Globalization.CultureInfo.InvariantCulture);
-        ulong counter = Convert.ToUInt64(netEntityIdType.GetProperty("Counter")!.GetValue(sender), System.Globalization.CultureInfo.InvariantCulture);
-        return bridge(envelope, instance, counter);
+        return (InputDecodeBridge)method.CreateDelegate(bridgeType);
     }
 
     private delegate object InputDecodeBridge(ReadOnlySpan<byte> envelope, ulong instanceId, ulong counter);
@@ -322,33 +342,17 @@ public static class HostEntry
     {
         if (!TryString(root, "bytesBase64", out string? encoded)) return (EntrySuccess, Fail("invalid_request"));
         string roomId = OptionalString(root, "roomId") ?? string.Empty;
-        var previousConnections = SnapshotConnections();
+        object? previousManager = Manager;
         object restored = ManagerType!.GetMethod("CreateFromSnapshot", BindingFlags.Public | BindingFlags.Static)!.Invoke(null, new object?[] { new ReadOnlyMemory<byte>(Convert.FromBase64String(encoded!)) })!;
-        Manager = restored;
-        ManagerType.GetMethod("Start")!.Invoke(Manager, new object?[] { System.Threading.Thread.CurrentThread });
-        Bindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { Manager });
+        ManagerType.GetMethod("Start")!.Invoke(restored, new object?[] { System.Threading.Thread.CurrentThread });
+        object? restoredBindings = BindingType!.GetMethod("Create", new[] { ManagerType })!.Invoke(null, new[] { restored });
+        if (restoredBindings is null) return (EntrySuccess, Fail("restore_failed"));
         if (!string.IsNullOrEmpty(roomId))
-        {
-            BindingType.GetMethod("RestoreRoomBindings", BindingFlags.Public | BindingFlags.Instance)!.Invoke(Bindings, new object?[] { roomId });
-            MethodInfo restoreConnection = BindingType.GetMethod("RestoreConnection", BindingFlags.Public | BindingFlags.Instance)!;
-            Type stateType = restoreConnection.GetParameters()[0].ParameterType;
-            foreach (object state in previousConnections)
-            {
-                object? converted = stateType.GetConstructor(new[] { typeof(string), state.GetType().GetProperty("Binding")!.PropertyType })?.Invoke(new[] { state.GetType().GetProperty("Connection")!.GetValue(state), state.GetType().GetProperty("Binding")!.GetValue(state) });
-                if (converted is not null) restoreConnection.Invoke(Bindings, new[] { converted });
-            }
-        }
+            BindingType.GetMethod("RestoreRoomBindings", BindingFlags.Public | BindingFlags.Instance)!.Invoke(restoredBindings, new object?[] { roomId });
+        Manager = restored;
+        Bindings = restoredBindings;
+        if (previousManager is IDisposable disposable) disposable.Dispose();
         return (EntrySuccess, Ok());
-    }
-
-    private static List<object> SnapshotConnections()
-    {
-        var result = new List<object>();
-        if (Bindings is null || BindingType is null) return result;
-        MethodInfo? snapshot = BindingType.GetMethod("SnapshotConnections", BindingFlags.Public | BindingFlags.Instance);
-        if (snapshot?.Invoke(Bindings, null) is not IEnumerable rows) return result;
-        foreach (object row in rows) result.Add(row);
-        return result;
     }
 
     private static object NewMessage(string typeName, params object?[] args) => Activator.CreateInstance(Ecs!.GetType("Lumio.GameRuntime.Ecs." + typeName)!, args)!;

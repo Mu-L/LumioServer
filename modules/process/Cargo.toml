@@ -27,7 +27,42 @@ tempfile.workspace = true
 [[bin]]
 name = "lumio-server"
 path = "src/main.rs"
+required-features = ["test-harness"]
 
 [[bin]]
 name = "lumio-entity-chat-replay"
 path = "src/entity_chat_replay.rs"
+required-features = ["test-harness"]
+
+[features]
+default = []
+test-harness = []
+
+[[test]]
+name = "entity_chat_architecture"
+path = "tests/entity_chat_architecture.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "entity_chat_wire"
+path = "tests/entity_chat_wire.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "entity_chat_host"
+path = "tests/entity_chat_host.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "entity_chat_acceptance"
+path = "tests/entity_chat_acceptance.rs"
+required-features = ["test-harness"]
+
+[[test]]
+name = "secure_transport"
+path = "tests/secure_transport.rs"
+required-features = ["test-harness"]
+
+[[bin]]
+name = "lumio-ds"
+path = "src/ds.rs"
