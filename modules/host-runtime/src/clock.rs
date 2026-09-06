@@ -1,4 +1,10 @@
 //! Process-local monotonic clocks. Wall-clock time is not used for deadlines.
+//!
+//! The production clock reads real monotonic time and nothing else: it exposes
+//! no way to inject an offset or skip ahead (ADR-057 §6 — a production clock
+//! that tests can fast-forward is a debug backdoor, banned by
+//! `.spec/rules/system.md`). Tests that need to cross a deadline inject
+//! [`TestMonotonicClock`] instead.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -6,17 +12,22 @@ use std::time::Instant;
 
 /// Millisecond monotonic clock used by reconnect and host timers.
 pub trait HostClock: Send + Sync {
-    /// Milliseconds since this clock's origin, plus any test offset.
+    /// Milliseconds since this clock's origin.
     fn now_ms(&self) -> u64;
-
-    /// Advances the clock. Production clocks still accept this so tests can
-    /// inject the five-minute reconnect deadline without sleeping.
-    fn advance_ms(&self, delta_ms: u64);
 
     /// Deterministic clocks are manually advanced by tests and must not be
     /// driven by the production owner cadence.
     fn is_deterministic(&self) -> bool {
         false
+    }
+
+    /// The deterministic test clock behind this handle, when there is one.
+    ///
+    /// Real clocks return `None`, which is what keeps time-skipping out of
+    /// production: there is no path from a [`SharedClock`] to moving a real
+    /// clock forward.
+    fn as_test_clock(&self) -> Option<&TestMonotonicClock> {
+        None
     }
 }
 
@@ -33,13 +44,13 @@ impl SharedClock {
         Self { inner: clock }
     }
 
-    /// System monotonic clock with a test-advanceable offset.
+    /// Real monotonic system clock. Cannot be advanced by anyone.
     #[must_use]
     pub fn system() -> Self {
         Self::new(Arc::new(SystemMonotonicClock::new()))
     }
 
-    /// Pure test clock starting at zero.
+    /// Deterministic test clock starting at zero.
     #[must_use]
     pub fn test() -> Self {
         Self::new(Arc::new(TestMonotonicClock::default()))
@@ -49,6 +60,22 @@ impl SharedClock {
     pub fn is_deterministic(&self) -> bool {
         self.inner.is_deterministic()
     }
+
+    /// Advances the clock **only** when it is a deterministic test clock.
+    ///
+    /// Returns `false` — and moves nothing — for a real clock. Production code
+    /// therefore cannot skip time through this handle; see the module docs.
+    /// The result is `#[must_use]` so a silent no-op cannot pass unnoticed.
+    #[must_use]
+    pub fn advance_test_clock(&self, delta_ms: u64) -> bool {
+        match self.inner.as_test_clock() {
+            Some(clock) => {
+                clock.advance_ms(delta_ms);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl HostClock for SharedClock {
@@ -56,19 +83,18 @@ impl HostClock for SharedClock {
         self.inner.now_ms()
     }
 
-    fn advance_ms(&self, delta_ms: u64) {
-        self.inner.advance_ms(delta_ms);
-    }
-
     fn is_deterministic(&self) -> bool {
         self.inner.is_deterministic()
     }
+
+    fn as_test_clock(&self) -> Option<&TestMonotonicClock> {
+        self.inner.as_test_clock()
+    }
 }
 
-/// Stopwatch-based monotonic clock plus an injected offset.
+/// Stopwatch-based monotonic clock. Reads real elapsed time only.
 pub struct SystemMonotonicClock {
     origin: Instant,
-    offset_ms: AtomicI64,
 }
 
 impl SystemMonotonicClock {
@@ -77,7 +103,6 @@ impl SystemMonotonicClock {
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
-            offset_ms: AtomicI64::new(0),
         }
     }
 }
@@ -90,25 +115,23 @@ impl Default for SystemMonotonicClock {
 
 impl HostClock for SystemMonotonicClock {
     fn now_ms(&self) -> u64 {
-        let elapsed = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let offset = self.offset_ms.load(Ordering::SeqCst);
-        if offset >= 0 {
-            elapsed.saturating_add(u64::try_from(offset).unwrap_or(0))
-        } else {
-            elapsed.saturating_sub(u64::try_from(offset.saturating_neg()).unwrap_or(0))
-        }
-    }
-
-    fn advance_ms(&self, delta_ms: u64) {
-        let delta = i64::try_from(delta_ms).unwrap_or(i64::MAX);
-        self.offset_ms.fetch_add(delta, Ordering::SeqCst);
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }
 
-/// Deterministic clock that only moves when [`HostClock::advance_ms`] is called.
+/// Deterministic clock that only moves when [`TestMonotonicClock::advance_ms`]
+/// is called. Test-support only: never installed by the server binary.
 #[derive(Default)]
 pub struct TestMonotonicClock {
     now_ms: AtomicI64,
+}
+
+impl TestMonotonicClock {
+    /// Moves this deterministic clock forward.
+    pub fn advance_ms(&self, delta_ms: u64) {
+        let delta = i64::try_from(delta_ms).unwrap_or(i64::MAX);
+        self.now_ms.fetch_add(delta, Ordering::SeqCst);
+    }
 }
 
 impl HostClock for TestMonotonicClock {
@@ -116,13 +139,12 @@ impl HostClock for TestMonotonicClock {
         u64::try_from(self.now_ms.load(Ordering::SeqCst).max(0)).unwrap_or(0)
     }
 
-    fn advance_ms(&self, delta_ms: u64) {
-        let delta = i64::try_from(delta_ms).unwrap_or(i64::MAX);
-        self.now_ms.fetch_add(delta, Ordering::SeqCst);
-    }
-
     fn is_deterministic(&self) -> bool {
         true
+    }
+
+    fn as_test_clock(&self) -> Option<&TestMonotonicClock> {
+        Some(self)
     }
 }
 
@@ -139,10 +161,25 @@ mod tests {
     }
 
     #[test]
-    fn system_clock_advance_is_visible() {
-        let clock = SystemMonotonicClock::new();
+    fn a_real_clock_cannot_be_advanced_through_the_shared_handle() {
+        let clock = SharedClock::system();
         let before = clock.now_ms();
-        clock.advance_ms(5_000);
-        assert!(clock.now_ms() >= before + 5_000);
+        assert!(
+            !clock.advance_test_clock(300_000),
+            "ADR-057 §6: real clocks must refuse to skip time"
+        );
+        assert!(
+            clock.now_ms() < before + 300_000,
+            "the real clock must not have moved"
+        );
+        assert!(clock.as_test_clock().is_none());
+    }
+
+    #[test]
+    fn a_deterministic_clock_advances_through_the_shared_handle() {
+        let clock = SharedClock::test();
+        assert!(clock.advance_test_clock(300_000));
+        assert_eq!(clock.now_ms(), 300_000);
+        assert!(clock.is_deterministic());
     }
 }

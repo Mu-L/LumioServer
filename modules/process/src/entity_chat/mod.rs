@@ -67,6 +67,18 @@ pub const BROWSER_NAME: &str = "Browser01";
 pub const TEST_PASSWORD: &str = "123456";
 pub const ADMISSION_KEY_ID: u8 = 1;
 pub const RECONNECT_WINDOW_MS: u64 = 300_000;
+/// Reconnect window the replay harness runs with.
+///
+/// The product window is five minutes ([`RECONNECT_WINDOW_MS`]); the harness
+/// cannot wait that long and — per ADR-057 §6 — must not fast-forward a
+/// production clock to get there. It therefore builds its host with a short
+/// window and waits real monotonic time for the NativeCore wall-clock timer.
+/// **Harness only** — never pass this to a deployed host; the product window is
+/// [`RECONNECT_WINDOW_MS`]. Expiry timers are armed by `disconnect` and by
+/// `fail_connection` (delivery / observer-flush failures), so a short window
+/// makes those fire within a run; the suite's only `disconnect` is c-bot99,
+/// which never reconnects.
+pub const SUITE_RECONNECT_WINDOW_MS: u64 = 2_000;
 pub const INGRESS_QUEUE_PER_CONNECTION: usize = 64;
 /// Runtime `ChatIngressWorld` default `MaxChangeEntries` is 128; each chat.input
 /// commits two ChatComponent fields, so one `RunTick` can take at most 64 chats.
