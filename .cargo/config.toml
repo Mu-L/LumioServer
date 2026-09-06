@@ -1,5 +1,2 @@
 [build]
 rustflags = ["-Dwarnings"]
-
-[alias]
-xtask = "run --package lumio-server-xtask --"
