@@ -1022,3 +1022,87 @@ fn bots_rs_spawns_bot_host_with_contract_args_and_reads_log_dir() {
         "bots.rs must not inject a startup hook or generate hook csproj"
     );
 }
+
+/// R-00493 / R-00393 退回项 B2（ADR-057 §6）：生产时钟不得带可注入的时间偏移后门。
+///
+/// 真正的保证来自类型系统：`HostClock` 已无 `advance_ms`，`SystemMonotonicClock`
+/// 只剩 `origin: Instant`，生产上没有任何类型可用的推进路径。
+///
+/// 本守卫是**回归网**，断言范围有限且明确：`SystemMonotonicClock` 的**字面字段
+/// 文本**里不得出现可变状态类型，且 `HostClock` trait 不得要求 `advance_ms`。
+/// 它能挡住「改方法名 + 搬到固有 impl」这类重构式回归（审查实测），
+/// **挡不住**蓄意新写组合类型 / 模块级 static 把可变状态藏进来。
+#[test]
+fn the_production_clock_holds_no_mutable_time_state() {
+    let clock = fs::read_to_string(host_runtime_root().join("src/clock.rs")).expect("clock.rs");
+
+    let start = clock
+        .find("pub struct SystemMonotonicClock {")
+        .expect("SystemMonotonicClock struct");
+    let body_start = clock[start..].find('{').expect("struct body") + start;
+    let body_end = clock[body_start..].find("\n}").expect("struct end") + body_start;
+    let body = &clock[body_start..body_end];
+
+    for banned in ["Atomic", "Cell", "Mutex", "RwLock", "AtomicI64"] {
+        assert!(
+            !body.contains(banned),
+            "ADR-057 §6: the production clock must hold no mutable time state, \
+             found `{banned}` in:{body}"
+        );
+    }
+    assert!(
+        body.contains("origin: Instant"),
+        "the production clock must read real monotonic time; body was:{body}"
+    );
+
+    // The trait must not force every clock to be advanceable either.
+    let advance = concat!("advance", "_ms");
+    let trait_start = clock.find("pub trait HostClock").expect("HostClock trait");
+    let trait_end = clock[trait_start..].find("\n}\n").expect("trait end") + trait_start;
+    assert!(
+        !clock[trait_start..trait_end].contains(advance),
+        "ADR-057 §6: HostClock must not require every clock to be advanceable"
+    );
+}
+
+/// R-00493 退回项 B2:生产源码不得推进宿主时钟。
+///
+/// 扫描面是全部 `modules/*/src`（时钟本体在 `host-runtime`，只扫 `process` 会
+/// 漏掉它），并覆盖 UFCS 写法。`clock.rs` 自身是唯一豁免——确定性测试时钟在那里
+/// 定义 `advance_ms`，`SharedClock::advance_test_clock` 在那里做合法桥接。
+#[test]
+fn production_sources_do_not_advance_the_host_clock() {
+    let advance = concat!("advance", "_ms");
+    let modules = process_root().parent().expect("modules").to_path_buf();
+    let mut offenders = Vec::new();
+    for crate_dir in ["host-runtime", "process"] {
+        let mut files = Vec::new();
+        collect_text_files(&modules.join(crate_dir).join("src"), &mut files);
+        for path in files {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.to_string_lossy().replace('\\', "/");
+            if name.ends_with("host-runtime/src/clock.rs") {
+                continue; // the clocks' own definition site
+            }
+            if let Ok(text) = fs::read_to_string(&path) {
+                if text.contains(advance) {
+                    offenders.push(name);
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "production sources must not skip time by advancing a clock; found in:\n  {}",
+        offenders.join("\n  ")
+    );
+}
+
+fn host_runtime_root() -> PathBuf {
+    process_root()
+        .parent()
+        .expect("modules")
+        .join("host-runtime")
+}

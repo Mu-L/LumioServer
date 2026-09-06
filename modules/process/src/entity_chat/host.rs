@@ -516,11 +516,28 @@ impl EntityChatHost {
     }
 
     /// Pumps NativeCore wallClock at the host monotonic reading.
+    ///
+    /// The bool reports only that the pump itself did not fail — it is `true`
+    /// even when no timer was due. Callers that need "an expiry actually
+    /// fired" must observe [`Self::armed_expiry_timers`] instead.
     pub fn drive_kernel(&self) -> bool {
         self.on_owner(Inner::drive_wall)
     }
 
-    /// Test/suite clock handle. Expiry still fires only via kernel pump.
+    /// How many reconnect-expiry **timers** are still armed.
+    ///
+    /// Read-only observability: it cannot change host state, and it is the
+    /// only honest way to tell a fired expiry from an idle pump. Note this is
+    /// `expire_watch` (armed kernel timers), *not* the `pending_expiries`
+    /// field (expire requests already sent to Runtime awaiting a reply) —
+    /// two different sets.
+    #[must_use]
+    pub fn armed_expiry_timers(&self) -> usize {
+        self.on_owner(|inner| inner.expire_watch.len())
+    }
+
+    /// Read-only clock handle. Expiry fires only via the kernel pump; a real
+    /// clock cannot be moved through this handle (ADR-057 §6).
     #[must_use]
     pub fn clock(&self) -> SharedClock {
         self.clock.clone()

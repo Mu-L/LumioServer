@@ -2,6 +2,7 @@
 
 use lumio_server_process::entity_chat::{
     discover, run_round_blocking, ClrGameplay, RuntimeSurface, SuiteOptions, MAIN_ROOM,
+    SUITE_RECONNECT_WINDOW_MS,
 };
 use std::env;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
         account_server_dll: artifacts.account_server_dll,
         dotnet: env::var("LUMIO_DOTNET").unwrap_or_else(|_| "dotnet".to_owned()),
         clr: Some(artifacts.clr),
+        reconnect_window_ms: SUITE_RECONNECT_WINDOW_MS,
     });
     if evidence.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
         && evidence

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
-use lumio_host_runtime::{bounded_channel, HostClock, NativeAbiKernel, Receiver, SharedClock};
+use lumio_host_runtime::{bounded_channel, NativeAbiKernel, Receiver, SharedClock};
 use serde_json::{json, Value};
 
 use super::account::{login_or_register, AccountServerProcess};
@@ -27,8 +27,7 @@ use super::runtime::{
 use super::wire::RoomClient;
 use super::MAX_CHAT_INPUTS_PER_TICK;
 use super::{
-    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM, RECONNECT_WINDOW_MS,
-    TEST_PASSWORD,
+    bot_name, ADMISSION_KEY_ID, BOT_COUNT, BROWSER_NAME, ISO_ROOM, MAIN_ROOM, TEST_PASSWORD,
 };
 
 /// Inputs for one suite run.
@@ -37,6 +36,9 @@ pub struct SuiteOptions {
     pub account_server_dll: PathBuf,
     pub dotnet: String,
     pub clr: Option<ClrGameplayConfig>,
+    /// Reconnect window this run builds its host with. See
+    /// [`super::SUITE_RECONNECT_WINDOW_MS`].
+    pub reconnect_window_ms: u64,
 }
 
 /// Result of one or two rounds.
@@ -194,7 +196,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     // representative instead of whichever socket happened to arrive first.
     let (wire_input_tx, wire_input_rx) = bounded_channel(BOT_COUNT as usize);
     let host = EntityChatHost::new(
-        RECONNECT_WINDOW_MS,
+        options.reconnect_window_ms,
         SharedClock::system(),
         gameplay,
         kernel,
@@ -798,8 +800,10 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             return write_blocked(out_dir, &format!("Runtime disconnect failed: {error}"))
         }
     }
-    host.clock().advance_ms(RECONNECT_WINDOW_MS + 1_000);
-    let expiry_tick_fired = host.drive_kernel();
+    // ADR-057 §6: the production clock has no fast-forward. This run uses a
+    // short reconnect window and waits real monotonic time for the NativeCore
+    // wall-clock timer to fire the expiry.
+    let expiry_tick_fired = wait_for_expiry(&host, options.reconnect_window_ms);
     // Expire is an owner-thread Runtime intent; settle it before admitting the
     // replacement account so the old entity is tombstoned first.
     let _ = host.run_tick(MAIN_ROOM.to_owned());
@@ -1429,6 +1433,28 @@ fn host_process_payload(process: &str, listen_uri: &str) -> Value {
     })
 }
 
+/// Waits real monotonic time for the armed reconnect deadline to actually fire.
+///
+/// Polls [`EntityChatHost::pending_expiries`] — the real consequence — rather
+/// than `drive_kernel`'s bool, which is `true` for an idle pump too and would
+/// make this check unfalsifiable. Returns `false` on timeout, and `false` when
+/// nothing was armed to begin with, so a silent no-op fails S9 instead of
+/// passing it. No clock is moved: see ADR-057 §6.
+fn wait_for_expiry(host: &EntityChatHost, window_ms: u64) -> bool {
+    if host.armed_expiry_timers() == 0 {
+        return false;
+    }
+    let deadline = Instant::now() + Duration::from_millis(window_ms.saturating_add(10_000));
+    while Instant::now() < deadline {
+        let _ = host.drive_kernel();
+        if host.armed_expiry_timers() == 0 {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
 fn account_meta(dll: &Path, account: &AccountServerProcess) -> Value {
     json!({
         "dll": dll.display().to_string(),
@@ -1467,10 +1493,16 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     server.push(json!({ "kind": "host", "process": process, "pid": pid }));
-    server.push(json!({
-        "kind": "account",
-        "wrongPasswordCode": evidence.pointer("/traces/account/wrongPasswordCode").and_then(Value::as_str).unwrap_or("wrong_password"),
-    }));
+    // B4 (R-00393): emit only what was actually observed. Defaulting a missing
+    // trace to the value the oracle accepts would make the S1 wrong-password
+    // check unfalsifiable; with no event emitted, the oracle's `!account`
+    // branch fails the check instead.
+    if let Some(code) = evidence
+        .pointer("/traces/account/wrongPasswordCode")
+        .and_then(Value::as_str)
+    {
+        server.push(json!({ "kind": "account", "wrongPasswordCode": code }));
+    }
     for line in audit.lines() {
         if let Ok(row) = serde_json::from_str::<Value>(line) {
             server.push(row);
