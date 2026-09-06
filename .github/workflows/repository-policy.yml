@@ -19,7 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate LumioAgent specification and repository boundary
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Validate specification and repository boundary
         run: |
           node .spec/tools/spec-lint.mjs
           node --test .spec/tools/spec-lint.test.mjs
@@ -44,10 +47,13 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Compile production profile and test harness profile
+      - name: Compile production and test-harness profiles
         run: python eng/verify.py --profile rust
       - uses: actions/upload-artifact@v4
         if: always()
@@ -66,13 +72,16 @@ jobs:
         os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-      - name: Build actual managed bridge and run account tests
+      - name: Build managed bridge and run account tests
         run: python eng/verify.py --profile managed
       - uses: actions/upload-artifact@v4
         if: always()
@@ -91,9 +100,34 @@ jobs:
       RUST_RESULT: ${{ needs.rust.result }}
       MANAGED_RESULT: ${{ needs.managed.result }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
       - name: No skipped, blocked, cancelled or failed required checks
         run: |
           test "$README_RESULT" = success
           test "$RUST_RESULT" = success
           test "$MANAGED_RESULT" = success
-          echo 'Module checks passed. Native/CoreCLR/Game/Platform integration and release validation are separate and are NOT implied.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Module checks passed. Native/CoreCLR/Game/Platform integration and release validation are NOT implied.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Package the exact reviewed source and patch
+        if: always()
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          mkdir -p artifacts/delivery
+          git archive --format=zip -o artifacts/delivery/LumioServer-source.zip HEAD
+          git rev-parse HEAD > artifacts/delivery/source-sha.txt
+          if test -n "$BASE_SHA"; then
+            git diff --binary "$BASE_SHA" HEAD > artifacts/delivery/LumioServer-PR.patch
+            printf '%s\n' "$BASE_SHA" > artifacts/delivery/base-sha.txt
+          fi
+          cp eng/PR38_HANDOFF.md eng/DS_RUNBOOK.md artifacts/delivery/
+          printf 'readme=%s\nrust=%s\nmanaged=%s\n' "$README_RESULT" "$RUST_RESULT" "$MANAGED_RESULT" > artifacts/delivery/check-results.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: LumioServer-reviewed-source
+          path: artifacts/delivery
+          if-no-files-found: error
