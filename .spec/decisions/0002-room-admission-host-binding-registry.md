@@ -17,3 +17,7 @@ R-00346 要求 Game Server 在准入后为 Player/Bot 建立隔离 Room 内的�
 
 - Host 侧可验收 101 实体主迹、顶号、跨 Room 隔离与 Bot 命名空间拒绝，而不拥有组件存储。
 - 查询面的属性三维与墓碑/重连窗仍归后续卡片；本登记只提供绑定与解析所需的身份属性。
+
+## 被 0009 取代
+
+2026-09-06,[0009](0009-exit-legacy-contract-regime.md) 删除 C# `mvp-host/` 整目录与只描述其 `Admission` 实现的 `knowledge/features/room-admission.md`。Room 准入的现行口径归 Rust 宿主的 `verify_admission` 与架构仓 `ds-server.md`。本文正文保留原样,只作历史记录。

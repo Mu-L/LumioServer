@@ -62,9 +62,8 @@ highlight = "simplest-path"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = [
-    "https://github.com/LumioGames/LumioGameEngineArchitecture",
-]
+# 无 git 依赖：Cargo.lock 里 git+ source 为 0；unknown-git = "deny" 使新增 git 依赖需显式登记。
+allow-git = []
 
 [advisories]
 yanked = "deny"

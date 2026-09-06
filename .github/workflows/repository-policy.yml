@@ -25,42 +25,12 @@ jobs:
           test -s LICENSE
           test -s .gitattributes
           grep -q '^\*\.md text eol=lf$' .gitattributes
-          test -s docs/architecture/LumioGameEngine_Architecture_v1.4.md
           grep -q '^## 职责$' README.md
           grep -q '^## 明确不负责什么$' README.md
           grep -q '^## Source / Compile-Time Dependencies$' README.md
           grep -q '^## Headless Test Surface$' README.md
-          grep -q '^# LumioGameEngine V3 (v1.4)' docs/architecture/LumioGameEngine_Architecture_v1.4.md
-          grep -q 'LGE-V1.4-2026-08-27' README.md
-          grep -q 'LGE-V1.4-2026-08-27' docs/architecture/LumioGameEngine_Architecture_v1.4.md
           grep -q '^## 子模块' README.md
           grep -q '^## 当前阶段与开发节奏$' README.md
-          test -s docs/architecture/.baseline.sha256
-          sha256sum -c docs/architecture/.baseline.sha256
-
-  mvp-host:
-    name: MVP C# host policy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # App 编译依赖架构源 Lumio.Engine.SDK。本 job 不得 skip verify-all。
-      - name: Checkout architecture source
-        uses: actions/checkout@v4
-        with:
-          repository: LumioGames/LumioGameEngine
-          path: .architecture-source
-      - name: Setup .NET SDK
-        uses: actions/setup-dotnet@v4
-        with:
-          global-json-file: mvp-host/global.json
-      - name: Validate mvp-host isolation
-        working-directory: mvp-host
-        run: bash eng/verify-isolation.sh
-      - name: Validate mvp-host build and tests
-        working-directory: mvp-host
-        env:
-          LUMIO_ARCHITECTURE_ROOT: ${{ github.workspace }}/.architecture-source
-        run: bash eng/verify-all.sh
 
   cargo-entity-chat:
     name: Cargo entity-chat acceptance

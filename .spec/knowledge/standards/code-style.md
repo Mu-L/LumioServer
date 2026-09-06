@@ -43,4 +43,4 @@ metadata:
 
 ## 骨架阶段入口
 
-当前 workspace 只包含无生产行为的 `process` 与 `xtask` 骨架。`process` 的 binary 必须保持薄入口，业务组装、协议和模块实现由后续任务按所有权加入；`protocol-dispatch` 永不因 workspace glob 自动成为 package。
+当前 workspace 只有 `crates/lumio-host-testkit`、`modules/host-runtime`、`modules/process` 三个成员。`process` 的 binary 必须保持薄入口，业务组装、协议和模块实现按所有权加入。

@@ -22,3 +22,7 @@
 - 聚合根把关键序列集中到 `world-slot`，其正确性成为单点关键面——由 epoch/`StaleEpoch` 契约与门审测试面兜底。
 - `protocol-dispatch`/凭据 wire 格式在公共决策门（D-009/D-011）冻结前封锁，相关实现推迟。
 - 全部 SRV-D 数值是临时默认值，Foundation/Vertical Slice 阶段需按测量确认并逐条转正。
+
+## 被 0009 取代
+
+2026-09-06,[0009](0009-exit-legacy-contract-regime.md) 退出旧合同制:本条依「模块骨架门审」定的 15 模块划分与依赖图,其载体(13 个 README-only 骨架目录、`modules/README.md` 的三张图、`.spec/guards/` 的 DAG 与队列守卫)已全部删除。边界口径改由架构仓 `architecture.md` §2 与本仓实际 crate 结构承担。本文正文保留原样,只作历史记录。

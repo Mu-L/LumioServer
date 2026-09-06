@@ -31,4 +31,4 @@ metadata:
 
 - 契约：架构仓 `engine/wire/account-port-v1.json`、ADR-054
 - 实现：[`account-server/`](../../../account-server/README.md)
-- Game Server 消费：[`room-admission.md`](room-admission.md)（进程内 `verify_admission`）
+- Game Server 消费：进程内 `verify_admission`（Rust 宿主侧实现见 [`rust-entity-chat-host.md`](rust-entity-chat-host.md)）

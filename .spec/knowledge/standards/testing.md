@@ -42,7 +42,7 @@ node .spec/tools/spec-lint.mjs
 node --test .spec/tools/spec-lint.test.mjs
 ```
 
-首次引入 Cargo 工程时，必须加入 `cargo fmt --check`、`cargo clippy`、单元/集成测试、网络故障注入、资源/负载测试和供应链检查。公共 Host/Network/Release Contract 变更还必须在架构源安装依赖并运行 `python3 tools/lumio_contract.py validate`。
+首次引入 Cargo 工程时，必须加入 `cargo fmt --check`、`cargo clippy`、单元/集成测试、网络故障注入、资源/负载测试和供应链检查。公共 Host/Network/Release 契约变更还必须先在架构仓 `LumioGameEngine` 更新 `engine/abi` 或 `engine/wire` 定义与正/失败 fixture，再重编译直接消费者。
 
 ## Rust 验证命令与分类
 
@@ -54,13 +54,11 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo nextest run --workspace --locked
 cargo test --doc --workspace --locked
-cargo xtask contracts verify
-cargo xtask policy check
 cargo deny check
 cargo audit --file Cargo.lock
 ```
 
-`cargo metadata`/fmt/clippy 是结构与静态质量门；`cargo nextest` 是单元/集成测试门；`cargo test --doc` 覆盖文档示例；`xtask policy` 检查仓内 DAG、源码红线、队列登记和封锁规则，`xtask contracts` 只验证架构源发布的 lock/artifact 输入，不能把缺失输入报告为成功；`cargo deny` 与 `cargo audit` 是许可证、来源和漏洞门。工具未安装或上游契约输入尚未提供时，必须在证据中记录实际退出码和 `not run/blocked` 原因，不得以“通过”替代。
+`cargo metadata`/fmt/clippy 是结构与静态质量门；`cargo nextest` 是单元/集成测试门；`cargo test --doc` 覆盖文档示例；`cargo deny` 与 `cargo audit` 是许可证、来源和漏洞门。工具未安装或上游契约输入尚未提供时，必须在证据中记录实际退出码和 `not run/blocked` 原因，不得以“通过”替代。
 
 测试分类纪律：新行为先写可复现失败测试再实现；故障/网络/真实文件系统测试显式触发，不把外部服务或 flaky 重试混入默认快速门；负向 fixture 必须确认稳定拒绝；性能、RSS、队列深度和 Tick p50/p95/p99 归 benchmark 波次。`unsafe`、FFI、线程取消、bounded queue 满载、epoch/ack 竞态和恢复路径必须有针对性测试，不能只依赖编译成功。
 

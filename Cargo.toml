@@ -2,10 +2,8 @@
 resolver = "2"
 members = [
     "crates/lumio-host-testkit",
-    "generated/lumio-architecture-contracts",
     "modules/host-runtime",
     "modules/process",
-    "tools/xtask",
 ]
 
 [workspace.package]
