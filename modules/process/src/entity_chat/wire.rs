@@ -19,7 +19,6 @@ use std::time::Duration;
 use tokio::sync::{watch, Notify};
 use tokio::task::JoinSet;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
-#[cfg(any(test, feature = "test-harness"))]
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::{
     frame::coding::CloseCode, CloseFrame, WebSocketConfig,
@@ -247,7 +246,7 @@ async fn run_socket(
         .max_frame_size(Some(MAX_WIRE_TEXT_BYTES));
     let handshake = accept_hdr_async_with_config(
         stream,
-        |request: &Request, response: Response| {
+        |request: &Request, mut response: Response| {
             if let Some(verifier) = &verifier {
                 let header = request
                     .headers()
@@ -256,6 +255,17 @@ async fn run_socket(
                     .ok_or_else(unauthorized)?;
                 let credential = header.strip_prefix("Bearer ").ok_or_else(unauthorized)?;
                 proof = Some(verifier.verify(credential).map_err(|_| unauthorized())?);
+            }
+            if request
+                .headers()
+                .get("Sec-WebSocket-Protocol")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.split(',').any(|item| item.trim() == "lumio.mvp.v0"))
+            {
+                response.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static("lumio.mvp.v0"),
+                );
             }
             Ok(response)
         },

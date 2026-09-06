@@ -264,7 +264,7 @@ public static class HostEntry
         byte[] envelope = Convert.FromBase64String(encoded);
         Type netEntityIdType = CachedNetEntityIdType ?? throw new InvalidOperationException("host not booted");
         object sender = CachedParseNetEntityId!.Invoke(null, new object?[] { senderText })!;
-        Type messageType = Ecs.GetType("Lumio.GameRuntime.Ecs.InputCommandMessage")!;
+        Type messageType = Ecs!.GetType("Lumio.GameRuntime.Ecs.InputCommandMessage")!;
         object message = DecodeInput(envelope, sender, netEntityIdType, messageType);
         if (Read(root, "connection") is string connection)
             messageType.GetProperty("Connection")?.SetValue(message, connection);

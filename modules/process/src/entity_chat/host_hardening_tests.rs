@@ -183,6 +183,7 @@ fn owner() -> (Inner, Arc<Mutex<Trace>>) {
     let clock = SharedClock::test();
     clock.advance_ms(5_000);
     let inner = Inner {
+        health: Arc::new(HealthState::default()),
         admission_clock_origin_ms: clock.now_ms(),
         active_rooms: BTreeSet::new(),
         admission_verifier: None,

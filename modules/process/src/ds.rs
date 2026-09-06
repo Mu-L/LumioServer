@@ -82,10 +82,8 @@ fn read_config(path: &Path) -> Result<Config, String> {
             *field = base.join(&*field);
         }
     }
-    if let Some(registry) = &mut config.clr.registry_assembly {
-        if registry.is_relative() {
-            *registry = base.join(&*registry);
-        }
+    if config.clr.registry_assembly.is_relative() {
+        config.clr.registry_assembly = base.join(&config.clr.registry_assembly);
     }
     config.validate()?;
     Ok(config)

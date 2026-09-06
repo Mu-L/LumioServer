@@ -630,9 +630,9 @@ impl EntityChatHost {
         Ok(Self {
             health,
             tx,
-            listener: listener,
-            forward: forward,
-            owner: owner,
+            listener,
+            forward,
+            owner,
             listen_uri,
             clock,
         })
@@ -681,7 +681,9 @@ impl EntityChatHost {
     #[must_use]
     pub fn health(&self) -> HostHealth {
         HostHealth {
-            ready: self.health.ready.load(Ordering::Acquire) && self.is_healthy(),
+            ready: self.health.ready.load(Ordering::Acquire)
+                && !self.health.draining.load(Ordering::Acquire)
+                && self.is_healthy(),
             faulted: self.health.faulted.load(Ordering::Acquire) || !self.is_healthy(),
             draining: self.health.draining.load(Ordering::Acquire),
             heartbeat_age_ms: self
@@ -1941,6 +1943,7 @@ impl Inner {
         self.flush_pending_observers();
         self.tick_id = self.tick_id.saturating_add(1);
         let Ok(fired) = self.kernel.advance_tick_frame(self.tick_id) else {
+            self.health.faulted.store(true, Ordering::Release);
             return;
         };
         if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
