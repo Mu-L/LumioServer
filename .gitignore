@@ -7,7 +7,7 @@ node_modules/
 /build
 /dist
 
-# .NET (mvp-host/)
+# .NET (account-server/)
 [Bb]in/
 [Oo]bj/
 .vs/
@@ -15,6 +15,3 @@ node_modules/
 *.suo
 TestResults/
 artifacts/
-
-# CI / local checkout of LumioGameEngine for mvp-host Engine SDK discovery
-.architecture-source/

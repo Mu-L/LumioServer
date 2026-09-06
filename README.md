@@ -30,10 +30,6 @@
 
 `LumioServer` 拥有服务器进程、连接、Release 身份代理、WorldSlot 聚合根、Host Pacing、CoreCLR Hosting、滚动更新与强制维护的本进程侧执行。集群期望状态（Pool 存在性、Release 指派、实例替换时机）归外部控制面（架构源 ADR-012）。它加载稳定 Runtime 与 Server Gameplay，但不拥有 ECS/Voxel 内部状态，也不定义 Gameplay 语义。
 
-## Architecture Gate
-
-ReleaseCatalog/Manifest、Envelope、Maintenance、Logging Event、Host Capability 和失败恢复契约由架构源 ABI/wire 定义维护。网络、路由、滚动更新或维护命令变更必须补齐正向/失败 Fixture，并重编译直接消费者；目标 Pool 之外的产品/Release 不得被默认影响。
-
 ## 拥有的状态与生命周期
 
 - 进程、监听 Endpoint、认证、Connection、Session Admission、重连窗口、限流和背压。
