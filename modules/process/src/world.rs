@@ -650,7 +650,7 @@ impl World {
             log.flush();
         }
         // Dropping `self` destroys the bridge (destroy_clr_host) and then the
-        // SDK lease (FreeLibrary), in the contract's shutdown order.
+        // SDK lease (unloading the native library), in the contract's shutdown order.
         WorldOutcome { reason, sessions }
     }
 }

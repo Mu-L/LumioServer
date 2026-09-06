@@ -47,7 +47,7 @@ Runtime 拥有 Logical Tick、GameWorld 和 Coordinator；VoxelEngine 拥有 Vox
 | 目录 | 责任 |
 | --- | --- |
 | [`modules/process`](modules/process) | 服务器进程组合根：WebSocket 监听与会话准入、SDK DLL 校验、CoreCLR 运行时桥、权威 tick 路由、NDJSON 审计、entity-chat 切片 |
-| [`modules/host-runtime`](modules/host-runtime) | 宿主运行时原语：单调时钟、有界 MPSC channel、受监督线程、`NativeCore` 定时器 ABI 适配 |
+| [`modules/host-runtime`](modules/host-runtime) | 宿主运行时原语：单调时钟、有界 MPSC channel、受监督线程、全仓唯一的 Native SDK 加载器与根表、`NativeCore` 定时器 ABI 适配 |
 | [`crates/lumio-host-testkit`](crates/lumio-host-testkit) | dev-only 确定性测试支撑：测试时钟、故障计划、fixture 加载、有界端口探针 |
 | [`entity-chat-host`](entity-chat-host/README.md) | 切片级 CoreCLR 托管入口，暴露 `boot` / `enqueue` / `tick` / `drain` / `snapshot` / `restore` |
 | [`account-server`](account-server/README.md) | 独立 C# 进程，实现 `lumio.account-port.v1` 的 login-or-register、AccountEntity 与准入凭证签发 |

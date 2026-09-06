@@ -37,3 +37,4 @@
 | [0007](0007-rust-host-consume-runtime.md) | Rust entity-chat 宿主纯消费 Runtime 绑定/查询/快照与 NativeCore 定时 | 生效 |
 | [0008](0008-csharp-mvp-host-frozen-after-adr-056.md) | C# MVP host 继续冻结为 reference；冻结条件改为 Rust 宿主已按 ADR-056 通过 | 被 0009 取代 |
 | [0009](0009-exit-legacy-contract-regime.md) | 退出旧合同制残留，全仓收敛为「消费 SDK 的 Rust 宿主」 | 生效 |
+| [0010](0010-single-cross-platform-native-loader.md) | 全仓只保留一份跨平台 Native 加载器，根表定义收敛到 host-runtime | 生效 |
