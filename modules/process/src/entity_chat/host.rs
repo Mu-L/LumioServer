@@ -461,6 +461,9 @@ impl EntityChatHost {
                             .send_timeout(OwnerWork::Wire(event), Duration::from_secs(2))
                             .is_err()
                         {
+                            if cancel.is_cancelled() {
+                                break;
+                            }
                             panic!("owner forwarding deadline exceeded or owner closed");
                         }
                     }

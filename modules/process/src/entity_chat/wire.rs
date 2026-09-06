@@ -310,7 +310,7 @@ async fn run_socket(
     let reason = tokio::select! {
         _ = stop.changed() => "shutdown",
         reason = read_inputs(&mut input, &tx, &connection_id, observer_id) => reason,
-        reason = write_frames(&mut sink, &pending, &cancel, &wake) => reason,
+        reason = write_frames(&mut sink, pending, &cancel, &wake) => reason,
     };
     cancel.cancel();
     wake.notify_one();
@@ -357,14 +357,14 @@ async fn read_inputs(
 }
 async fn write_frames(
     sink: &mut futures_util::stream::SplitSink<Socket, Message>,
-    pending: &lumio_host_runtime::Receiver<WireOut>,
+    pending: lumio_host_runtime::Receiver<WireOut>,
     cancel: &CancelToken,
     wake: &Notify,
 ) -> &'static str {
     loop {
         let notified = wake.notified();
         tokio::pin!(notified);
-        notified.as_mut().enable();
+        let _ = notified.as_mut().enable();
         if cancel.is_cancelled() {
             return "session_closed";
         }
