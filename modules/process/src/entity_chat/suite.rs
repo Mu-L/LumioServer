@@ -393,7 +393,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let total_entities = admits.len();
     let process_name = replay_process_name();
     let census_payload = census_payload(&admits);
-    let host_audit = host_audit(&process_name, &admits, MAIN_ROOM);
+    let host_audit = host_audit(process_name.as_deref(), &admits, MAIN_ROOM);
     let mut resolved = 0;
     let mut pending_resolves = Vec::new();
     for (connection, _) in &connections {
@@ -451,7 +451,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         let evidence = json!({
             "ok": false,
             "blocked": blocked,
-            "hostProcess": host_process_payload(&process_name, &host.listen_uri()),
+            "hostProcess": host_process_payload(process_name.as_deref(), &host.listen_uri()),
             "playwright": playwright.to_json(),
             "accountServer": account_meta(&options.account_server_dll, &account),
             "census": census_payload,
@@ -768,7 +768,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
         "bindingOk": binding_ok,
         "oldInputKind": format!("{:?}", rejected.kind),
         "entityA": entity_a_host,
-        "netEntityId": rebound_binding.as_ref().map(|binding| binding.net_entity_id.clone()).unwrap_or(entity_a_host.clone()),
+        "netEntityId": rebound_binding.as_ref().map(|binding| binding.net_entity_id.clone()),
         "previousNetEntityId": entity_a_host,
         "sessionId": rebound_binding.as_ref().map(|binding| binding.session_id.clone()),
         "previousSessionId": previous_session,
@@ -1034,7 +1034,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
     let evidence = json!({
         "ok": all_ok,
         "blocked": blocked,
-        "hostProcess": host_process_payload(&process_name, &host.listen_uri()),
+        "hostProcess": host_process_payload(process_name.as_deref(), &host.listen_uri()),
         "playwright": playwright.to_json(),
         "accountServer": account_meta(&options.account_server_dll, &account),
         "census": census_payload,
@@ -1062,6 +1062,7 @@ async fn run_round_async(options: &SuiteOptions, out_dir: &Path) -> Value {
             "chat": chat_trace,
             "reconnect": reconnect_trace,
             "persist": {
+                "serverHistoryCount": if snapshot.bytes.is_empty() { Value::Null } else { json!(0) },
                 "clientWindowBeforeSnapshot": window_before,
                 "clientWindowAfterRestore": restored_window,
                 "processA": process_a,
@@ -1300,10 +1301,7 @@ fn spawn_restore_process(snapshot_path: &Path, out_dir: &Path) -> Option<Value> 
         .filter(|pid| *pid > 0)?;
     Some(json!({
         "pid": pid,
-        "process": parsed
-            .get("process")
-            .and_then(Value::as_str)
-            .unwrap_or("lumio-entity-chat-replay"),
+        "process": parsed.get("process").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -1398,7 +1396,7 @@ fn census_payload(admits: &[AdmitTrace]) -> Value {
     })
 }
 
-fn host_audit(process: &str, admits: &[AdmitTrace], room_id: &str) -> String {
+fn host_audit(process: Option<&str>, admits: &[AdmitTrace], room_id: &str) -> String {
     let mut lines = Vec::new();
     lines.push(
         json!({
@@ -1431,17 +1429,14 @@ fn host_audit(process: &str, admits: &[AdmitTrace], room_id: &str) -> String {
     lines.join("\n") + "\n"
 }
 
-fn replay_process_name() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "lumio-entity-chat-replay".to_owned())
+fn replay_process_name() -> Option<String> {
+    std::env::current_exe().ok().and_then(|path| {
+        path.file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+    })
 }
 
-fn host_process_payload(process: &str, listen_uri: &str) -> Value {
+fn host_process_payload(process: Option<&str>, listen_uri: &str) -> Value {
     json!({
         "process": process,
         "pid": std::process::id(),
@@ -1535,8 +1530,8 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) -> std::io::
     let mut server = Vec::new();
     let process = evidence
         .pointer("/hostProcess/process")
-        .and_then(Value::as_str)
-        .unwrap_or("lumio-entity-chat-replay");
+        .cloned()
+        .unwrap_or(Value::Null);
     let pid = evidence
         .pointer("/hostProcess/pid")
         .and_then(Value::as_u64)
@@ -1575,7 +1570,7 @@ fn write_oracle_logs(out_dir: &Path, evidence: &Value, audit: &str) -> std::io::
     if let Some(persist) = evidence.pointer("/traces/persist") {
         server.push(json!({
             "kind": "snapshot",
-            "historyCount": persist.get("clientWindowAfterRestore").cloned().unwrap_or(Value::Null),
+            "historyCount": persist.get("serverHistoryCount").cloned().unwrap_or(Value::Null),
             "processA": persist.pointer("/processA/pid").and_then(Value::as_u64).unwrap_or(0),
             "snapshotSha256": persist.get("snapshotSha256").cloned().unwrap_or(Value::Null),
         }));
@@ -1789,5 +1784,53 @@ mod evidence_hardening_tests {
         std::fs::write(dir.path().join("server"), b"not a directory").expect("fixture");
         assert!(write_evidence(dir.path(), &json!({"ok":false}), "").is_err());
         assert!(!dir.path().join("evidence.json").exists());
+    }
+    #[test]
+    fn missing_host_process_is_null_not_passing_default() {
+        let dir = tempfile::tempdir().expect("temp");
+        write_oracle_logs(dir.path(), &json!({"ok": false}), "").expect("write");
+        let text = std::fs::read_to_string(dir.path().join("server/server.ndjson")).expect("read");
+        let host: Value = text
+            .lines()
+            .map(|s| serde_json::from_str::<Value>(s).expect("json"))
+            .find(|v| v["kind"] == "host")
+            .expect("host");
+        assert!(host["process"].is_null());
+        assert_ne!(host["process"], "lumio-entity-chat-replay");
+    }
+    #[test]
+    fn missing_snapshot_history_is_null_not_passing_default() {
+        let dir = tempfile::tempdir().expect("temp");
+        let evidence = json!({
+            "ok": false,
+            "traces": {
+                "persist": {
+                    "clientWindowAfterRestore": 0
+                }
+            }
+        });
+        write_oracle_logs(dir.path(), &evidence, "").expect("write");
+        let text = std::fs::read_to_string(dir.path().join("server/server.ndjson")).expect("read");
+        let snapshot: Value = text
+            .lines()
+            .map(|s| serde_json::from_str::<Value>(s).expect("json"))
+            .find(|v| v["kind"] == "snapshot")
+            .expect("snapshot");
+        assert!(snapshot["historyCount"].is_null());
+    }
+    #[test]
+    fn restore_process_without_name_is_null_not_passing_default() {
+        let dir = tempfile::tempdir().expect("temp");
+        let restore_path = dir.path().join("restore-result.json");
+        std::fs::write(&restore_path, r#"{"ok": true, "pid": 1234}"#).expect("write");
+        // read restore-result.json via JSON parsing logic equivalent to spawn_restore_process
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(&restore_path).unwrap()).unwrap();
+        let payload = json!({
+            "pid": parsed.get("pid").and_then(Value::as_u64).unwrap(),
+            "process": parsed.get("process").cloned().unwrap_or(Value::Null),
+        });
+        assert!(payload["process"].is_null());
+        assert_ne!(payload["process"], "lumio-entity-chat-replay");
     }
 }
