@@ -13,7 +13,7 @@ dotnet test tests/Lumio.Server.Account.Tests/Lumio.Server.Account.Tests.csproj -
 
 ## Storage safety
 
-An exclusive writer lease serializes one store owner. Identity and password-hash files are written into a new complete group, flushed, and activated through `active-account-group`. Existing legacy files are imported only as a complete, version-checked matching cohort. A publication error seals the runtime; Dispose never republishes the failed transaction. This is a process-crash fixture guarantee, not a PostgreSQL replacement or certified hardware power-loss guarantee.
+A publication error seals the runtime; Dispose never republishes the failed transaction. Atomic file writes are flushed to disk before rename. This is a minimal fixture guarantee, not a PostgreSQL replacement or certified hardware power-loss guarantee. 本目录按 ADR-061 §11 由 R-00420 整目录退役，不再扩建。
 
 ## Fixture launch
 
