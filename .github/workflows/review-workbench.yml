@@ -27,6 +27,12 @@ jobs:
           if test -f eng/review-workbench/apply.py; then
             python3 eng/review-workbench/apply.py
           fi
+          if test -f eng/review-workbench/after.py; then
+            python3 eng/review-workbench/after.py
+          fi
+          # Actions credentials deliberately do not have workflows permission.
+          # Workflow changes are submitted explicitly through the connector.
+          git restore -- .github/workflows
           cargo fmt --all
           git diff --check
           git diff --stat
@@ -46,9 +52,10 @@ jobs:
           node .spec/tools/spec-lint.mjs || status=1
           node --test .spec/tools/spec-lint.test.mjs || status=1
           cargo fmt --all -- --check || status=1
+          cargo check --workspace --locked || status=1
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings || status=1
           cargo test -p lumio-host-runtime --locked || status=1
           cargo test -p lumio-host-testkit --locked || status=1
-          cargo test -p lumio-server-process --all-features --locked --lib --bins --test entity_chat_architecture --test entity_chat_wire --test native_loader_architecture --test entity_chat_host || status=1
+          cargo test -p lumio-server-process --all-features --locked --lib --bins --test entity_chat_architecture --test entity_chat_wire --test native_loader_architecture --test entity_chat_host --test secure_transport || status=1
           echo "Source tested: $VERIFIED_SOURCE_SHA; status=$status" >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
