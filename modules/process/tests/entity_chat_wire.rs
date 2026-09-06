@@ -397,9 +397,10 @@ fn drain_chat_event_deltas_returns_before_deadline_when_idle() {
 }
 
 #[test]
-fn wire_ingress_auto_ticks_before_runtime_budget_overflow() {
+fn wire_ingress_waits_for_owner_tick_and_preserves_runtime_budget() {
     let runtime = SharedRuntime::new();
     let keys = generate_keys();
+    let (observer_tx, observer_rx) = bounded_channel(MAX_CHAT_INPUTS_PER_TICK);
     let host = EntityChatHost::new(
         RECONNECT_WINDOW_MS,
         SharedClock::test(),
@@ -409,6 +410,7 @@ fn wire_ingress_auto_ticks_before_runtime_budget_overflow() {
         keys.public.to_vec(),
         1_000,
     );
+    host.attach_wire_input_observer(observer_tx);
     let admit = host.admit(
         "room-main".to_owned(),
         "c-bot01".to_owned(),
@@ -417,21 +419,23 @@ fn wire_ingress_auto_ticks_before_runtime_budget_overflow() {
     assert!(admit.accepted);
     let mut client = RoomClient::connect(&host.listen_uri(), "c-bot01").expect("connect");
     let _ = client.recv_text();
-    send_n_wire_chats(&mut client, MAX_CHAT_INPUTS_PER_TICK + 1);
+    send_n_wire_chats(&mut client, MAX_CHAT_INPUTS_PER_TICK);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while runtime.lock().run_tick_input_counts().is_empty() && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    for _ in 0..MAX_CHAT_INPUTS_PER_TICK {
+        observer_rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .expect("all inputs reach the owner before the explicit tick");
     }
+    // This owner-thread round trip also orders the assertion after the last
+    // on_wire callback. Observing bytes alone happens before that callback ends.
+    assert!(host.try_self_lookup("c-bot01".to_owned()).is_some());
+    assert!(
+        runtime.lock().run_tick_input_counts().is_empty(),
+        "network load must not advance logical time"
+    );
+    assert!(host.run_tick("room-main".to_owned()).ok);
     let counts = runtime.lock().run_tick_input_counts().to_vec();
-    assert!(
-        !counts.is_empty() && counts.iter().sum::<usize>() == MAX_CHAT_INPUTS_PER_TICK,
-        "wire ingress must commit a batch at the limit, counts={counts:?}"
-    );
-    assert!(
-        counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),
-        "production must not RunTick more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs, got {counts:?}"
-    );
+    assert_eq!(counts, vec![MAX_CHAT_INPUTS_PER_TICK]);
 }
 
 #[test]

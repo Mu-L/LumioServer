@@ -1,6 +1,6 @@
 //! Consume-only Room host: session table + Runtime forward + NativeCore timers + wire.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use lumio_host_runtime::{
@@ -216,6 +216,10 @@ struct Inner {
     admission_key_id: u8,
     admission_public: Vec<u8>,
     unix_seconds: u64,
+    admission_clock_origin_ms: u64,
+    // Activated Runtime rooms live until this host is destroyed, not until the
+    // last socket disappears. Bound this registry at the admission boundary.
+    active_rooms: BTreeSet<String>,
     runtime: Box<dyn RuntimeSurface>,
     kernel: Box<dyn KernelTimer>,
     sessions: HashMap<String, Session>,
@@ -260,8 +264,26 @@ fn deliver_to_egresses(egresses: &mut Vec<ObserverEgress>, bytes: &[u8]) -> Deli
     let mut invalid = false;
     let mut overflow = false;
     egresses.retain_mut(|egress| {
-        if matches!(flush_observer_egress(egress), Delivery::Unavailable) {
-            return false;
+        match flush_observer_egress(egress) {
+            Delivery::Unavailable => return false,
+            Delivery::Invalid => {
+                invalid = true;
+                return false;
+            }
+            Delivery::Backpressured => {
+                if egress.pending.len() >= MAX_DEFERRED_FRAMES_PER_CONNECTION
+                    || egress.pending_bytes.saturating_add(bytes.len())
+                        > MAX_DEFERRED_FRAME_BYTES_PER_CONNECTION
+                {
+                    overflow = true;
+                } else {
+                    egress.pending.push_back(bytes.to_vec());
+                    egress.pending_bytes = egress.pending_bytes.saturating_add(bytes.len());
+                    backpressured = true;
+                }
+                return true;
+            }
+            Delivery::Delivered | Delivery::Overflow => {}
         }
         match egress.sender.try_send_bytes(bytes) {
             Ok(()) => {
@@ -377,6 +399,7 @@ impl EntityChatHost {
             }
         });
         let owner_clock = clock.clone();
+        let admission_clock_origin_ms = clock.now_ms();
         let owner = spawn_supervised("lumio-entity-chat-owner", move |_cancel| {
             let mut inner = Inner {
                 clock: owner_clock,
@@ -384,6 +407,8 @@ impl EntityChatHost {
                 admission_key_id,
                 admission_public,
                 unix_seconds,
+                admission_clock_origin_ms,
+                active_rooms: BTreeSet::new(),
                 runtime,
                 kernel,
                 sessions: HashMap::new(),
@@ -626,7 +651,16 @@ impl EntityChatHost {
         room_id: String,
         snapshot: PersistRecord,
     ) -> Result<(), String> {
-        self.on_owner(move |inner| inner.runtime.restore(&room_id, &snapshot.bytes))
+        self.on_owner(move |inner| {
+            if !inner.active_rooms.contains(&room_id)
+                && inner.active_rooms.len() >= MAX_PENDING_ADMISSIONS
+            {
+                return Err("admission_capacity".to_owned());
+            }
+            inner.runtime.restore(&room_id, &snapshot.bytes)?;
+            inner.active_rooms.insert(room_id);
+            Ok(())
+        })
     }
 }
 
@@ -923,12 +957,24 @@ impl Inner {
         }
     }
 
+    fn admission_unix_seconds(&self) -> u64 {
+        // The supplied Unix reading is anchored to the monotonic reading at
+        // construction. It must advance on every verification, independently
+        // of simulation ticks (including an idle or disconnected room).
+        self.unix_seconds.saturating_add(
+            self.clock
+                .now_ms()
+                .saturating_sub(self.admission_clock_origin_ms)
+                / 1_000,
+        )
+    }
+
     fn admit(&mut self, room_id: &str, connection_id: &str, credential: &str) -> RoomAdmitResult {
         match verify_admission(
             credential,
             self.admission_key_id,
             &self.admission_public,
-            self.unix_seconds,
+            self.admission_unix_seconds(),
         ) {
             Ok(payload) => self.admit_verified(room_id, connection_id, &payload),
             Err(code) => RoomAdmitResult::reject(&code),
@@ -956,6 +1002,11 @@ impl Inner {
         }
         if self.pending_admissions.contains_key(connection_id) {
             return RoomAdmitResult::reject("admission_pending");
+        }
+        if !self.active_rooms.contains(room_id)
+            && self.active_rooms.len() >= MAX_PENDING_ADMISSIONS
+        {
+            return RoomAdmitResult::reject("admission_capacity");
         }
         if self.pending_admissions.len() >= MAX_PENDING_ADMISSIONS {
             self.clear_pending_admission(connection_id);
@@ -1053,6 +1104,7 @@ impl Inner {
         reconnected: bool,
         takeover: bool,
     ) -> RoomAdmitResult {
+        self.active_rooms.insert(room_id.to_owned());
         let pending = PendingAdmission {
             room_id: room_id.to_owned(),
             payload: payload.clone(),
@@ -1523,9 +1575,9 @@ impl Inner {
             self.pending_wire_input_bytes = self
                 .pending_wire_input_bytes
                 .saturating_sub(pending.envelope_bytes.len());
-            selected.push(pending);
+            selected.push((index, pending));
         }
-        selected.sort_by(|left, right| {
+        selected.sort_by(|(left_index, left), (right_index, right)| {
             let left_sender = self
                 .sessions
                 .get(&left.connection_id)
@@ -1538,9 +1590,9 @@ impl Inner {
                 .unwrap_or_default();
             left_sender
                 .cmp(right_sender)
-                .then(left.connection_id.cmp(&right.connection_id))
+                .then(left_index.cmp(right_index))
         });
-        for pending in selected {
+        for (_, pending) in selected {
             let _ = self.admit_input_command(&pending.connection_id, &pending.envelope_bytes);
         }
         self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
@@ -1616,7 +1668,9 @@ impl Inner {
         if !fired.iter().any(|row| row.dispatch_id == DISPATCH_TICK) {
             return;
         }
-        let mut rooms = HashSet::new();
+        // Stable visitation order, independent of HashMap/HashSet seed and
+        // socket presence. A disconnected room continues simulation.
+        let mut rooms = self.active_rooms.clone();
         rooms.extend(
             self.sessions
                 .values()
@@ -1933,16 +1987,8 @@ impl Inner {
                         .map_or(0, |pending| pending.envelope_bytes.len()),
                 );
                 self.wire_chat_pending = self.pending_wire_inputs.len() as u64;
-                // Preserve the bounded-ingress behavior for a single noisy
-                // connection. Multi-connection traffic is held for the next
-                // owner tick so it can be sorted deterministically.
-                if self.pending_wire_inputs.len() >= MAX_CHAT_INPUTS_PER_TICK
-                    && self.pending_wire_inputs.iter().all(|pending| {
-                        pending.room_id == room_id && pending.connection_id == connection_id
-                    })
-                {
-                    let _ = self.run_tick(&room_id);
-                }
+                // Ingress never advances logical time. Only the owner cadence
+                // (or an explicit deterministic test tick) drains this budget.
             }
             WireEvent::Closed {
                 connection_id,
@@ -2157,3 +2203,7 @@ mod tests {
         assert!(matches!(rx.recv().expect("close"), WireOut::Close));
     }
 }
+
+#[cfg(test)]
+#[path = "host_hardening_tests.rs"]
+mod hardening_tests;
