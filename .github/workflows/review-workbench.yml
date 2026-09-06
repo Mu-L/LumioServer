@@ -1,0 +1,54 @@
+name: PR38 Remediation Workbench
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.github/workflows/review-workbench.yml'
+      - 'eng/review-workbench/**'
+permissions:
+  contents: write
+concurrency:
+  group: pr38-remediation-workbench
+  cancel-in-progress: false
+jobs:
+  remediate:
+    if: github.event.pull_request.number == 38 && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'fix/server-review-correctness-20260906'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+      - name: Materialize reviewed changes on the PR branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f eng/review-workbench/apply.py; then
+            python3 eng/review-workbench/apply.py
+          fi
+          cargo fmt --all
+          git diff --check
+          git diff --stat
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix(server): materialize reviewed hardening and canonical formatting'
+            git push origin HEAD:refs/heads/fix/server-review-correctness-20260906
+          fi
+          echo "VERIFIED_SOURCE_SHA=$(git rev-parse HEAD)" | tee -a "$GITHUB_ENV"
+      - name: Source structure and tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          node .spec/tools/spec-lint.mjs || status=1
+          node --test .spec/tools/spec-lint.test.mjs || status=1
+          cargo fmt --all -- --check || status=1
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings || status=1
+          cargo test -p lumio-host-runtime --locked || status=1
+          cargo test -p lumio-host-testkit --locked || status=1
+          cargo test -p lumio-server-process --all-features --locked --lib --bins --test entity_chat_architecture --test entity_chat_wire --test native_loader_architecture --test entity_chat_host || status=1
+          echo "Source tested: $VERIFIED_SOURCE_SHA; status=$status" >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
