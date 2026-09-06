@@ -16,7 +16,8 @@ use super::runtime::{
 use super::wire::MAX_WIRE_TEXT_BYTES;
 
 /// Files needed to create the CoreCLR Runtime consume host.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClrGameplayConfig {
     pub engine_native: PathBuf,
     pub hostfxr: PathBuf,

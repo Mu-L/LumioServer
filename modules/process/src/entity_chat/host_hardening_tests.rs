@@ -209,6 +209,7 @@ fn owner() -> (Inner, Arc<Mutex<Trace>>) {
         deferred_frames: HashMap::new(),
         retired_connections: HashSet::new(),
         tick_id: 0,
+        last_committed_tick: 0,
         wire_chat_pending: 0,
         pending_wire_inputs: Vec::new(),
         pending_wire_input_bytes: 0,

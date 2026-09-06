@@ -264,6 +264,7 @@ struct Inner {
     deferred_frames: HashMap<String, Vec<Vec<u8>>>,
     retired_connections: HashSet<String>,
     tick_id: u64,
+    last_committed_tick: u64,
     wire_chat_pending: u64,
     pending_wire_inputs: Vec<PendingWireInput>,
     pending_wire_input_bytes: usize,
@@ -428,6 +429,7 @@ impl EntityChatHost {
             runtime,
             kernel,
             None,
+            None,
         )
         .expect("test host startup")
     }
@@ -450,6 +452,32 @@ impl EntityChatHost {
             runtime,
             kernel,
             Some(verifier),
+            None,
+        )
+    }
+
+    /// Restores before publishing Ready or consuming any socket work.
+    pub fn new_authenticated_restored(
+        reconnect_window_ms: u64,
+        runtime: Box<dyn RuntimeSurface>,
+        kernel: Box<dyn KernelTimer>,
+        verifier: BoundAdmissionVerifier,
+        snapshot: Option<(u64, PersistRecord)>,
+    ) -> Result<Self, String> {
+        let initial =
+            snapshot.map(|(tick, bytes)| (verifier.allocation.room_id.clone(), tick, bytes));
+        Self::build(
+            (
+                reconnect_window_ms,
+                verifier.clock.clone(),
+                verifier.key_id,
+                verifier.public_key.clone(),
+                verifier.unix_origin,
+            ),
+            runtime,
+            kernel,
+            Some(verifier),
+            initial,
         )
     }
 
@@ -458,6 +486,7 @@ impl EntityChatHost {
         runtime: Box<dyn RuntimeSurface>,
         kernel: Box<dyn KernelTimer>,
         admission_verifier: Option<BoundAdmissionVerifier>,
+        initial_snapshot: Option<(String, u64, PersistRecord)>,
     ) -> Result<Self, String> {
         let (reconnect_window_ms, clock, admission_key_id, admission_public, unix_seconds) = config;
 
@@ -531,6 +560,7 @@ impl EntityChatHost {
                 deferred_frames: HashMap::new(),
                 retired_connections: HashSet::new(),
                 tick_id: 0,
+                last_committed_tick: 0,
                 wire_chat_pending: 0,
                 pending_wire_inputs: Vec::new(),
                 pending_wire_input_bytes: 0,
@@ -546,6 +576,13 @@ impl EntityChatHost {
                 .is_err()
             {
                 return;
+            }
+            if let Some((room, tick, bytes)) = initial_snapshot {
+                if inner.runtime.restore(&room, &bytes.bytes).is_err() {
+                    inner.health.faulted.store(true, Ordering::Release);
+                    return;
+                }
+                inner.last_committed_tick = tick;
             }
             if let Some(verifier) = &inner.admission_verifier {
                 inner
@@ -619,9 +656,14 @@ impl EntityChatHost {
                 })),
                 Duration::from_secs(2),
             )
-            .unwrap_or_else(|_| panic!("entity-chat owner thread closed"));
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("entity-chat owner result deadline")
+            .unwrap_or_else(|_| {
+                self.health.faulted.store(true, Ordering::Release);
+                panic!("entity-chat owner thread closed or queue deadline exceeded")
+            });
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_or_else(|_| {
+            self.health.faulted.store(true, Ordering::Release);
+            panic!("entity-chat owner result deadline: outcome may be indeterminate")
+        })
     }
 
     /// Nonblocking process-supervision probe. Does not enqueue work to a stuck owner.
@@ -666,7 +708,7 @@ impl EntityChatHost {
             inner
                 .runtime
                 .persist(&room_id)
-                .map(|bytes| (inner.tick_id, bytes))
+                .map(|bytes| (inner.last_committed_tick, bytes))
         })
     }
 
@@ -1841,6 +1883,9 @@ impl Inner {
         self.flush_pending_observers();
         let expected_queries = self.pending_request_ids_for_tick();
         let tick = self.runtime.run_tick(room_id, self.tick_id);
+        if tick.ok {
+            self.last_committed_tick = tick.applied_tick;
+        }
         let completed = self.absorb_runtime_queries();
         for request_id in expected_queries {
             let still_pending = self

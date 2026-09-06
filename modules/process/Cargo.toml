@@ -62,3 +62,7 @@ required-features = ["test-harness"]
 name = "secure_transport"
 path = "tests/secure_transport.rs"
 required-features = ["test-harness"]
+
+[[bin]]
+name = "lumio-ds"
+path = "src/ds.rs"
