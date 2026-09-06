@@ -2,7 +2,7 @@
 
 用 ADR(Architecture Decision Record)记录决策:为什么这样调度、为什么定这种结构、为什么划这条边界。**本目录是全仓决策记录的唯一落点**——功能内决策与框架级决策都记这里,feature 文档只描述设计现状,不留决策记录。
 
-> 跨仓公共语义的决策只在 `LumioGameEngineArchitecture` 维护；本目录仅记录 Server 内部实现决策，从 `0001` 开始编号。
+> 跨仓公共语义的决策只在架构仓 `LumioGameEngine` 维护；本目录仅记录 Server 内部实现决策，从 `0001` 开始编号。
 
 ## 怎么写一条 ADR
 
@@ -28,11 +28,12 @@
 
 | 编号 | 决策 | 状态 |
 |------|------|------|
-| [0001](0001-gate-review-remediation.md) | 按架构门审退回结论重构模块边界(聚合根收权 + 控制面收缩 + host-runtime 新设) | 生效 |
-| [0002](0002-room-admission-host-binding-registry.md) | Room 准入做成 Host 绑定登记，不引入第二套 ECS | 生效 |
+| [0001](0001-gate-review-remediation.md) | 按架构门审退回结论重构模块边界(聚合根收权 + 控制面收缩 + host-runtime 新设) | 被 0009 取代 |
+| [0002](0002-room-admission-host-binding-registry.md) | Room 准入做成 Host 绑定登记，不引入第二套 ECS | 被 0009 取代 |
 | [0003](0003-host-reconnect-window.md) | 五分钟重连窗由 Host Timer 持有，不用 Native Tick | 生效 |
 | [0004](0004-csharp-mvp-host-frozen-reference.md) | C# MVP host 在切片验收通过后冻结为 reference | 被 0005 取代 |
 | [0005](0005-csharp-mvp-host-unfrozen-until-live-11.md) | C# MVP host 在 11 场景 live-green 之前不得冻结为 reference | 被 0006 取代 |
 | [0006](0006-csharp-mvp-host-frozen-after-rust-identical-suite.md) | C# MVP host 冻结为 reference，identical suite 以 Rust replay 为交付面 | 被 0008 取代 |
 | [0007](0007-rust-host-consume-runtime.md) | Rust entity-chat 宿主纯消费 Runtime 绑定/查询/快照与 NativeCore 定时 | 生效 |
-| [0008](0008-csharp-mvp-host-frozen-after-adr-056.md) | C# MVP host 继续冻结为 reference；冻结条件改为 Rust 宿主已按 ADR-056 通过 | 生效 |
+| [0008](0008-csharp-mvp-host-frozen-after-adr-056.md) | C# MVP host 继续冻结为 reference；冻结条件改为 Rust 宿主已按 ADR-056 通过 | 被 0009 取代 |
+| [0009](0009-exit-legacy-contract-regime.md) | 退出旧合同制残留，全仓收敛为「消费 SDK 的 Rust 宿主」 | 生效 |

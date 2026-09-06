@@ -42,7 +42,7 @@ node .spec/tools/spec-lint.mjs
 node --test .spec/tools/spec-lint.test.mjs
 ```
 
-首次引入 Cargo 工程时，必须加入 `cargo fmt --check`、`cargo clippy`、单元/集成测试、网络故障注入、资源/负载测试和供应链检查。公共 Host/Network/Release Contract 变更还必须在架构源安装依赖并运行 `python3 tools/lumio_contract.py validate`。
+首次引入 Cargo 工程时，必须加入 `cargo fmt --check`、`cargo clippy`、单元/集成测试、网络故障注入、资源/负载测试和供应链检查。公共 Host/Network/Release 契约变更还必须先在架构仓 `LumioGameEngine` 更新 `engine/abi` 或 `engine/wire` 定义与正/失败 fixture，再重编译直接消费者。
 
 ## Rust 验证命令与分类
 

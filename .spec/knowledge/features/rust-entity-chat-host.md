@@ -31,7 +31,6 @@ ADR-056：Rust 宿主是接力交付面，只托管与传输。Room 世界是 Ru
 
 - 完整 101 实体 acceptance 依赖 Runtime / NativeCore / Game 产物路径；缺失时测试以 BLOCKED 失败而非跳过。S3 的 Playwright Room 观察同样依赖 `LUMIO_GAME_ROOT`。
 - Runtime `ChatIngressWorld.Create` 默认预算装不下 101 实体 Persist；S7 跨进程恢复待 Runtime 放大 `MaxSnapshotBytes`。
-- `mvp-host/` 仍冻结，归 N-13。
 
 ## 相关
 

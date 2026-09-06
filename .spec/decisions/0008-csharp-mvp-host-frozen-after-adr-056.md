@@ -21,3 +21,7 @@ R-00374（N-10）把 `lumio-entity-chat-replay` 改为消费 Runtime 绑定/查�
 ## 后果
 
 交付面是 Rust entity-chat 宿主 + CoreCLR HostEntry 调 Runtime + NativeCore 定时内核。C# MVP 源码冻结留作对照，带着 CS0234 政策债。0007 描述的 Rust 纯消费路径仍是生效真值。
+
+## 被 0009 取代
+
+2026-09-06,[0009](0009-exit-legacy-contract-regime.md) 结束 0004 → 0008 的 C# mvp-host 冻结链:`mvp-host/` 不再是冻结对照,整目录删除(D21 / D22)。冻结留下的 CS0234 政策债与 `MVP C# host policy` 作业随目录一并消失。本文正文保留原样,只作历史记录。
