@@ -1,14 +1,15 @@
-//! Hand-written FFI loader for the Lumio Engine native SDK.
+//! `CoreCLR` half of the Lumio Engine native SDK: sidecar trust plus the
+//! `create_clr_host` / `clr_host_call` / `destroy_clr_host` chain.
 //!
-//! Loads the SDK DLL via `LoadLibraryW`/`GetProcAddress` (no `libloading`),
-//! verifies the `build-info.json` sidecar against the binary (SHA-256) and the
-//! root table (`abiHash`, `buildId`), then probes `ping`. Any mismatch is a
-//! startup failure (exit code 1) naming the failed check.
+//! The library itself is opened by [`NativeLibrary`], the workspace's single
+//! cross-platform loader (Owner ruling D24). This module adds what only the
+//! server process cares about: verifying the `build-info.json` sidecar against
+//! the binary (SHA-256) and against the root table (`abiHash`, `buildId`), then
+//! probing `ping`. Any mismatch is a startup failure (exit code 1) naming the
+//! failed check.
 //!
-//! Root table layout: `engine/abi/native-abi.json` in the architecture repo
-//! (commit cef0b03), including the `CoreCLR` host slots (`create_clr_host`,
-//! `clr_host_call`, `destroy_clr_host`). The real DLL is exercised in the
-//! integration phase.
+//! Root table layout truth: `engine/abi/native-abi.json` in the architecture
+//! repo. The real library is exercised in the integration phase.
 #![allow(unsafe_code)] // FFI boundary: unsafe is the point of this module.
 
 use std::ffi::c_void;
@@ -17,14 +18,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use lumio_host_runtime::{NativeAbiError, NativeLibrary, RootApiV1, ABI_VERSION, CLR_SLOTS_SIZE};
 use sha2::{Digest, Sha256};
 
 use crate::wire::BUILD_INFO_SIDECAR;
-
-/// ABI version requested from `lumio_engine_get_api_v1`.
-pub const ABI_VERSION: u32 = 1;
-/// The only exported SDK symbol; everything else hangs off the root table.
-pub const ENTRY_SYMBOL: &str = "lumio_engine_get_api_v1";
 
 /// SDK status codes (architecture repo `engine/abi/native-abi.json`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,48 +57,6 @@ impl SdkStatus {
     }
 }
 
-/// Root API table returned by `lumio_engine_get_api_v1`.
-///
-/// Layout mirrors the architecture repo's `engine/abi/native-abi.json`
-/// (x64: size 88, ping at 56, the CLR chain at 64/72/80).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct RootApiV1 {
-    /// ABI version the DLL was built for.
-    pub abi_version: u32,
-    /// `size_of::<RootApiV1>()` as seen by the DLL.
-    pub struct_size: u32,
-    /// Lowercase-hex SHA-256 of the ABI definition.
-    pub abi_hash: [u8; 32],
-    /// Build identifier bytes.
-    pub build_id: [u8; 16],
-    /// Liveness probe: writes 1 into `*mut u32` marker, returns status.
-    pub ping: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-    /// Creates the `CoreCLR` host; resolves the managed entry fail-fast.
-    pub create_clr_host: Option<
-        unsafe extern "C" fn(
-            *const u8,        // hostfxr_path (UTF-8 NUL-terminated)
-            *const u8,        // runtime_config_path
-            *const u8,        // assembly_path
-            *const u8,        // entry_spec: '<assembly-qualified type>;<method>'
-            *mut *mut c_void, // out opaque handle
-        ) -> i32,
-    >,
-    /// One byte-protocol call into the managed entry.
-    pub clr_host_call: Option<
-        unsafe extern "C" fn(
-            *mut c_void, // host
-            *const u8,   // input (null allowed when input_len is 0)
-            u32,         // input_len
-            *mut u8,     // output (null allowed when capacity is 0)
-            u32,         // output_capacity
-            *mut u32,    // out bytes_written
-        ) -> i32,
-    >,
-    /// Destroys the `CoreCLR` host.
-    pub destroy_clr_host: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-}
-
 /// Result of one `clr_host_call` FFI invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClrCall {
@@ -109,15 +64,6 @@ pub(crate) struct ClrCall {
     pub status: i32,
     /// Bytes written (`Success`) or required size (`BufferTooSmall`).
     pub written: u32,
-}
-
-type GetApiV1 = unsafe extern "C" fn(u32, *mut *const RootApiV1) -> i32;
-
-#[link(name = "kernel32")]
-unsafe extern "system" {
-    fn LoadLibraryW(filename: *const u16) -> isize;
-    fn GetProcAddress(module: isize, name: *const u8) -> *const c_void;
-    fn FreeLibrary(module: isize) -> i32;
 }
 
 /// Sidecar contents (`build-info.json`).
@@ -167,8 +113,8 @@ pub enum LoadError {
     UnsupportedVersion(i32),
     /// `lumio_engine_get_api_v1` is not exported.
     EntryMissing,
-    /// `LoadLibraryW` failed (bad image, missing deps, ...).
-    LibraryLoadFailed(PathBuf),
+    /// The platform loader refused the image (bad format, missing deps, ...).
+    LibraryLoadFailed(String),
     /// `ping` probe failed (status or marker mismatch).
     PingFailed(String),
 }
@@ -200,8 +146,8 @@ impl Display for LoadError {
                     "entry symbol rejected ABI version {ABI_VERSION} (status {status})"
                 )
             }
-            Self::EntryMissing => write!(f, "export `{ENTRY_SYMBOL}` not found in DLL"),
-            Self::LibraryLoadFailed(path) => write!(f, "LoadLibraryW failed: {}", path.display()),
+            Self::EntryMissing => write!(f, "export `lumio_engine_get_api_v1` not found"),
+            Self::LibraryLoadFailed(detail) => write!(f, "{detail}"),
             Self::PingFailed(detail) => write!(f, "SDK ping failed: {detail}"),
         }
     }
@@ -298,10 +244,10 @@ pub(crate) fn verify_root_table(root: &RootApiV1, info: &BuildInfo) -> Result<()
             root.abi_version
         )));
     }
-    let min_size = u32::try_from(std::mem::size_of::<RootApiV1>()).unwrap_or(u32::MAX);
+    let min_size = u32::try_from(CLR_SLOTS_SIZE).unwrap_or(u32::MAX);
     if root.struct_size < min_size {
         return Err(LoadError::InvalidRootTable(format!(
-            "struct_size {} < {min_size} (extended layout required)",
+            "struct_size {} < {min_size} (CoreCLR slots required)",
             root.struct_size
         )));
     }
@@ -338,7 +284,7 @@ impl std::fmt::Debug for SdkLease {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         // The root table holds raw fn pointers; report the module handle only.
         f.debug_struct("SdkLease")
-            .field("module", &self.module)
+            .field("library", &self.library)
             .finish_non_exhaustive()
     }
 }
@@ -360,10 +306,16 @@ impl ClrHostHandle {
     }
 }
 
-/// Loaded SDK lease: keeps the module handle until dropped.
+/// Loaded SDK lease: keeps the native library mapped until dropped.
 pub struct SdkLease {
-    module: isize,
-    root: RootApiV1,
+    library: NativeLibrary,
+}
+
+impl SdkLease {
+    /// The verified root table.
+    const fn root(&self) -> &RootApiV1 {
+        self.library.root()
+    }
 }
 
 impl SdkLease {
@@ -375,7 +327,7 @@ impl SdkLease {
     /// not written.
     pub fn ping(&self) -> Result<(), LoadError> {
         let ping = self
-            .root
+            .root()
             .ping
             .ok_or_else(|| LoadError::InvalidRootTable("`ping` slot vanished".to_owned()))?;
         let mut marker: u32 = 0;
@@ -411,7 +363,7 @@ impl SdkLease {
         entry_spec: &str,
     ) -> Result<ClrHostHandle, String> {
         let create = self
-            .root
+            .root()
             .create_clr_host
             .ok_or_else(|| "create_clr_host slot is null".to_owned())?;
         let hostfxr = utf8_null(hostfxr_path);
@@ -455,7 +407,7 @@ impl SdkLease {
         output: &mut [u8],
     ) -> Result<ClrCall, String> {
         let call = self
-            .root
+            .root()
             .clr_host_call
             .ok_or_else(|| "clr_host_call slot is null".to_owned())?;
         let input_len = u32::try_from(input.len()).map_err(|_| "input too large".to_owned())?;
@@ -494,7 +446,7 @@ impl SdkLease {
     /// Human-readable failure when the native call reports an error.
     pub(crate) fn destroy_clr_host(&self, handle: ClrHostHandle) -> Result<(), String> {
         let destroy = self
-            .root
+            .root()
             .destroy_clr_host
             .ok_or_else(|| "destroy_clr_host slot is null".to_owned())?;
         if handle.is_null() {
@@ -510,87 +462,33 @@ impl SdkLease {
     }
 }
 
-impl Drop for SdkLease {
-    fn drop(&mut self) {
-        if self.module != 0 {
-            // SAFETY: the module handle came from LoadLibraryW and each
-            // successful load is balanced by exactly one FreeLibrary; all CLR
-            // hosts are destroyed before the lease drops.
-            unsafe { FreeLibrary(self.module) };
-        }
-    }
-}
-
-fn wide_null(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 fn utf8_null(value: &str) -> Vec<u8> {
     let mut bytes = value.as_bytes().to_vec();
     bytes.push(0);
     bytes
 }
 
-/// Load the SDK DLL: sidecar verification, `LoadLibraryW`, root table fetch,
-/// root-vs-sidecar verification and ping probe.
+/// Load the native SDK: sidecar verification, the shared cross-platform
+/// loader, root-vs-sidecar verification and the ping probe.
 ///
 /// # Errors
 ///
 /// See [`LoadError`]; every failure is fatal at startup (exit code 1).
 pub fn load(native_path: &Path) -> Result<SdkLease, LoadError> {
     let info = verify_sidecar(native_path)?;
-    let wide = wide_null(&native_path.to_string_lossy());
-    // SAFETY: `wide` is a valid null-terminated UTF-16 path; LoadLibraryW only
-    // reads it. The returned handle is owned by the SdkLease below.
-    let module = unsafe { LoadLibraryW(wide.as_ptr()) };
-    if module == 0 {
-        return Err(LoadError::LibraryLoadFailed(native_path.to_path_buf()));
-    }
-
-    // SAFETY: the module handle is valid and non-zero; `load_entry` only uses
-    // it for GetProcAddress and the root-table fetch, and hands it back inside
-    // the returned lease (or it is freed by the caller below on error).
-    let lease = unsafe { load_entry(module, &info) };
-    match lease {
-        Ok(lease) => Ok(lease),
-        Err(error) => {
-            // SAFETY: module handle is valid (checked non-zero above) and this
-            // is the balancing FreeLibrary for our load.
-            unsafe { FreeLibrary(module) };
-            Err(error)
+    let library = NativeLibrary::open(native_path).map_err(|error| match error {
+        NativeAbiError::MissingFile(path) => LoadError::MissingFile(path),
+        NativeAbiError::EntryMissing => LoadError::EntryMissing,
+        NativeAbiError::UnsupportedVersion(status) => LoadError::UnsupportedVersion(status),
+        NativeAbiError::NullRootTable => {
+            LoadError::InvalidRootTable("entry returned a null API table".to_owned())
         }
-    }
-}
-
-unsafe fn load_entry(module: isize, info: &BuildInfo) -> Result<SdkLease, LoadError> {
-    let symbol = utf8_null(ENTRY_SYMBOL);
-    // SAFETY: `symbol` is a valid null-terminated name and the module handle
-    // is valid for the lifetime of this call.
-    let address = unsafe { GetProcAddress(module, symbol.as_ptr()) };
-    if address.is_null() {
-        return Err(LoadError::EntryMissing);
-    }
-    // SAFETY: the SDK contract guarantees the entry symbol has the
-    // `GetApiV1` signature (C calling convention).
-    let entry: GetApiV1 = unsafe { std::mem::transmute(address) };
-
-    let mut root_ptr: *const RootApiV1 = std::ptr::null();
-    // SAFETY: root_ptr is writable storage for one pointer.
-    let status = unsafe { entry(ABI_VERSION, std::ptr::from_mut(&mut root_ptr)) };
-    if status != 0 {
-        return Err(LoadError::UnsupportedVersion(status));
-    }
-    if root_ptr.is_null() {
-        return Err(LoadError::InvalidRootTable(
-            "entry returned a null API table".to_owned(),
-        ));
-    }
-    // SAFETY: the SDK contract keeps the root table at static storage for the
-    // lifetime of the module; we copy the plain-old-data table out.
-    let root = unsafe { *root_ptr };
-    verify_root_table(&root, info)?;
-
-    let lease = SdkLease { module, root };
+        other @ NativeAbiError::LibraryLoadFailed { .. } => {
+            LoadError::LibraryLoadFailed(other.to_string())
+        }
+    })?;
+    verify_root_table(library.root(), &info)?;
+    let lease = SdkLease { library };
     lease.ping()?;
     Ok(lease)
 }
@@ -661,13 +559,14 @@ mod tests {
     fn sample_root() -> RootApiV1 {
         RootApiV1 {
             abi_version: ABI_VERSION,
-            struct_size: u32::try_from(std::mem::size_of::<RootApiV1>()).unwrap_or(u32::MAX),
+            struct_size: u32::try_from(CLR_SLOTS_SIZE).unwrap_or(u32::MAX),
             abi_hash: [0xab; 32],
             build_id: [0x11; 16],
             ping: Some(dummy_ping),
             create_clr_host: Some(dummy_create),
             clr_host_call: Some(dummy_call),
             destroy_clr_host: Some(dummy_destroy),
+            ..RootApiV1::zeroed()
         }
     }
 
@@ -796,17 +695,17 @@ mod tests {
     }
 
     #[test]
-    fn wide_and_utf8_buffers_are_null_terminated() {
-        assert_eq!(wide_null("a"), vec![0x61, 0]);
+    fn utf8_buffers_are_null_terminated() {
         assert_eq!(utf8_null("a"), b"a\0".to_vec());
     }
 
     #[test]
-    fn root_table_layout_matches_the_extended_abi() {
-        // x64 golden layout from engine/abi/native-abi.json (commit cef0b03):
-        // size 88; ping at 56; create_clr_host at 64; clr_host_call at 72;
-        // destroy_clr_host at 80.
-        assert_eq!(std::mem::size_of::<RootApiV1>(), 88);
+    fn core_clr_slots_keep_the_golden_x64_layout() {
+        // x64 golden layout from engine/abi/native-abi.json: the CoreCLR prefix
+        // is 88 bytes; ping at 56; create_clr_host at 64; clr_host_call at 72;
+        // destroy_clr_host at 80. The shared table extends past 88 with the
+        // NativeCore timer slots, which this crate does not read.
+        assert_eq!(CLR_SLOTS_SIZE, 88);
         let root = sample_root();
         let base = std::ptr::from_ref(&root) as usize;
         assert_eq!(std::ptr::from_ref(&root.ping) as usize - base, 56);

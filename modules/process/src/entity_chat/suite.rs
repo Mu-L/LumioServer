@@ -1092,7 +1092,7 @@ fn receive_connection_superseded(client: &mut RoomClient) -> bool {
             Ok(Some(frame)) if frame.contains("\"messageType\":\"ConnectionSuperseded\"") => {
                 return true;
             }
-            Ok(Some(_)) | Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Ok(Some(_) | None) => thread::sleep(Duration::from_millis(10)),
             Err(_) => return false,
         }
     }
