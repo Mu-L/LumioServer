@@ -20,18 +20,15 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
       - name: Materialize reviewed changes on the PR branch only
         shell: bash
         run: |
           set -euo pipefail
-          if test -f eng/review-workbench/apply.py; then
-            python3 eng/review-workbench/apply.py
-          fi
-          if test -f eng/review-workbench/after.py; then
-            python3 eng/review-workbench/after.py
-          fi
-          # Actions credentials deliberately do not have workflows permission.
-          # Workflow changes are submitted explicitly through the connector.
+          if test -f eng/review-workbench/apply.py; then python3 eng/review-workbench/apply.py; fi
+          if test -f eng/review-workbench/after.py; then python3 eng/review-workbench/after.py; fi
           git restore -- .github/workflows
           cargo fmt --all
           git diff --check
@@ -49,13 +46,13 @@ jobs:
         run: |
           set -uo pipefail
           status=0
-          node .spec/tools/spec-lint.mjs || status=1
-          node --test .spec/tools/spec-lint.test.mjs || status=1
-          cargo fmt --all -- --check || status=1
-          cargo check --workspace --locked || status=1
-          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings || status=1
-          cargo test -p lumio-host-runtime --locked || status=1
-          cargo test -p lumio-host-testkit --locked || status=1
-          cargo test -p lumio-server-process --all-features --locked --lib --bins --test entity_chat_architecture --test entity_chat_wire --test native_loader_architecture --test entity_chat_host --test secure_transport || status=1
+          python3 eng/verify.py --profile rust || status=1
+          python3 eng/verify.py --profile managed || status=1
           echo "Source tested: $VERIFIED_SOURCE_SHA; status=$status" >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: remediation-verification-${{ github.run_id }}
+          path: artifacts/verification
+          if-no-files-found: warn
