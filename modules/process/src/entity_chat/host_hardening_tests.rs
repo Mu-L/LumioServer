@@ -185,6 +185,7 @@ fn owner() -> (Inner, Arc<Mutex<Trace>>) {
     let inner = Inner {
         admission_clock_origin_ms: clock.now_ms(),
         active_rooms: BTreeSet::new(),
+        admission_verifier: None,
         clock,
         reconnect_window_ms: 300_000,
         admission_key_id: 1,
@@ -233,6 +234,7 @@ fn input(inner: &mut Inner, connection: &str, text: &str) {
     inner.on_wire(WireEvent::Input {
         connection_id: connection.to_owned(),
         text: text.to_owned(),
+        observer_id: 0,
     });
 }
 

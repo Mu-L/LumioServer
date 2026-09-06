@@ -137,7 +137,7 @@ impl Drop for SupervisedTask {
                 eprintln!("supervised task did not stop before deadline: {} (process escalation required)", timeout.name);
                 // Rust cannot safely terminate an arbitrary thread. Detach rather
                 // than deadlock Drop; owned resources stay alive in that thread.
-                self.join.take();
+                drop(self.join.take());
             }
             Ok(None) => {}
         }

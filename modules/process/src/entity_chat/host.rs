@@ -14,6 +14,7 @@ use super::runtime::{
     AttributeQueryScope, ChatOperation, PersistRecord, QueryResult, RebindMode, RuntimeBinding,
     RuntimeFrame, RuntimeQuery, RuntimeQueryRecord, RuntimeSurface, RuntimeTick,
 };
+use super::secure::BoundAdmissionVerifier;
 use super::wire::{RoomListener, WireEvent, WireSendError, WireSender, MAX_WIRE_TEXT_BYTES};
 use super::{INGRESS_QUEUE_PER_CONNECTION, MAX_CHAT_INPUTS_PER_TICK};
 
@@ -217,6 +218,7 @@ struct Inner {
     admission_public: Vec<u8>,
     unix_seconds: u64,
     admission_clock_origin_ms: u64,
+    admission_verifier: Option<BoundAdmissionVerifier>,
     // Activated Runtime rooms live until this host is destroyed, not until the
     // last socket disappears. Bound this registry at the admission boundary.
     active_rooms: BTreeSet<String>,
@@ -324,6 +326,9 @@ fn deliver_to_egresses(egresses: &mut Vec<ObserverEgress>, bytes: &[u8]) -> Deli
 }
 
 fn flush_observer_egress(egress: &mut ObserverEgress) -> Delivery {
+    if egress.sender.is_closed() {
+        return Delivery::Unavailable;
+    }
     loop {
         let Some(bytes) = egress.pending.front() else {
             if egress.close_requested && !egress.close_enqueued {
@@ -377,6 +382,7 @@ pub struct EntityChatHost {
 impl EntityChatHost {
     /// Builds a consume-only host. Kernel due-decision stays in NativeCore ABI.
     #[must_use]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn new(
         reconnect_window_ms: u64,
         clock: SharedClock,
@@ -386,9 +392,65 @@ impl EntityChatHost {
         admission_public: Vec<u8>,
         unix_seconds: u64,
     ) -> Self {
+        Self::build(
+            (
+                reconnect_window_ms,
+                clock,
+                admission_key_id,
+                admission_public,
+                unix_seconds,
+            ),
+            runtime,
+            kernel,
+            None,
+        )
+        .expect("test host startup")
+    }
+
+    /// Secure Host entry. Public clients cannot select an existing connection identity.
+    pub fn new_authenticated(
+        reconnect_window_ms: u64,
+        runtime: Box<dyn RuntimeSurface>,
+        kernel: Box<dyn KernelTimer>,
+        verifier: BoundAdmissionVerifier,
+    ) -> Result<Self, String> {
+        Self::build(
+            (
+                reconnect_window_ms,
+                verifier.clock.clone(),
+                verifier.key_id,
+                verifier.public_key.clone(),
+                verifier.unix_origin,
+            ),
+            runtime,
+            kernel,
+            Some(verifier),
+        )
+    }
+
+    fn build(
+        config: (u64, SharedClock, u8, Vec<u8>, u64),
+        runtime: Box<dyn RuntimeSurface>,
+        kernel: Box<dyn KernelTimer>,
+        admission_verifier: Option<BoundAdmissionVerifier>,
+    ) -> Result<Self, String> {
+        let (reconnect_window_ms, clock, admission_key_id, admission_public, unix_seconds) = config;
+
         let (tx, rx) = bounded_channel(256);
         let (wire_tx, wire_rx) = bounded_channel(256);
-        let listener = RoomListener::bind(wire_tx).expect("room wire bind");
+        let listener = match admission_verifier.clone() {
+            Some(verifier) => RoomListener::bind_authenticated(wire_tx, verifier)?,
+            None => {
+                #[cfg(any(test, feature = "test-harness"))]
+                {
+                    RoomListener::bind(wire_tx)?
+                }
+                #[cfg(not(any(test, feature = "test-harness")))]
+                {
+                    return Err("test-harness transport is unavailable".to_owned());
+                }
+            }
+        };
         let listen_uri = listener.uri();
         let forward_tx = tx.clone();
         let forward = spawn_supervised("lumio-entity-chat-wire-fwd", move |cancel| {
@@ -413,6 +475,7 @@ impl EntityChatHost {
             let mut inner = Inner {
                 clock: owner_clock,
                 reconnect_window_ms,
+                admission_verifier,
                 admission_key_id,
                 admission_public,
                 unix_seconds,
@@ -473,14 +536,14 @@ impl EntityChatHost {
                 }
             }
         });
-        Self {
+        Ok(Self {
             tx,
             _listener: listener,
             _forward: forward,
             _owner: owner,
             listen_uri,
             clock,
-        }
+        })
     }
 
     /// Attaches a bounded observer for exact admitted input bytes.
@@ -504,6 +567,16 @@ impl EntityChatHost {
             .unwrap_or_else(|_| panic!("entity-chat owner thread closed"));
         rx.recv_timeout(Duration::from_secs(2))
             .expect("entity-chat owner result deadline")
+    }
+
+    /// Nonblocking process-supervision probe. Does not enqueue work to a stuck owner.
+    #[must_use]
+    pub fn is_healthy(&self) -> bool {
+        !self._owner.is_finished()
+            && self._owner.failure().is_none()
+            && !self._forward.is_finished()
+            && self._forward.failure().is_none()
+            && self._listener.is_healthy()
     }
 
     /// Loopback Room wire URI.
@@ -537,6 +610,7 @@ impl EntityChatHost {
 
     /// Admits an already-verified payload (suite path after local verify).
     #[must_use]
+    #[cfg(any(test, feature = "test-harness"))]
     pub fn admit_verified(
         &self,
         room_id: String,
@@ -678,8 +752,9 @@ impl EntityChatHost {
 
 impl Drop for EntityChatHost {
     fn drop(&mut self) {
-        self._owner.cancel();
+        self._listener.shutdown();
         self._forward.cancel();
+        self._owner.cancel();
     }
 }
 
@@ -989,6 +1064,15 @@ impl Inner {
     }
 
     fn admit(&mut self, room_id: &str, connection_id: &str, credential: &str) -> RoomAdmitResult {
+        if let Some(verifier) = &self.admission_verifier {
+            if room_id != verifier.allocation.room_id {
+                return RoomAdmitResult::reject("admission_binding_mismatch");
+            }
+            return match verifier.verify(credential) {
+                Ok(proof) => self.admit_verified(room_id, connection_id, &proof.payload),
+                Err(code) => RoomAdmitResult::reject(&code),
+            };
+        }
         match verify_admission(
             credential,
             self.admission_key_id,
@@ -1783,7 +1867,10 @@ impl Inner {
     fn flush_pending_observers(&mut self) {
         let mut invalid_sessions = Vec::new();
         for (connection, session) in &mut self.sessions {
-            if !flush_observer_egresses(&mut session.egresses) {
+            let had_socket = !session.egresses.is_empty();
+            if !flush_observer_egresses(&mut session.egresses)
+                || (had_socket && session.egresses.is_empty())
+            {
                 invalid_sessions.push(connection.clone());
             }
         }
@@ -1920,10 +2007,32 @@ impl Inner {
     fn on_wire(&mut self, event: WireEvent) {
         self.flush_pending_observers();
         match event {
+            WireEvent::Authenticated {
+                connection_id,
+                egress,
+                proof,
+            } => {
+                let result = self.admit_verified(&proof.room_id, &connection_id, &proof.payload);
+                if !result.accepted {
+                    let _ = egress.try_close();
+                    return;
+                }
+                if let Some(session) = self.sessions.get_mut(&connection_id) {
+                    session.egresses.push(ObserverEgress::new(egress));
+                } else {
+                    self.pending_egress
+                        .insert(connection_id.clone(), vec![ObserverEgress::new(egress)]);
+                }
+                self.flush_deferred(&connection_id);
+            }
             WireEvent::Attached {
                 connection_id,
                 egress,
             } => {
+                if self.admission_verifier.is_some() {
+                    egress.abort();
+                    return;
+                }
                 if self.sessions.contains_key(&connection_id) {
                     if let Some(session) = self.sessions.get_mut(&connection_id) {
                         if session.egresses.len() >= MAX_PENDING_EGRESS_PER_CONNECTION {
@@ -1958,8 +2067,18 @@ impl Inner {
             }
             WireEvent::Input {
                 connection_id,
+                observer_id,
                 text,
             } => {
+                if self.admission_verifier.is_some()
+                    && !self.sessions.get(&connection_id).is_some_and(|session| {
+                        session.egresses.iter().any(|egress| {
+                            egress.sender.observer_id() == observer_id && !egress.sender.is_closed()
+                        })
+                    })
+                {
+                    return;
+                }
                 if text.as_bytes().len() > MAX_WIRE_TEXT_BYTES {
                     let _ = self.fail_connection(&connection_id);
                     return;
