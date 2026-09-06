@@ -1026,33 +1026,41 @@ fn sixty_four_chat_inputs_one_tick_emit_chat_event() {
 }
 
 #[test]
-fn host_wire_ingress_ticks_at_max_chat_inputs() {
+fn host_wire_ingress_waits_for_a_clock_tick_at_the_batch_limit() {
     let runtime = SharedRuntime::new();
     let (host, keys) = host_with(runtime.clone());
-    let _ = host.admit(
-        "room-main".to_owned(),
-        "c-bot01".to_owned(),
-        credential(&keys, "Bot01", true),
+    let (observed, rx) = bounded_channel(MAX_CHAT_INPUTS_PER_TICK);
+    host.attach_wire_input_observer(observed);
+    assert!(
+        host.admit(
+            "room-main".to_owned(),
+            "c-bot01".to_owned(),
+            credential(&keys, "Bot01", true)
+        )
+        .accepted
     );
     let mut client =
         lumio_server_process::entity_chat::RoomClient::connect(&host.listen_uri(), "c-bot01")
             .expect("connect");
     let _ = client.recv_text();
-    for _ in 0..=MAX_CHAT_INPUTS_PER_TICK {
+    for _ in 0..MAX_CHAT_INPUTS_PER_TICK {
         client
             .send_text(RUNTIME_WIRE_CHAT_INPUT)
-            .expect("wire chat.input");
+            .expect("wire input");
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while runtime.lock().run_tick_input_counts().is_empty() && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    for _ in 0..MAX_CHAT_INPUTS_PER_TICK {
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .expect("observed input");
     }
-    let counts = runtime.lock().run_tick_input_counts().to_vec();
-    assert_eq!(counts.first().copied(), Some(MAX_CHAT_INPUTS_PER_TICK));
+    assert!(host.try_self_lookup("c-bot01".to_owned()).is_some());
     assert!(
-        counts.iter().all(|n| *n <= MAX_CHAT_INPUTS_PER_TICK),
-        "host must not forward more than {MAX_CHAT_INPUTS_PER_TICK} chat.inputs to Runtime RunTick, got {counts:?}"
+        runtime.lock().run_tick_input_counts().is_empty(),
+        "ingress must not advance the clock"
+    );
+    assert!(host.run_tick("room-main".to_owned()).ok);
+    assert_eq!(
+        runtime.lock().run_tick_input_counts(),
+        &[MAX_CHAT_INPUTS_PER_TICK]
     );
 }
 

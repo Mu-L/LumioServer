@@ -391,16 +391,25 @@ impl EntityChatHost {
         let listener = RoomListener::bind(wire_tx).expect("room wire bind");
         let listen_uri = listener.uri();
         let forward_tx = tx.clone();
-        let forward = spawn_supervised("lumio-entity-chat-wire-fwd", move |_| {
-            while let Ok(event) = wire_rx.recv() {
-                if forward_tx.send(OwnerWork::Wire(event)).is_err() {
-                    break;
+        let forward = spawn_supervised("lumio-entity-chat-wire-fwd", move |cancel| {
+            while !cancel.is_cancelled() {
+                match wire_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(event) => {
+                        if forward_tx
+                            .send_timeout(OwnerWork::Wire(event), Duration::from_secs(2))
+                            .is_err()
+                        {
+                            panic!("owner forwarding deadline exceeded or owner closed");
+                        }
+                    }
+                    Err(lumio_host_runtime::RecvError::Empty) => {}
+                    Err(lumio_host_runtime::RecvError::Closed) => break,
                 }
             }
         });
         let owner_clock = clock.clone();
         let admission_clock_origin_ms = clock.now_ms();
-        let owner = spawn_supervised("lumio-entity-chat-owner", move |_cancel| {
+        let owner = spawn_supervised("lumio-entity-chat-owner", move |cancel| {
             let mut inner = Inner {
                 clock: owner_clock,
                 reconnect_window_ms,
@@ -442,11 +451,10 @@ impl EntityChatHost {
             let self_drive = !inner.clock.is_deterministic();
             let mut last_cadence_ms = inner.clock.now_ms();
             loop {
-                let work = if self_drive {
-                    rx.recv_timeout(Duration::from_millis(OWNER_CADENCE_MS))
-                } else {
-                    rx.recv().map_err(|_| lumio_host_runtime::RecvError::Closed)
-                };
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let work = rx.recv_timeout(Duration::from_millis(OWNER_CADENCE_MS));
                 match work {
                     Ok(OwnerWork::Run(work)) => work(&mut inner),
                     Ok(OwnerWork::Wire(event)) => inner.on_wire(event),
@@ -487,11 +495,15 @@ impl EntityChatHost {
     {
         let (tx, rx) = bounded_channel(1);
         self.tx
-            .send(OwnerWork::Run(Box::new(move |inner| {
-                let _ = tx.send(work(inner));
-            })))
+            .send_timeout(
+                OwnerWork::Run(Box::new(move |inner| {
+                    let _ = tx.try_send(work(inner));
+                })),
+                Duration::from_secs(2),
+            )
             .unwrap_or_else(|_| panic!("entity-chat owner thread closed"));
-        rx.recv().expect("entity-chat owner result")
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("entity-chat owner result deadline")
     }
 
     /// Loopback Room wire URI.
@@ -661,6 +673,13 @@ impl EntityChatHost {
             inner.active_rooms.insert(room_id);
             Ok(())
         })
+    }
+}
+
+impl Drop for EntityChatHost {
+    fn drop(&mut self) {
+        self._owner.cancel();
+        self._forward.cancel();
     }
 }
 
