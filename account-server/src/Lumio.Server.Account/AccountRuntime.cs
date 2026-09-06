@@ -11,14 +11,15 @@ public sealed class AccountRuntime : IDisposable
     private readonly CredentialStore credentials = new();
     private readonly DurableAccountStore store;
     private readonly object gate = new();
-    private readonly Dictionary<string, object> nameGates = new(StringComparer.Ordinal);
+    private bool faulted;
     private bool disposed;
 
     private AccountRuntime(AccountServerOptions options)
     {
         this.options = options;
         store = new DurableAccountStore(options.StorePath);
-        store.Load(world, credentials);
+        try { store.Load(world, credentials); }
+        catch { store.Dispose(); throw; }
         AdmissionPublicKey = Ed25519Keys.PublicKeyFromSeed(options.AdmissionPrivateSeed);
         StorePath = store.DirectoryPath;
     }
@@ -61,8 +62,10 @@ public sealed class AccountRuntime : IDisposable
             return Reject(loginName, botCode, "bot-tool credential rejected");
         }
 
-        lock (NameGate(loginName))
+        lock (gate)
         {
+            if (faulted) throw new InvalidOperationException("account store requires recovery after failed write");
+            ObjectDisposedException.ThrowIf(disposed, this);
             var exists = world.TryGetByLoginName(loginName, out var identity);
             if (botName && string.IsNullOrEmpty(botToolCredential))
             {
@@ -84,11 +87,13 @@ public sealed class AccountRuntime : IDisposable
             }
 
             var accountId = NewAccountId();
+            var encodedPassword = Argon2idPasswordHasher.Hash(password);
             var created = world.Create(accountId, loginName, options.Clock.UnixSeconds);
-            credentials.Put(accountId, Argon2idPasswordHasher.Hash(password));
+            credentials.Put(accountId, encodedPassword);
             lock (gate)
             {
-                store.Save(world, credentials);
+                try { store.Save(world, credentials); }
+                catch { faulted = true; throw; }
             }
 
             Audit("account_created", new Dictionary<string, string>(StringComparer.Ordinal)
@@ -173,41 +178,36 @@ public sealed class AccountRuntime : IDisposable
 
     public void Flush()
     {
-        ObjectDisposedException.ThrowIf(disposed, this);
         lock (gate)
         {
-            store.Save(world, credentials);
+            ObjectDisposedException.ThrowIf(disposed, this);
+            if (faulted) throw new InvalidOperationException("account writer faulted");
+            try { store.Save(world, credentials); }
+            catch { faulted = true; throw; }
         }
     }
 
     public void Dispose()
     {
-        if (disposed)
-        {
-            return;
-        }
-
         lock (gate)
         {
-            store.Save(world, credentials);
+            if (disposed) return;
+            disposed = true;
+            try { if (!faulted) store.Save(world, credentials); }
+            finally
+            {
+                CryptographicOperations.ZeroMemory(options.AdmissionPrivateSeed);
+                store.Dispose();
+            }
         }
-
-        CryptographicOperations.ZeroMemory(options.AdmissionPrivateSeed);
-        disposed = true;
     }
 
+    // All identity/credential mutations share the same transaction boundary.
+    // No unbounded dictionary of attacker-controlled username locks exists.
     internal object NameGate(string loginName)
     {
-        lock (nameGates)
-        {
-            if (!nameGates.TryGetValue(loginName, out var gateObject))
-            {
-                gateObject = new object();
-                nameGates[loginName] = gateObject;
-            }
-
-            return gateObject;
-        }
+        ArgumentNullException.ThrowIfNull(loginName);
+        return gate;
     }
 
     internal AccountWorld World => world;
